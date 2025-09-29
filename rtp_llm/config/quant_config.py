@@ -172,11 +172,11 @@ class Fp8DynamicPerTensorQuantConfig(QuantizationConfig):
 
     @classmethod
     def get_method(cls) -> str:
-        return "FP8_DYNAMIC"
+        return "FP8_DYNAMIC_PER_TENSOR"
 
     @classmethod
     def get_algo(cls) -> str:
-        return "fp8_dynamic"
+        return "fp8_dynamic_per_tensor"
 
     def get_supported_compute_dtypes(self) -> List[torch.dtype]:
         return [torch.float16, torch.bfloat16]
@@ -433,7 +433,7 @@ DEFAULT_FP8_PER_CHANNEL_COMPRESSED_QUANT_CONFIG = Fp8PerChannelCompressedQuantCo
 preset_quant_config = {
     "INT8": DEFAULT_WEIGHT_ONLY_INT8_PER_CHANNEL_QUANT_CONFIG,
     "FP8": DEFAULT_FP8_PER_TENSOR_QUANT_CONFIG,
-    "FP8_DYNAMIC": DEFAULT_FP8_DYNAMIC_PER_TENSOR_QUANT_CONFIG,
+    "FP8_DYNAMIC_PER_TENSOR": DEFAULT_FP8_DYNAMIC_PER_TENSOR_QUANT_CONFIG,
     "FP8_PER_BLOCK": DEFAULT_FP8_BLOCK_WISE_QUANT_CONFIG,
     "FP8_PER_CHANNEL_COMPRESSED": DEFAULT_FP8_PER_CHANNEL_COMPRESSED_QUANT_CONFIG,
 }

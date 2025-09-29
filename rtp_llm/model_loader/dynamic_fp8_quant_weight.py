@@ -1,12 +1,68 @@
+import copy
 import logging
+from typing import Dict, Optional, Union
 
 import torch
 
-from rtp_llm.config.quant_config import Fp8PerTensorQuantConfig, QuantizationConfig
-from rtp_llm.model_loader.static_fp8_quant_weight import StaticPerTensorFp8Weight
+import rtp_llm.models_py.modules.utils as utils
+from rtp_llm.config.quant_config import (
+    Fp8DynamicPerTensorQuantConfig,
+    QuantizationConfig,
+)
+from rtp_llm.model_loader.ffn_weight import FfnAtomicWeight, MoeAtomicWeight
+from rtp_llm.model_loader.load_config import LoadConfig
+from rtp_llm.model_loader.w8a8_weight import W8A8Fp8AtomicWeight, create_w8a8_fp8_weight
+from rtp_llm.model_loader.weight_module import (
+    AtomicWeight,
+    CompositeWeight,
+    QuantWeight,
+    WeightModule,
+)
+from rtp_llm.utils.database import BaseDatabase
+from rtp_llm.utils.model_weight import W, WeightStyle
+
+if utils.is_cuda():
+    try:
+        from libth_transformer.rtp_llm_ops import per_tensor_quant_fp8  # isort:skip
+    except ImportError:
+        per_tensor_quant_fp8 = None
+else:
+    per_tensor_quant_fp8 = None
 
 
-class LoadQuantDynamicPerTensorFp8Weight(StaticPerTensorFp8Weight):
+def to_float32_tensor(x, device) -> torch.Tensor:
+    return torch.as_tensor(x, dtype=torch.float32, device=device)
+
+
+def quantize_weight_to_fp8(ts: torch.Tensor, output: Optional[torch.Tensor] = None):
+    if output is None:
+        output = torch.empty_like(ts, device=ts.device, dtype=torch.float8_e4m3fn)
+    else:
+        assert output.dtype == torch.float8_e4m3fn
+        assert output.device == ts.device
+
+    if per_tensor_quant_fp8 is not None and ts.device.type != "cpu":
+        scale = torch.zeros(1, device=ts.device, dtype=torch.float32)
+        per_tensor_quant_fp8(ts, output, scale, False)
+        return output, scale
+    else:
+        device = ts.device
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        max_abs_value = to_float32_tensor(ts.abs().max(), device)
+        scaling_factor = max_abs_value / finfo.max
+        min_scaling_factor = to_float32_tensor(1.0, device) / (
+            to_float32_tensor(512.0, device) * finfo.max
+        )
+        scaling_factor = torch.max(min_scaling_factor, scaling_factor)
+        output = (
+            (to_float32_tensor(ts, device) / scaling_factor)
+            .clamp(min=finfo.min, max=finfo.max)
+            .to(torch.float8_e4m3fn)
+        )
+        return output.contiguous(), scaling_factor.to(torch.float32)
+
+
+class LoadQuantDynamicPerTensorFp8Weight(CompositeWeight, QuantWeight):
     fp8_attn_weights_map = {
         W.attn_qkv_w: (
             W.attn_qkv_s,
@@ -50,15 +106,24 @@ class LoadQuantDynamicPerTensorFp8Weight(StaticPerTensorFp8Weight):
         **fp8_ffn_weights_maps,
         **fp8_partial_moe_weights_maps,
     }
+    w8a8_weight_list = [
+        W.attn_qkv_w,
+        W.attn_o_w,
+        W.ffn_w1,
+        W.ffn_w3,
+        W.ffn_w2,
+        W.ffn_w13,
+        W.moe_w1,
+        W.moe_w2,
+    ]
 
     @classmethod
     def support(
         cls, quant_config: QuantizationConfig, src_weight_info: WeightModule
     ) -> bool:
-        if (
-            quant_config.is_quanted()
-            or not isinstance(quant_config, Fp8PerTensorQuantConfig)
-            or not quant_config.is_dynamic()
+
+        if quant_config.is_quanted() or not isinstance(
+            quant_config, Fp8DynamicPerTensorQuantConfig
         ):
             return False
         name = src_weight_info.name
@@ -85,15 +150,10 @@ class LoadQuantDynamicPerTensorFp8Weight(StaticPerTensorFp8Weight):
         scale_params["name"] = scale_name
         scale: AtomicWeight = create_w8a8_fp8_weight(src_weight_info, **scale_params)
         sub_weights.update({scale.name: scale})
-
-        CompositeWeight.__init__(
-            self, sub_weights, quant_config=quant_config, *args, **kwargs
-        )
+        super().__init__(sub_weights, quant_config=quant_config, *args, **kwargs)
         self.kernel = kernel
         self.scale = scale
-        from rtp_llm.models_py.utils.debug import set_trace_on_tty
 
-        set_trace_on_tty()
         self.act_scale = None
         self.act_scale_inv = None
 
@@ -105,9 +165,29 @@ class LoadQuantDynamicPerTensorFp8Weight(StaticPerTensorFp8Weight):
         load_config: LoadConfig,
     ):
         kernel = self.kernel._load_raw_tensor(database, layer_id, device, load_config)
+        if self.kernel.name in [W.moe_w1, W.moe_w2]:
+            # per expert quant moe w13 and w2 to fp8
+            kernel_tensor = kernel[self.kernel.name]
+            assert len(kernel_tensor.shape) == 3
+            num_experts = kernel_tensor.shape[0]
+
+            quant_kernel = torch.empty_like(
+                kernel_tensor, device=kernel_tensor.device, dtype=torch.float8_e4m3fn
+            )
+            scale = torch.ones(
+                [num_experts], device=kernel_tensor.device, dtype=torch.float32
+            )
+
+            for i in range(num_experts):
+                quant_kernel[i, :, :], scale[i] = quantize_weight_to_fp8(
+                    kernel_tensor[i, :, :], quant_kernel[i, :, :]
+                )
+
+        else:
+            quant_kernel, scale = quantize_weight_to_fp8(kernel.get(self.kernel.name))
+            quant_kernel = quant_kernel.T
+
         res = {}
-        quant_kernel, scale = quantize_weight_to_fp8(kernel.get(self.kernel.name))
-        quant_kernel = quant_kernel.T
         res = {
             self.kernel.name: quant_kernel.contiguous().to(device),
             self.scale.name: scale.contiguous().to(device),
@@ -124,45 +204,18 @@ class LoadQuantDynamicPerTensorFp8Weight(StaticPerTensorFp8Weight):
         processed_res = super()._postprocess(tensor, device, load_config)
 
         kernel_weight = processed_res[self.kernel.name]
-        weight_scale_name = self.FP8_SCALE_MAP.get(self.kernel.name)
-
-        input_scale_r_str, _ = self.FP8_ACT_SCALE_MAP.get(self.kernel.name)[1]
-        intput_scale_str, _ = self.FP8_ACT_SCALE_MAP.get(self.kernel.name)[0]
-
+        weight_scale_name = self.weight_scale_map.get(self.kernel.name)[0]
         kernel_scale = processed_res.get(weight_scale_name, None)
-        input_scale = processed_res.get(input_scale_r_str, None)
 
         if isinstance(self.kernel, MoeAtomicWeight):
             if self.kernel.name is W.moe_w1:
                 # handle moe w13 weight
                 num_local_experts, moe_inter_padding_size, _ = kernel_weight.shape
-
                 assert moe_inter_padding_size == (
                     load_config.moe_inter_padding_size * 2
                 )
                 assert kernel_scale is not None
-                max_kernel_scale = kernel_scale.max(dim=1).values
                 moe_inter_padding_size = moe_inter_padding_size // 2
-
-                for expert_id in range(num_local_experts):
-                    start = 0
-                    for shard_id in range(2):
-                        if (
-                            max_kernel_scale[expert_id]
-                            != kernel_scale[expert_id][shard_id]
-                        ):
-                            # rescale shard
-                            dq_weight = (
-                                kernel_weight[expert_id][
-                                    start : start + moe_inter_padding_size, :
-                                ].to(torch.float16)
-                                * kernel_scale[expert_id][shard_id]
-                            )
-                            kernel_weight[expert_id][
-                                start : start + moe_inter_padding_size, :
-                            ] = (dq_weight / max_kernel_scale[expert_id]).to(
-                                torch.float8_e4m3fn
-                            )
                 # w13 to w31
                 kernel_weight = torch.cat(
                     [
@@ -173,53 +226,7 @@ class LoadQuantDynamicPerTensorFp8Weight(StaticPerTensorFp8Weight):
                 )
 
                 processed_res[self.kernel.name] = kernel_weight
-                processed_res[W.moe_s1] = max_kernel_scale
 
-            if input_scale is not None:
-                input_scale = input_scale.max()
-                processed_res[input_scale_r_str] = input_scale
-                processed_res[intput_scale_str] = 1.0 / input_scale
-            return processed_res
-
-        # handle qkv_proj quant weight
-        if self.kernel.name is W.attn_qkv_w:
-            kernel_weight = processed_res[self.kernel.name]
-            kernel_scale = processed_res[W.attn_qkv_s]
-
-            head_size = load_config.size_per_head
-            head_num_kv = load_config.head_num_kv
-            head_num_q = load_config.head_num
-            assert head_num_q + 2 * head_num_kv == kernel_weight.shape[0] // head_size
-            logical_widths = [
-                head_num_q * head_size,
-                head_num_kv * head_size,
-                head_num_kv * head_size,
-            ]
-
-            qkv_rescale, max_scale = merge_qkv_hf_fp8_with_scale(
-                [
-                    kernel_weight[0 : logical_widths[0], :],
-                    kernel_weight[
-                        logical_widths[0] : logical_widths[0] + logical_widths[1], :
-                    ],
-                    kernel_weight[logical_widths[0] + logical_widths[1] :, :],
-                    kernel_scale[0],
-                    kernel_scale[1],
-                    kernel_scale[2],
-                ]
-            )
-            processed_res[self.kernel.name] = qkv_rescale
-            processed_res[W.attn_qkv_s] = max_scale
-
-            # maybe handle qkv_proj input scale
-            if processed_res.get(W.pre_ln_static_quant_reciprocal) is not None:
-                assert processed_res[W.pre_ln_static_quant_reciprocal].shape[0] == 3
-                processed_res[W.pre_ln_static_quant_reciprocal] = processed_res[
-                    W.pre_ln_static_quant_reciprocal
-                ].max()
-                processed_res[W.pre_ln_static_quant] = (
-                    1.0 / processed_res[W.pre_ln_static_quant_reciprocal]
-                )
             return processed_res
 
         return processed_res

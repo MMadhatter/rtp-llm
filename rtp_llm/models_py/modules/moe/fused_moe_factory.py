@@ -203,7 +203,7 @@ class FusedMoeFactory(object):
             return FusedMoeFactory._create_fp8_per_block_fused_moe(config, weights)
         elif config.quant_config.get_method() in [
             "FP8_PER_TENSOR_COMPRESSED",
-            "FP8_DYNAMIC",
+            "FP8_DYNAMIC_PER_TENSOR",
         ]:
             return FusedMoeFactory._create_fp8_per_tensor_fused_moe(config, weights)
         else:
