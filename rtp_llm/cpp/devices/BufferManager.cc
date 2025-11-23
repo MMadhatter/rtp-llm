@@ -7,6 +7,9 @@
 #include <mutex>
 #include <unistd.h>
 #include "rtp_llm/cpp/config/ConfigModules.h"
+
+#include <iostream>
+
 using namespace std;
 using ReadLock  = shared_lock<shared_mutex>;
 using WriteLock = unique_lock<shared_mutex>;
@@ -95,6 +98,13 @@ void BufferManager::recordAllcation(const BufferParams& params, const BufferHint
                          buffer->sizeBytes(),
                          hints.tag.c_str(),
                          stack_trace_id);
+        if (hints.tag == "torch_allocated" || hints.tag == "float_workspace" || hints.tag == "int_workspace") {
+            printf("================>>>>>Allocate buffer: %p, size: %zu, tag: [%s], trace id [%lu] \n",
+                   buffer->data(),
+                   buffer->sizeBytes(),
+                   hints.tag.c_str(),
+                   stack_trace_id);
+        }
         auto       status                = queryStatus();
         const auto device_consumed_bytes = status.device_allocated_bytes + status.device_fragmented_bytes;
         if (device_consumed_bytes > device_max_consumed_bytes_) {
@@ -104,6 +114,12 @@ void BufferManager::recordAllcation(const BufferParams& params, const BufferHint
                              device_max_allocated_bytes_,
                              stack_trace_id,
                              printAllocationRecords(device_allocator_).c_str());
+            printf(
+                "Device allocated size + fragmented size reached new maximum %zu, \n previous is %zu bytes, current stack trace id[%lu]\n %s",
+                device_consumed_bytes,
+                device_max_allocated_bytes_,
+                stack_trace_id,
+                printAllocationRecords(device_allocator_).c_str());
             device_max_consumed_bytes_ = device_consumed_bytes;
         }
         if (status.device_allocated_bytes > device_max_allocated_bytes_) {
@@ -119,6 +135,12 @@ void BufferManager::recordRecycle(void* data) {
             allocation_records_.erase(data);
         }
         RTP_LLM_LOG_DEBUG("record recycle: %p [%s]", data, allocation_records_[data].hints.tag.c_str());
+    }
+
+    if (allocation_records_[data].hints.tag == "torch_allocated"
+        || allocation_records_[data].hints.tag == "float_workspace"
+        || allocation_records_[data].hints.tag == "int_workspace") {
+        printf("================>>>>>Recycle buffer : %p [%s] \n", data, allocation_records_[data].hints.tag.c_str());
     }
 }
 

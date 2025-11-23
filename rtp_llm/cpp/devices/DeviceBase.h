@@ -208,8 +208,10 @@ private:
     virtual IAllocator* getAllocator()     = 0;
     virtual IAllocator* getHostAllocator() = 0;
 
+public:
+    int device_id_;
+
 protected:
-    int                                  device_id_;
     DeviceInitParams                     init_params_;
     std::shared_ptr<rtp_llm::CacheStore> cache_store_;
     bool                                 enable_device_perf_ = false;
