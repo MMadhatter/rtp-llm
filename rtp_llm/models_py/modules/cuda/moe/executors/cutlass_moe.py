@@ -260,8 +260,6 @@ class CutlassBatchedExpertsFp8(mm.FusedMoeExpertExecutor):
 
     def __init__(
         self,
-        max_num_tokens: int,
-        num_dispatchers: int,
         w1: torch.Tensor,
         w2: torch.Tensor,
         w1_scale: torch.Tensor,
@@ -288,8 +286,6 @@ class CutlassBatchedExpertsFp8(mm.FusedMoeExpertExecutor):
         self.a1q_scale = a1q_scale
         self.a2_scale = a2_scale
 
-        self.max_num_tokens = max_num_tokens
-        self.num_dispatchers = num_dispatchers
         self.num_local_experts = self.w1.size(0)
         self.num_experts = num_experts
 
