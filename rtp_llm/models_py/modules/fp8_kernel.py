@@ -178,7 +178,6 @@ def cutlass_moe_mm_fp8_scaled(
         # Get the optimal config
         key = min(configs.keys(), key=lambda x: abs(x - elements_m))
         config = configs[min(configs.keys(), key=lambda x: abs(x - elements_m))]
-        logging.info("Get best cutlass config: key=%d, M=%d, K=%d.", key, M, K)
         tile_m, tile_n, tile_k = config["tile_m"], config["tile_n"], config["tile_k"]
         cluster_m, cluster_n, cluster_k = (
             config["cluster_m"],

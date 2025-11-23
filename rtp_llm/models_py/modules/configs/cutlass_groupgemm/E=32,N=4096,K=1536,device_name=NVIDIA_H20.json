@@ -2,17 +2,17 @@
   "1": {
     "tile_m": 128,
     "tile_n": 16,
-    "tile_k": 256,
-    "cluster_m": 2,
+    "tile_k": 128,
+    "cluster_m": 1,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
   },
   "2": {
-    "tile_m": 128,
+    "tile_m": 64,
     "tile_n": 32,
     "tile_k": 128,
-    "cluster_m": 2,
+    "cluster_m": 1,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
@@ -21,7 +21,7 @@
     "tile_m": 128,
     "tile_n": 16,
     "tile_k": 128,
-    "cluster_m": 2,
+    "cluster_m": 1,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
@@ -29,7 +29,7 @@
   "8": {
     "tile_m": 128,
     "tile_n": 16,
-    "tile_k": 256,
+    "tile_k": 128,
     "cluster_m": 1,
     "cluster_n": 1,
     "cluster_k": 1,
@@ -39,7 +39,7 @@
     "tile_m": 128,
     "tile_n": 16,
     "tile_k": 256,
-    "cluster_m": 1,
+    "cluster_m": 2,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
@@ -47,7 +47,7 @@
   "24": {
     "tile_m": 128,
     "tile_n": 16,
-    "tile_k": 256,
+    "tile_k": 128,
     "cluster_m": 2,
     "cluster_n": 1,
     "cluster_k": 1,
@@ -57,7 +57,7 @@
     "tile_m": 128,
     "tile_n": 16,
     "tile_k": 128,
-    "cluster_m": 1,
+    "cluster_m": 2,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
@@ -66,7 +66,7 @@
     "tile_m": 128,
     "tile_n": 16,
     "tile_k": 128,
-    "cluster_m": 2,
+    "cluster_m": 1,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
@@ -75,7 +75,7 @@
     "tile_m": 128,
     "tile_n": 16,
     "tile_k": 256,
-    "cluster_m": 1,
+    "cluster_m": 2,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
@@ -84,7 +84,7 @@
     "tile_m": 128,
     "tile_n": 16,
     "tile_k": 128,
-    "cluster_m": 1,
+    "cluster_m": 2,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
@@ -101,8 +101,8 @@
   "256": {
     "tile_m": 128,
     "tile_n": 16,
-    "tile_k": 256,
-    "cluster_m": 2,
+    "tile_k": 128,
+    "cluster_m": 1,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
@@ -138,7 +138,7 @@
     "tile_m": 64,
     "tile_n": 64,
     "tile_k": 128,
-    "cluster_m": 2,
+    "cluster_m": 1,
     "cluster_n": 1,
     "cluster_k": 1,
     "swap_ab": true
@@ -155,6 +155,60 @@
   "4096": {
     "tile_m": 64,
     "tile_n": 64,
+    "tile_k": 128,
+    "cluster_m": 1,
+    "cluster_n": 2,
+    "cluster_k": 1,
+    "swap_ab": true
+  },
+  "5120": {
+    "tile_m": 128,
+    "tile_n": 32,
+    "tile_k": 128,
+    "cluster_m": 1,
+    "cluster_n": 1,
+    "cluster_k": 1,
+    "swap_ab": true
+  },
+  "6144": {
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 128,
+    "cluster_m": 1,
+    "cluster_n": 2,
+    "cluster_k": 1,
+    "swap_ab": false
+  },
+  "8192": {
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 128,
+    "cluster_m": 1,
+    "cluster_n": 1,
+    "cluster_k": 1,
+    "swap_ab": false
+  },
+  "16384": {
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 128,
+    "cluster_m": 2,
+    "cluster_n": 1,
+    "cluster_k": 1,
+    "swap_ab": true
+  },
+  "32768": {
+    "tile_m": 64,
+    "tile_n": 128,
+    "tile_k": 128,
+    "cluster_m": 1,
+    "cluster_n": 2,
+    "cluster_k": 1,
+    "swap_ab": true
+  },
+  "65536": {
+    "tile_m": 64,
+    "tile_n": 128,
     "tile_k": 128,
     "cluster_m": 1,
     "cluster_n": 2,

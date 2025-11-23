@@ -51,6 +51,10 @@ def _load_all_configs():
     logging.info(
         f"Loaded {len(_CUTLASS_GROUPGEMM_CONFIG_MAP)} cutlass groupgemm configurations"
     )
+    try:
+        import internal_source.rtp_llm.utils.register_cutlass_configs
+    except:
+        logging.info("internal_source not found")
 
 
 def register_cutlass_groupgemm_config(
