@@ -59,6 +59,15 @@ void BufferManager::recycle(Buffer* buffer, IAllocator* allocator) {
                           allocation_records_[data].hints.tag.c_str(),
                           buffer->debugString().c_str());
         held_data_.push_back(std::make_pair(data, allocator));
+
+        if (allocation_records_[data].hints.tag == "torch_allocated"
+            || allocation_records_[data].hints.tag == "float_workspace"
+            || allocation_records_[data].hints.tag == "int_workspace") {
+            printf("================>>>>>recycle held buffer : %p [%s] \n",
+                   data,
+                   allocation_records_[data].hints.tag.c_str());
+        }
+
         return;
     }
 
@@ -93,11 +102,11 @@ void BufferManager::recordAllcation(const BufferParams& params, const BufferHint
             AllocationRecord record             = {params.allocation, buffer->sizeBytes(), hints, stack_trace_id};
             allocation_records_[buffer->data()] = record;
         }
-        RTP_LLM_LOG_INFO("record allocation: %p, size: %zu, tag: [%s], trace id [%lu]",
-                         buffer->data(),
-                         buffer->sizeBytes(),
-                         hints.tag.c_str(),
-                         stack_trace_id);
+        RTP_LLM_LOG_DEBUG("record allocation: %p, size: %zu, tag: [%s], trace id [%lu]",
+                          buffer->data(),
+                          buffer->sizeBytes(),
+                          hints.tag.c_str(),
+                          stack_trace_id);
         if (hints.tag == "torch_allocated" || hints.tag == "float_workspace" || hints.tag == "int_workspace") {
             printf("================>>>>>Allocate buffer: %p, size: %zu, tag: [%s], trace id [%lu] \n",
                    buffer->data(),
@@ -108,12 +117,12 @@ void BufferManager::recordAllcation(const BufferParams& params, const BufferHint
         auto       status                = queryStatus();
         const auto device_consumed_bytes = status.device_allocated_bytes + status.device_fragmented_bytes;
         if (device_consumed_bytes > device_max_consumed_bytes_) {
-            RTP_LLM_LOG_INFO("Device allocated size + fragmented size reached new maximum %zu, \n"
-                             "previous is %zu bytes, current stack trace id[%lu]\n  %s",
-                             device_consumed_bytes,
-                             device_max_allocated_bytes_,
-                             stack_trace_id,
-                             printAllocationRecords(device_allocator_).c_str());
+            RTP_LLM_LOG_DEBUG("Device allocated size + fragmented size reached new maximum %zu, \n"
+                              "previous is %zu bytes, current stack trace id[%lu]\n  %s",
+                              device_consumed_bytes,
+                              device_max_allocated_bytes_,
+                              stack_trace_id,
+                              printAllocationRecords(device_allocator_).c_str());
             printf(
                 "Device allocated size + fragmented size reached new maximum %zu, \n previous is %zu bytes, current stack trace id[%lu]\n %s",
                 device_consumed_bytes,
