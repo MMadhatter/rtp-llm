@@ -4,10 +4,25 @@
 #include <pybind11/stl.h>
 #include <pybind11/embed.h>
 #include <torch/extension.h>
+#include <sstream>
 #include "rtp_llm/cpp/model_utils/AttentionConfig.h"
 #include "rtp_llm/models_py/bindings/ParamsBase.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 namespace torch_ext {
+
+// Utility function to convert tensor to string with shape, dtype, device and values
+inline std::string tensorToString(const torch::Tensor& t, const std::string& name) {
+    if (!t.defined()) {
+        return name + ": undefined";
+    }
+    std::ostringstream oss;
+    oss << name << ": shape=" << t.sizes() << ", dtype=" << t.dtype() << ", device=" << t.device();
+    // Print tensor values (move to CPU if on GPU)
+    torch::Tensor cpu_tensor = t.to(torch::kCPU);
+    oss << ", values=" << cpu_tensor;
+    return oss.str();
+}
+
 struct MlaParams {
     torch::Tensor batch_indice;
     torch::Tensor positions;
@@ -91,7 +106,27 @@ struct PyAttentionInputs {
     std::optional<PyCacheStoreInputs> cache_store_inputs;
 
     std::optional<PyPrefillCudaGaphCopyParams> prefill_cuda_graph_copy_params;
-    bool                              is_s_padded = false;
+    bool                                       is_s_padded = false;
+    std::string                                to_string() const {
+        std::ostringstream oss;
+        oss << "PyAttentionInputs {\n";
+        oss << "  is_prefill: " << (is_prefill ? "true" : "false") << "\n";
+        oss << "  " << tensorToString(prefix_lengths, "prefix_lengths") << "\n";
+        oss << "  " << tensorToString(sequence_lengths, "sequence_lengths") << "\n";
+        oss << "  " << tensorToString(input_lengths, "input_lengths") << "\n";
+        oss << "  " << tensorToString(kv_cache_block_id_host, "kv_cache_block_id_host") << "\n";
+        oss << "  " << tensorToString(kv_cache_block_id_device, "kv_cache_block_id_device") << "\n";
+        oss << "  dtype: " << dtype.name() << "\n";
+        oss << "  kv_block_offset: " << kv_block_offset << "\n";
+        oss << "  " << tensorToString(cu_seqlens, "cu_seqlens") << "\n";
+        oss << "  " << tensorToString(padding_offset, "padding_offset") << "\n";
+        oss << "  cache_store_inputs: " << (cache_store_inputs.has_value() ? "present" : "nullopt") << "\n";
+        oss << "  prefill_cuda_graph_copy_params: "
+            << (prefill_cuda_graph_copy_params.has_value() ? "present" : "nullopt") << "\n";
+        oss << "  is_s_padded: " << (is_s_padded ? "true" : "false") << "\n";
+        oss << "}";
+        return oss.str();
+    }
 };
 
 struct BertEmbeddingInputs {
