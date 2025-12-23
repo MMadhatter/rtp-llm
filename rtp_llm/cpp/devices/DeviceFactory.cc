@@ -71,6 +71,8 @@ void DeviceFactory::initDevices(const GptInitParameter& params) {
     device_params.ep_rank                        = params.ep_rank_;
     device_params.tp_rank                        = params.tp_rank_;
     device_params.dp_rank                        = params.dp_rank_;
+    device_params.cp_rank                        = params.cp_rank_;
+    device_params.cp_size                        = params.cp_size_;
     device_params.ffn_tp_size                    = params.ffn_tp_size_;
     device_params.ffn_tp_rank                    = params.ffn_tp_rank_;
     device_params.enable_sp                      = params.enable_sp_;

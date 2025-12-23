@@ -129,6 +129,18 @@ GptModelOutputs PyWrappedModel::callForwardPostLayers(BufferPtr             hidd
                              skip_final_layernorm);
 }
 
+std::optional<PyContextParallelParams> PyWrappedModel::prepareContextParallelParams(const GptModelInputs& inputs) {
+    std::optional<PyContextParallelParams> params;
+    if (inputs.prefill_cp_padding_lengths) {
+        params = PyContextParallelParams{
+            Buffer2torchTensor(inputs.prefill_cp_padding_lengths),
+            Buffer2torchTensor(inputs.prefill_cp_chunk_lengths),
+            Buffer2torchTensor(inputs.prefill_shuffle_indices),
+        };
+    }
+    return params;
+}
+
 std::optional<PyCacheStoreInputs> PyWrappedModel::prepareWriteCacheParams(const GptModelInputs& inputs) {
     std::optional<PyCacheStoreInputs> params;
     if (!inputs.warmup && inputs.pd_separation) {
@@ -240,6 +252,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         BufferPtr kv_cache_block_id_device;
         if (!inputs.warmup && inputs.pd_separation) {
             attention_inputs.cache_store_inputs = prepareWriteCacheParams(inputs);
+        }
+        if (inputs.prefill_cp_padding_lengths) {
+            attention_inputs.context_parallel_info = prepareContextParallelParams(inputs);
         }
         setupKVCacheForAttentionInputs(attention_inputs, inputs, kv_cache_block_id_device);
 

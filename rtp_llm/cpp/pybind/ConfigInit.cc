@@ -26,10 +26,11 @@ void registerFMHAType(py::module m) {
 
 void register_parallelism_distributed_config(pybind11::module& m) {
     pybind11::class_<ParallelismDistributedConfig>(m, "ParallelismDistributedConfig")
-        .def(pybind11::init<int, int, int, int, int, int, int, int, bool>(),
+        .def(pybind11::init<int, int, int, int, int, int, int, int, int, bool>(),
              pybind11::arg("tp_size")          = 1,
              pybind11::arg("ep_size")          = 1,
              pybind11::arg("dp_size")          = 1,
+             pybind11::arg("cp_size")          = 1,
              pybind11::arg("pp_size")          = 1,
              pybind11::arg("world_size")       = 1,
              pybind11::arg("world_rank")       = 0,
@@ -41,6 +42,7 @@ void register_parallelism_distributed_config(pybind11::module& m) {
         .def_readwrite("tp_size", &ParallelismDistributedConfig::tp_size)
         .def_readwrite("ep_size", &ParallelismDistributedConfig::ep_size)
         .def_readwrite("dp_size", &ParallelismDistributedConfig::dp_size)
+        .def_readwrite("cp_size", &ParallelismDistributedConfig::cp_size)
         .def_readwrite("pp_size", &ParallelismDistributedConfig::pp_size)
         .def_readwrite("world_size", &ParallelismDistributedConfig::world_size)
         .def_readwrite("world_rank", &ParallelismDistributedConfig::world_rank)
@@ -684,6 +686,8 @@ void registerGptInitParameter(py::module m) {
     DEF_PROPERTY(tp_rank, tp_rank_)                                                                                    \
     DEF_PROPERTY(dp_size, dp_size_)                                                                                    \
     DEF_PROPERTY(dp_rank, dp_rank_)                                                                                    \
+    DEF_PROPERTY(cp_size, cp_size_)                                                                                    \
+    DEF_PROPERTY(cp_rank, cp_rank_)                                                                                    \
     DEF_PROPERTY(ffn_tp_size, ffn_tp_size_)                                                                            \
     DEF_PROPERTY(ffn_tp_rank, ffn_tp_rank_)                                                                            \
     DEF_PROPERTY(enable_sp, enable_sp_)                                                                                \

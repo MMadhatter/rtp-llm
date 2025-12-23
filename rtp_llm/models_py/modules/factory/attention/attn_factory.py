@@ -9,6 +9,7 @@ from rtp_llm.utils.model_weight import W
 
 # Lists to store registered implementations
 PREFILL_MHA_IMPS: List[type[FMHAImplBase]] = []
+PREFILL_CP_MHA_IMPS: List[type[FMHAImplBase]] = []
 DECODE_MHA_IMPS: List[type[FMHAImplBase]] = []
 PREFILL_MLA_IMPS: List[type[FMHAImplBase]] = []
 DECODE_MLA_IMPS: List[type[FMHAImplBase]] = []
@@ -34,7 +35,10 @@ def get_mla_impl(
 def get_fmha_impl(
     config: GptInitModelParameters, weight: ModelWeights, attn_inputs: PyAttentionInputs
 ) -> FMHAImplBase:
-    mha_impls = PREFILL_MHA_IMPS if attn_inputs.is_prefill else DECODE_MHA_IMPS
+    if config.cp_size > 1:
+        mha_impls = PREFILL_CP_MHA_IMPS
+    else:
+        mha_impls = PREFILL_MHA_IMPS if attn_inputs.is_prefill else DECODE_MHA_IMPS
     for impl in mha_impls:
         instance = impl(config, attn_inputs)
         if instance.support():

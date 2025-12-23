@@ -64,7 +64,6 @@ class Qwen3DecoderLayer(nn.Module):
 class Qwen3Model(GptModelBase):
     def __init__(self, config: GptInitModelParameters, weights: ModelWeights):
         super().__init__(config, weights)
-
         self.embed_tokens = Embedding(config, weights.get_global_weight(W.embedding))
         self.layers = nn.ModuleList(
             [

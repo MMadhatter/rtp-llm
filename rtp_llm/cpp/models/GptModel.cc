@@ -1769,8 +1769,12 @@ BufferPtr GptModel::mergeEagle3HiddenState(const GptLayerInputs&   layer_inputs,
 }
 
 void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
-    if (device->getDeviceProperties().tp_size <= 1) {
+    if (device->getDeviceProperties().tp_size <= 1 && device->getDeviceProperties().cp_size <= 1) {
         return;
+    }
+    auto parallel_mode = ParallelMode::TP;
+    if (device->getDeviceProperties().cp_size > 1) {
+        parallel_mode = ParallelMode::CP;
     }
     const size_t shape_hints_size = GptModelInputIndex::gptModelInputLength;
     auto         shape_hints =
@@ -1813,7 +1817,14 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
     shape_hints_ptr[GptModelInputIndex::mtpHiddenStatesDtype] =
         shape_hints_ptr[GptModelInputIndex::mtpHiddenStates] ? (std::uint8_t)inputs.last_hidden_states->type() : 0;
     shape_hints_ptr[GptModelInputIndex::skipRun] = inputs.skip_run;
-    device->broadcast({{shape_hints}, 0});
+    shape_hints_ptr[GptModelInputIndex::cpChunkLengths] =
+        inputs.prefill_cp_padding_lengths.get() ? inputs.prefill_cp_padding_lengths->size() : 0;
+    shape_hints_ptr[GptModelInputIndex::cpPaddingLengths] =
+        inputs.prefill_cp_chunk_lengths.get() ? inputs.prefill_cp_chunk_lengths->size() : 0;
+    shape_hints_ptr[GptModelInputIndex::cpShuffleIndices] =
+        inputs.prefill_shuffle_indices.get() ? inputs.prefill_shuffle_indices->size() : 0;
+
+    device->broadcast({{shape_hints}, 0, parallel_mode});
     device->syncCommunication(false);
     device->syncAndCheck();
 
@@ -1835,7 +1846,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
             mm_features_shape_ptr[i] =
                 inputs.multimodal_features.has_value() ? inputs.multimodal_features.value()[i]->shape()[0] : 0;
         }
-        device->broadcast({{mm_features_shape}, 0});
+        device->broadcast({{mm_features_shape}, 0, parallel_mode});
         device->syncCommunication(false);
         device->syncAndCheck();
     }
@@ -1846,7 +1857,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
     auto mm_features_locs_size   = shape_hints_ptr[GptModelInputIndex::mmFeaturesLocs];
     auto hidden_states_size      = shape_hints_ptr[GptModelInputIndex::mtpHiddenStates];
 
-    if (device->getDeviceProperties().tp_rank) {
+    if (device->getDeviceProperties().tp_rank || device->getDeviceProperties().cp_rank) {
         auto context_batch_size = (size_t)shape_hints_ptr[GptModelInputIndex::prefixLengths];
 
         inputs.combo_tokens  = device->allocateBuffer({rtp_llm::DataType::TYPE_INT32,
@@ -1930,6 +1941,24 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
             }
             inputs.multimodal_features = std::move(mm_features);
         }
+        if (shape_hints_ptr[GptModelInputIndex::cpPaddingLengths]) {
+            inputs.prefill_cp_padding_lengths =
+                device->allocateBuffer({rtp_llm::DataType::TYPE_INT32,
+                                        {(size_t)shape_hints_ptr[GptModelInputIndex::cpPaddingLengths]},
+                                        rtp_llm::AllocationType::HOST});
+        }
+        if (shape_hints_ptr[GptModelInputIndex::cpChunkLengths]) {
+            inputs.prefill_cp_chunk_lengths =
+                device->allocateBuffer({rtp_llm::DataType::TYPE_INT32,
+                                        {(size_t)shape_hints_ptr[GptModelInputIndex::cpChunkLengths]},
+                                        rtp_llm::AllocationType::HOST});
+        }
+        if (shape_hints_ptr[GptModelInputIndex::cpShuffleIndices]) {
+            inputs.prefill_shuffle_indices =
+                device->allocateBuffer({rtp_llm::DataType::TYPE_INT32,
+                                        {(size_t)shape_hints_ptr[GptModelInputIndex::cpShuffleIndices]},
+                                        rtp_llm::AllocationType::HOST});
+        }
     }
 
     std::vector<rtp_llm::BufferPtr> buffers;
@@ -1967,7 +1996,16 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
     if (hidden_states_size) {
         buffers.emplace_back(inputs.last_hidden_states);
     }
-    device->broadcast({buffers, 0});
+    if (shape_hints_ptr[GptModelInputIndex::cpPaddingLengths]) {
+        buffers.emplace_back(inputs.prefill_cp_padding_lengths);
+    }
+    if (shape_hints_ptr[GptModelInputIndex::cpChunkLengths]) {
+        buffers.emplace_back(inputs.prefill_cp_chunk_lengths);
+    }
+    if (shape_hints_ptr[GptModelInputIndex::cpShuffleIndices]) {
+        buffers.emplace_back(inputs.prefill_shuffle_indices);
+    }
+    device->broadcast({buffers, 0, parallel_mode});
     device->syncAndCheck();
 }
 

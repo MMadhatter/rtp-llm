@@ -269,7 +269,8 @@ absl::Status NormalEngine::step() {
     }
 
     list<GenerateStreamPtr> streams;
-    if (device_->getDeviceProperties().tp_rank == 0 && !params_.ffn_disaggregate_config.is_ffn_service()) {
+    if (device_->getDeviceProperties().tp_rank == 0 && device_->getDeviceProperties().cp_rank == 0
+        && !params_.ffn_disaggregate_config.is_ffn_service()) {
         CHECK_AND_ASSIGN(streams, scheduler_->schedule());
         if (streams.empty()) {
             if (params_.dp_size_ > 1) {

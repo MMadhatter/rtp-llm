@@ -62,7 +62,10 @@ enum GptModelInputIndex : size_t {
     mtpHiddenStates,
     mtpHiddenStatesDtype,
     skipRun,
-    gptModelInputLength,
+    cpPaddingLengths,  // for context parallel
+    cpChunkLengths,
+    cpShuffleIndices,
+    gptModelInputLength
 };
 
 void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device);

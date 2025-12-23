@@ -80,7 +80,7 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                   params,
 
     // when warmup, cache manager maybe nullptr
     const auto& cache_config = cache_manager ? cache_manager->cacheConfig() : CacheConfig();
-    batch_stream_processor_.reset(new NormalBatchStreamProcessor(params.gpt_init_parameter, cache_config, warm_up_));
+    batch_stream_processor_  = NormalBatchStreamProcessor::create(params.gpt_init_parameter, cache_config, warm_up_);
     PrefixToCandidateTokens::instance()->reloadPrefixDictWithPrefix(
         params.gpt_init_parameter.ckpt_path_, params.gpt_init_parameter.sp_config.tree_decode_config);
     device_->profileStart();
@@ -106,6 +106,13 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         tpSyncModelInputs(model_input, device_);
         if (model_input.skip_run) {
             return absl::OkStatus();
+        }
+        if (device_->getDeviceProperties().cp_size > 0) {
+            // handle context parallel inputs
+            // do padding and shuffle and slice
+            int cp_rank = device_->getDeviceProperties().cp_rank;
+            int cp_size = device_->getDeviceProperties().cp_size;
+            handleContextParallelInputs(model_input, cp_rank, cp_size);
         }
         executor_collector.tp_sync_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
@@ -137,7 +144,9 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         expert_balancer_->stepForward(*model_, executor_collector);
         executor_collector.eplb_step_latency_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
-    if (device_->getDeviceProperties().tp_rank > 0 || warm_up_ || streams.size() == 0) {
+
+    if (device_->getDeviceProperties().tp_rank > 0 || device_->getDeviceProperties().cp_rank > 0 || warm_up_
+        || streams.size() == 0) {
         return absl::OkStatus();
     }
     {
@@ -161,7 +170,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
 void NormalExecutor::reportMetrics(const StreamGroups&             stream_groups,
                                    RtpLLMExecutorMetricsCollector& executor_collector,
                                    RtpLLMTokenPSMetricsCollector&  tps_collector) {
-    if (device_->getDeviceProperties().tp_rank > 0) {
+    if (device_->getDeviceProperties().tp_rank > 0 || device_->getDeviceProperties().cp_rank > 0) {
         return;
     }
     if (metrics_reporter_) {
@@ -184,6 +193,10 @@ void NormalExecutor::reportMetrics(const StreamGroups&             stream_groups
     }
 }
 
+void NormalExecutor::handleContextParallelInputs(GptModelInputs& model_input, int cp_rank, int cp_size) {
+    auto input_tokens = model_input.combo_tokens;
+    return;
+}
 bool NormalExecutor::updateEplbConfig(const EplbConfig& config) {
     if (expert_balancer_) {
         return expert_balancer_->updateEplbConfig(config);

@@ -1,10 +1,6 @@
 from __future__ import annotations
 import typing
-from typing import Dict, overload
-__all__: list[str] = ['ArpcConfig', 'BatchDecodeSchedulerConfig', 'CacheStoreConfig', 'ConcurrencyConfig', 'DeviceResourceConfig', 'EplbConfig', 'EplbMode', 'FIFOSchedulerConfig', 'FMHAConfig', 'FMHAType', 'FfnDisAggregateConfig', 'GptInitParameter', 'GrpcConfig', 'HWKernelConfig', 'KVCacheConfig', 'MiscellaneousConfig',
-                      'MlaOpsType', 'ModelSpecificConfig', 'MoeConfig', 'ParallelismDistributedConfig', 'ProfilingDebugLoggingConfig', 'QuantAlgo', 'RoleSpecialTokens', 'RoleType', 'SamplerConfig', 'SchedulerConfig', 'ServiceDiscoveryConfig', 'SpecialTokens', 'SpeculativeExecutionConfig', 'get_block_cache_keys']
-
-
+__all__: list[str] = ['ArpcConfig', 'BatchDecodeSchedulerConfig', 'CacheStoreConfig', 'ConcurrencyConfig', 'DeviceResourceConfig', 'EplbConfig', 'EplbMode', 'FIFOSchedulerConfig', 'FMHAConfig', 'FMHAType', 'FfnDisAggregateConfig', 'GptInitParameter', 'GrpcConfig', 'HWKernelConfig', 'KVCacheConfig', 'MiscellaneousConfig', 'MlaOpsType', 'ModelSpecificConfig', 'MoeConfig', 'ParallelismDistributedConfig', 'ProfilingDebugLoggingConfig', 'QuantAlgo', 'RoleSpecialTokens', 'RoleType', 'SamplerConfig', 'SchedulerConfig', 'ServiceDiscoveryConfig', 'SpecialTokens', 'SpeculativeExecutionConfig', 'get_block_cache_keys']
 class ArpcConfig:
     ioThreadNum: int
     queueNum: int
@@ -13,27 +9,10 @@ class ArpcConfig:
         ...
     def to_string(self) -> str:
         ...
-
-class GrpcConfig:
-    def __init__(self) -> None: 
-    
-    def __init__(self, json_str: str) -> None: 
-        ...
-    
-    def to_string(self) -> str: 
-        ...
-        
-    def update_from_env(self) -> None: 
-        ... 
-        
-    def get_client_config(self) -> dict[str, int]: 
-        ...
-    
-    def get_server_config(self) -> dict[str, int]: 
-        ...
-
 class BatchDecodeSchedulerConfig:
     batch_decode_scheduler_batch_size: int
+    def __init__(self, batch_decode_scheduler_batch_size: int = 1, batch_decode_scheduler_warmup_type: int = 0) -> None:
+        ...
     def to_string(self) -> str:
         ...
     def update_from_env(self) -> None:
@@ -241,7 +220,6 @@ class GptInitParameter:
     activation_type: str
     add_bias_linear: bool
     arpc_config: ArpcConfig
-    grpc_config: GrpcConfig
     batch_decode_scheduler_config: BatchDecodeSchedulerConfig
     block_nums: int
     cache_store_config: CacheStoreConfig
@@ -252,6 +230,8 @@ class GptInitParameter:
     cache_store_rdma_mode: bool
     ckpt_path: str
     concurrency_config: ConcurrencyConfig
+    cp_rank: int
+    cp_size: int
     cross_attn_input_len: int
     data_type: str
     decode_entrance: bool
@@ -266,6 +246,7 @@ class GptInitParameter:
     dp_rank: int
     dp_size: int
     dp_tp_nccl_port: int
+    embedding_rpc_port: int
     embedding_size: int
     enable_eplb: bool
     enable_fast_gen: bool
@@ -285,6 +266,7 @@ class GptInitParameter:
     fifo_scheduler_config: FIFOSchedulerConfig
     fmha_config: FMHAConfig
     gen_num_per_circle: int
+    grpc_config: GrpcConfig
     has_lm_head: bool
     has_moe_norm: bool
     has_positional_encoding: bool
@@ -435,6 +417,25 @@ class GptInitParameter:
         ...
     def showDebugInfo(self) -> None:
         ...
+class GrpcConfig:
+    @typing.overload
+    def __init__(self) -> None:
+        ...
+    @typing.overload
+    def __init__(self, json_str: str) -> None:
+        ...
+    def from_json(self, arg0: str) -> None:
+        """
+        Initialize from JSON string
+        """
+    def get_client_config(self) -> dict[str, int]:
+        ...
+    def get_server_config(self) -> dict[str, int]:
+        ...
+    def to_string(self) -> str:
+        ...
+    def update_from_env(self) -> None:
+        ...
 class HWKernelConfig:
     arm_gemm_use_kai: bool
     decode_capture_batch_sizes: list[int]
@@ -558,6 +559,7 @@ class MoeConfig:
     def update_from_env(self) -> None:
         ...
 class ParallelismDistributedConfig:
+    cp_size: int
     dp_size: int
     ep_size: int
     ffn_sp_size: int
@@ -567,7 +569,7 @@ class ParallelismDistributedConfig:
     use_all_gather: bool
     world_rank: int
     world_size: int
-    def __init__(self, tp_size: int = 1, ep_size: int = 1, dp_size: int = 1, pp_size: int = 1, world_size: int = 1, world_rank: int = 0, local_world_size: int = 1, ffn_sp_size: int = 1, use_all_gather: bool = True) -> None:
+    def __init__(self, tp_size: int = 1, ep_size: int = 1, dp_size: int = 1, cp_size: int = 1, pp_size: int = 1, world_size: int = 1, world_rank: int = 0, local_world_size: int = 1, ffn_sp_size: int = 1, use_all_gather: bool = True) -> None:
         ...
     def to_string(self) -> str:
         ...

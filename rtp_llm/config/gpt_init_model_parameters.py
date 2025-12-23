@@ -250,6 +250,8 @@ class GptInitModelParameters:
     dp_size: int
     dp_tp_nccl_port: int
     th_nccl_port: int
+    cp_rank: int
+    cp_size: int
     embedding_size: int
     enable_eplb: bool
     enable_fast_gen: bool
@@ -730,6 +732,7 @@ class GptInitModelParameters:
                 tp_size=parallel_info.tp_size,
                 ep_size=parallel_info.ep_size,
                 dp_size=parallel_info.dp_size,
+                cp_size=parallel_info.cp_size,
                 world_size=parallel_info.world_size,
                 world_rank=parallel_info.world_rank,
                 local_world_size=parallel_info.local_world_size,
@@ -1153,6 +1156,8 @@ class GptInitModelParameters:
         self.ep_rank = parallel_info.ep_rank
         self.dp_size = parallel_info.dp_size
         self.dp_rank = parallel_info.dp_rank
+        self.cp_size = parallel_info.cp_size
+        self.cp_rank = parallel_info.cp_rank
         self.ffn_tp_rank = parallel_info.ffn_tp_rank
         self.ffn_tp_size = parallel_info.ffn_tp_size
         self.enable_sp = parallel_info.ffn_sp_size > 1

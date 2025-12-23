@@ -22,7 +22,8 @@ public:
     GptModelOutputs forwardMicroBatched(const GptModelInputs& inputs);
 
 private:
-    std::optional<PyCacheStoreInputs> prepareWriteCacheParams(const GptModelInputs& inputs);
+    std::optional<PyCacheStoreInputs>      prepareWriteCacheParams(const GptModelInputs& inputs);
+    std::optional<PyContextParallelParams> prepareContextParallelParams(const GptModelInputs& inputs);
 
 private:
     // Helper functions to reduce code duplication

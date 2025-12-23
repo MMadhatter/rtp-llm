@@ -9,6 +9,7 @@ struct ParallelismDistributedConfig {
     int         tp_size          = 1;
     int         ep_size          = 1;
     int         dp_size          = 1;
+    int         cp_size          = 1;
     int         pp_size          = 1;
     int         world_size       = 1;
     int         world_rank       = 0;
@@ -229,6 +230,7 @@ public:
                  int pp_size          = 1,
                  int ep_size          = 1,
                  int dp_size          = 1,
+                 int cp_size          = 1,
                  int world_size       = 1,
                  int world_rank       = 0,
                  int local_world_size = 1):
@@ -236,6 +238,7 @@ public:
         pp_size_(pp_size),
         ep_size_(ep_size),
         dp_size_(dp_size),
+        cp_size_(cp_size),
         world_size_(world_size),
         world_rank_(world_rank),
         local_world_size_(local_world_size) {}
@@ -268,6 +271,12 @@ public:
     }
     int getEpSize() const {
         return ep_size_;
+    }
+    void setCpSize(int cp_size) {
+        cp_size_ = cp_size;
+    }
+    int getCpSize() const {
+        return cp_size_;
     }
     int getTpRank() const {
         return world_rank_ % tp_size_;
@@ -302,8 +311,9 @@ public:
     std::string toString() const {
         std::ostringstream oss;
         oss << "ParallelInfo:[ "
-            << "tp_size=" << tp_size_ << " pp_size=" << pp_size_ << " world_size=" << world_size_
-            << " world_rank=" << world_rank_ << " local_world_size=" << local_world_size_ << " ]";
+            << "tp_size=" << tp_size_ << " pp_size=" << pp_size_ << " cp_size=" << cp_size_
+            << " world_size=" << world_size_ << " world_rank=" << world_rank_
+            << " local_world_size=" << local_world_size_ << " ]";
         return oss.str();
     }
     // only for test
@@ -315,6 +325,7 @@ public:
         pp_size_          = parallelism_distributed_config.pp_size;
         ep_size_          = parallelism_distributed_config.ep_size;
         dp_size_          = parallelism_distributed_config.dp_size;
+        cp_size_          = parallelism_distributed_config.cp_size;
         world_size_       = parallelism_distributed_config.world_size;
         world_rank_       = parallelism_distributed_config.world_rank;
         local_world_size_ = parallelism_distributed_config.local_world_size;
@@ -325,6 +336,7 @@ private:
     int pp_size_;
     int ep_size_;
     int dp_size_;
+    int cp_size_;
     int world_size_;
     int world_rank_;
     int local_world_size_;

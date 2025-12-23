@@ -169,6 +169,10 @@ absl::StatusOr<int> StreamCacheResource::incrKVBlock(int token_capacity, size_t 
         }
     }
     auto seq_len = stream_->isChunkStream() ? stream_->currentChunkLen() : (stream_->seqLength() + (int)reserve_step);
+
+    if (stream_->isContextParallelStream()) {
+        seq_len = stream_->contextParallelChunkSize();
+    }
     auto common_seq_len     = std::min(seq_len, stream_->adjustedCommonLen());
     auto common_blocks_nums = singleBatchNeedBlocks(common_seq_len);
 

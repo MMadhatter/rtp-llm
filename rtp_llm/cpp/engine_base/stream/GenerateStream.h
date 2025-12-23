@@ -188,6 +188,11 @@ public:
     bool                      isChunkStream() const;
     const rtp_llm::BufferPtr& cumLogProbs() const;
 
+    bool isContextParallelStream() const;
+    int  contextParallelChunkSize() const;
+    int  contextParallelPaddedSeqLen() const;
+    int  contextParallelPrefillPaddingSize() const;
+
     const rtp_llm::BufferPtr& completeTokenIds();
     std::vector<int>          completeTokenIdsVec(int batch_idx = 0);
     std::vector<int>          commonCompleteTokenIdsVec(int batch_idx = 0);
@@ -523,6 +528,12 @@ protected:
     int                                  fallback_blocks_        = 0;
     int                                  fallback_times_         = 0;
     int                                  fallback_prefix_length_ = 0;
+
+    // for context parallel
+    size_t cp_size_                 = 1;
+    int    cp_prefill_chunk_size_   = 0;
+    int    cp_prefill_padding_size_ = 0;
+
     // TOOD(xinfei.sxf) fix state
     bool done_                  = false;
     bool released_              = false;

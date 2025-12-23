@@ -10,6 +10,7 @@ class Group(Enum):
     DP = "DP"
     TP = "TP"
     DP_AND_TP = "DP_AND_TP"
+    CP = "CP"
 
 
 try:
@@ -24,6 +25,8 @@ try:
             return RtpProcessGroupType.TP_GROUP
         elif group == Group.DP_AND_TP:
             return RtpProcessGroupType.DP_AND_TP_GROUP
+        elif group == Group.CP:
+            return RtpProcessGroupType.CP_GROUP
         raise ValueError(f"Invalid group: {group}")
 
     def _get_group(group: Group) -> RtpProcessGroup:

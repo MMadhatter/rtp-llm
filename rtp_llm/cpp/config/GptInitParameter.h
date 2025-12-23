@@ -208,16 +208,16 @@ public:
     int64_t seq_size_per_block_      = 8;
     int64_t max_block_size_per_item_ = 16;
 
-    int64_t block_nums_                       = 0;
-    int64_t reserve_runtime_mem_mb_           = 0;
-    int64_t kv_cache_mem_mb_                  = 0;
-    bool    reuse_cache_                      = false;
-    bool    enable_partial_fallback_          = false;
-    bool    enable_fast_gen_                  = false;
-    bool    warm_up_                          = false;
-    bool    warm_up_with_loss_                = false;
-    int64_t fast_gen_max_context_len_         = 0;
-    bool    reverse_e_h_norm_                 = false;
+    int64_t block_nums_               = 0;
+    int64_t reserve_runtime_mem_mb_   = 0;
+    int64_t kv_cache_mem_mb_          = 0;
+    bool    reuse_cache_              = false;
+    bool    enable_partial_fallback_  = false;
+    bool    enable_fast_gen_          = false;
+    bool    warm_up_                  = false;
+    bool    warm_up_with_loss_        = false;
+    int64_t fast_gen_max_context_len_ = 0;
+    bool    reverse_e_h_norm_         = false;
 
     std::string nccl_ip_            = "";
     bool        use_all_gather_     = false;
@@ -233,6 +233,8 @@ public:
     int64_t     ep_rank_            = 0;
     int64_t     dp_size_            = 1;
     int64_t     dp_rank_            = 0;
+    int64_t     cp_rank_            = 0;
+    int64_t     cp_size_            = 1;
     int64_t     ffn_tp_size_        = 1;
     int64_t     ffn_tp_rank_        = 0;
     bool        enable_sp_          = false;

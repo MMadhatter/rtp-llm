@@ -65,6 +65,12 @@ void registerPyOpDefs(pybind11::module& m) {
         .def_readonly("max_seq_len", &PyPrefillCudaGaphCopyParams::max_seq_len)
         .def_readonly("max_batch_size", &PyPrefillCudaGaphCopyParams::max_batch_size);
 
+    pybind11::class_<PyContextParallelParams>(m, "PyContextParallelParams")
+        .def(pybind11::init<>())
+        .def_readwrite("prefill_cp_padding_lengths", &PyContextParallelParams::prefill_cp_padding_lengths)
+        .def_readwrite("prefill_cp_chunk_lengths", &PyContextParallelParams::prefill_cp_chunk_lengths)
+        .def_readwrite("prefill_shuffle_indices", &PyContextParallelParams::prefill_shuffle_indices);
+
     pybind11::class_<PyAttentionInputs>(m, "PyAttentionInputs")
         .def(pybind11::init<>())
         .def_readwrite("is_prefill", &PyAttentionInputs::is_prefill)
@@ -79,6 +85,7 @@ void registerPyOpDefs(pybind11::module& m) {
         .def_readwrite("cu_seqlens_without_prefix", &PyAttentionInputs::cu_seqlens_without_prefix)
         .def_readwrite("padding_offset", &PyAttentionInputs::padding_offset)
         .def_readwrite("cache_store_inputs", &PyAttentionInputs::cache_store_inputs)
+        .def_readwrite("context_parallel_info", &PyAttentionInputs::context_parallel_info)
         .def("__repr__", [](const PyAttentionInputs& self) { return "PyAttentionInputs"; })
         .def_readonly("prefill_cuda_graph_copy_params", &PyAttentionInputs::prefill_cuda_graph_copy_params);
 

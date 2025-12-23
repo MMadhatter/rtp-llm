@@ -29,6 +29,7 @@ void ParallelismDistributedConfig::update_from_env_for_test() {
     tp_size          = autil::EnvUtil::getEnv("TP_SIZE", 1);
     ep_size          = autil::EnvUtil::getEnv("EP_SIZE", 1);
     dp_size          = autil::EnvUtil::getEnv("DP_SIZE", 1);
+    cp_size          = autil::EnvUtil::getEnv("CP_SIZE", 1);
     pp_size          = autil::EnvUtil::getEnv("PP_SIZE", 1);
     world_size       = autil::EnvUtil::getEnv("WORLD_SIZE", 1);
     world_rank       = autil::EnvUtil::getEnv("WORLD_RANK", 0);
@@ -43,6 +44,7 @@ std::string ParallelismDistributedConfig::to_string() const {
     oss << "tp_size: " << tp_size << "\n"
         << "ep_size: " << ep_size << "\n"
         << "dp_size: " << dp_size << "\n"
+        << "cp_size: " << cp_size << "\n"
         << "world_size: " << world_size << "\n"
         << "world_rank: " << world_rank << "\n"
         << "pp_size: " << pp_size << "\n"

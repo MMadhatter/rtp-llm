@@ -34,9 +34,10 @@ struct EngineInitParams {
             gpt_init_parameter.profiling_debug_logging_config.ft_core_dump_on_exception;
         StaticConfig::user_disable_pdl = gpt_init_parameter.misc_config.disable_pdl;
         // default 1 minute and 1000
-        ParallelInfo& global_parallel_info    = ParallelInfo::globalParallelInfo();
+        ParallelInfo& global_parallel_info = ParallelInfo::globalParallelInfo();
         global_parallel_info.setTpSize(gpt_init_parameter.parallelism_distributed_config.tp_size);
         global_parallel_info.setPpSize(gpt_init_parameter.parallelism_distributed_config.pp_size);
+        global_parallel_info.setCpSize(gpt_init_parameter.parallelism_distributed_config.cp_size);
         global_parallel_info.setEpSize(gpt_init_parameter.parallelism_distributed_config.ep_size);
         global_parallel_info.setDpSize(gpt_init_parameter.parallelism_distributed_config.dp_size);
         global_parallel_info.setWorldSize(gpt_init_parameter.parallelism_distributed_config.world_size);
