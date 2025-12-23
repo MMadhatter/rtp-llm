@@ -126,7 +126,53 @@ class ContextParallelFlashInferRaggedPrefillOp:
         """Check if this operator supports the given attention inputs."""
         return attention_inputs.is_prefill and self.config.cp_size > 1
 
+    def _prepare_cp_data(
+        self,
+        cp_chunk_lengths: torch.Tensor,
+        cp_shuffle_indices: torch.Tensor,
+        cp_padding_lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        # return q_lens, kv_lens之类的东西
+        return
+
     def prepare(self, attention_inputs: PyAttentionInputs) -> ParamsBase:
+        """
+        Prepare context parallel attention computation with zig-zag load balancing.
+        Zig-zag Attention Partitioning for Causal Attention:
+        For a sequence of length N distributed across cp_size ranks:
+        1. Tokens are split using zig-zag shuffle: alternating chunks from start/end
+           Example (cp_size=4, N=16, chunk=2): [0,1, 14,15, 2,3, 12,13, 4,5, 10,11, 6,7, 8,9]
+                                                 └─┘  └──┘  └─┘  └──┘  └─┘  └──┘  └─┘  └─┘
+                                           rank0(r0)   r0  r1   r1    r2   r2    r3   r3
+        2. Each rank holds a subset of Q and KV:
+           - Rank i has Q_i (queries for its token chunk)
+           - Rank i has KV_i (keys/values for its token chunk)
+
+        3. Causal Attention Matrix (Q attends to KV where token_j <= token_i):
+
+                      KV0  KV1  KV2  KV3  KV4  KV5  KV6  KV7  KV8  KV9  KV10 KV11 KV12 KV13 KV14 KV15
+           Q0   (r0) [ C   ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗   ]
+           Q1   (r0) [ C   C    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗   ] 2
+           Q2   (r1) [ C   C    C    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗   ]
+           Q3   (r1) [ C   C    C    C    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗   ] 4
+           Q4   (r2) [ C   C    C    C    C    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗   ]
+           Q5   (r2) [ C   C    C    C    C    C    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗   ] 6
+           Q6   (r3) [ C   C    C    C    C    C    C    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗   ]
+           Q7   (r3) [ C   C    C    C    C    C    C    C    ✗    ✗    ✗    ✗    ✗    ✗    ✗    ✗   ]  8
+           Q8   (r3) [ C   C    C    C    C    C    C    C    C    ✗    ✗    ✗    ✗    ✗    ✗    ✗   ]
+           Q9   (r3) [ C   C    C    C    C    C    C    C    C    C    ✗    ✗    ✗    ✗    ✗    ✗   ] 10
+           Q10  (r2) [ C   C    C    C    C    C    C    C    C    C    C    ✗    ✗    ✗    ✗    ✗   ]
+           Q11  (r2) [ C   C    C    C    C    C    C    C    C    C    C    C    ✗    ✗    ✗    ✗   ] 12
+           Q12  (r1) [ C   C    C    C    C    C    C    C    C    C    C    C    C    ✗    ✗    ✗   ]
+           Q13  (r1) [ C   C    C    C    C    C    C    C    C    C    C    C    C    C    ✗    ✗   ] 14
+           Q14  (r0) [ C   C    C    C    C    C    C    C    C    C    C    C    C    C    C    ✗   ]
+           Q15  (r0) [ C   C    C    C    C    C    C    C    C    C    C    C    C    C    C    C   ] 16
+        4.
+        - all gather without overlap:
+           rank_i_part_0: q_len=chunk_size, kv_len=chunk_size*(rank_id + 1)
+           rank_i_part_1: q_len=chunk_size, kv_len=chunk_size*(2 * cp_size - rank_id)
+        """
         # Get batch information
         batch_size = attention_inputs.input_lengths.size(0)
         device = attention_inputs.input_lengths.device
@@ -140,12 +186,15 @@ class ContextParallelFlashInferRaggedPrefillOp:
 
         if self.rotate_method == CPRotateMethod.ALL_GATHER:
             # Plan for both part0 and part1 wrappers
+            qo_indptr = cu_seqlens // 2
+            kv_indptr_part0 = qo_indptr * (self.cp_rank + 1)
+            kv_indptr_part1 = qo_indptr * (2 * self.cp_size - self.cp_rank)
             # Part0: First part of attention computation
             part_0_kv_indptr = cu_seqlens_wo_padding[:-1]
             part_1_kv_indptr = cu_seqlens_wo_padding[:-1]
             self.prefill_wrappers["part0"].plan(
-                qo_indptr=cu_seqlens_wo_padding,
-                kv_indptr=cu_seqlens_wo_padding,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr_part0,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
@@ -155,8 +204,8 @@ class ContextParallelFlashInferRaggedPrefillOp:
             )
             # Part1: Second part of attention computation
             self.prefill_wrappers["part1"].plan(
-                qo_indptr=cu_seqlens_wo_padding,
-                kv_indptr=cu_seqlens_wo_padding,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr_part1,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
@@ -166,6 +215,7 @@ class ContextParallelFlashInferRaggedPrefillOp:
             )
         elif self.rotate_method == CPRotateMethod.RING:
             # Use ring attention with multi-round send/recv
+            qo_indptr = cu_seqlens // 2
             self.prefill_wrappers["causal"].plan(
                 qo_indptr=cu_seqlens_wo_padding,
                 kv_indptr=cu_seqlens_wo_padding,

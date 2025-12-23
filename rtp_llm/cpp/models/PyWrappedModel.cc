@@ -132,10 +132,16 @@ GptModelOutputs PyWrappedModel::callForwardPostLayers(BufferPtr             hidd
 std::optional<PyContextParallelParams> PyWrappedModel::prepareContextParallelParams(const GptModelInputs& inputs) {
     std::optional<PyContextParallelParams> params;
     if (inputs.prefill_cp_padding_lengths) {
-        params = PyContextParallelParams{
-            Buffer2torchTensor(inputs.prefill_cp_padding_lengths),
-            Buffer2torchTensor(inputs.prefill_cp_chunk_lengths),
-            Buffer2torchTensor(inputs.prefill_shuffle_indices),
+        auto prefill_cp_padding_lengths = Buffer2torchTensor(inputs.prefill_cp_padding_lengths);
+        auto prefill_cp_chunk_lengths   = Buffer2torchTensor(inputs.prefill_cp_chunk_lengths);
+        auto prefill_shuffle_indices    = Buffer2torchTensor(inputs.prefill_shuffle_indices);
+
+        int total_chunk_size    = prefill_cp_chunk_lengths.sum().item<int64_t>();
+        prefill_shuffle_indices = prefill_shuffle_indices.slice(0, 0, total_chunk_size);
+        params                  = PyContextParallelParams{
+            prefill_cp_padding_lengths.cuda(),
+            prefill_cp_chunk_lengths.cuda(),
+            prefill_shuffle_indices.cuda(),
         };
     }
     return params;
