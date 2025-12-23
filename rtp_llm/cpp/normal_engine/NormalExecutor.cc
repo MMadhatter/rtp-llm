@@ -122,7 +122,6 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
                       << endl;
             RTP_LLM_LOG_INFO("[cp_rank: %d], model_input after slice: %s", cp_rank, model_input.debugString().c_str());
         }
-
         executor_collector.tp_sync_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
     {
@@ -240,7 +239,6 @@ void NormalExecutor::handleContextParallelInputs(GptModelInputs& model_input, in
         int input_chunk_length   = prefill_cp_chunk_lengths->data<int>()[p];
         int input_padding_length = prefill_cp_padding_lengths->data<int>()[p];
         int input_length         = input_lengths->data<int>()[p + num_decode_stream];
-
         // Copy input tokens for this prefill stream
         int*             src_tokens = total_input_tokens->dataWithOffset<int>(total_input_token_idx);
         std::vector<int> total_input_token_vec(src_tokens, src_tokens + input_length);
