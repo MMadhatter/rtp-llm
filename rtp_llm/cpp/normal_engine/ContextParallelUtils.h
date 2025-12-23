@@ -16,20 +16,20 @@ namespace rtp_llm {
 std::vector<int> generateZigZagShuffleIndices(int num_padded_input_tokens, int cp_size);
 
 /// @brief Split and balance input tokens across context parallel ranks
-/// @param context_stream The context stream containing sequence info
 /// @param total_input_tokens All input tokens before splitting
 /// @param input_tokens Output: tokens for this rank (pre-allocated)
 /// @param shuffle_indices Output: shuffle indices for later reshuffle
 /// @param cp_rank Current context parallel rank
 /// @param cp_size Total context parallel size
 /// @param cp_chunk_size Chunk size per rank
+/// @param cp_padding_size Padding size to add for context parallel
 /// @return true if split successful, false otherwise
-bool contextParallelLoadBalanceSplit(const GenerateStream&   context_stream,
-                                     const std::vector<int>& total_input_tokens,
+bool contextParallelLoadBalanceSplit(const std::vector<int>& total_input_tokens,
                                      std::vector<int>&       input_tokens,
                                      std::vector<int>&       shuffle_indices,
                                      int                     cp_rank,
                                      int                     cp_size,
-                                     int                     cp_chunk_size);
+                                     int                     cp_chunk_size,
+                                     int                     cp_padding_size);
 
 }  // namespace rtp_llm

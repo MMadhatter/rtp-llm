@@ -53,17 +53,16 @@ std::vector<int> generateZigZagShuffleIndices(int num_padded_input_tokens, int c
     return shuffle_indices;
 }
 
-bool contextParallelLoadBalanceSplit(const GenerateStream&   context_stream,
-                                     const std::vector<int>& total_input_tokens,
+bool contextParallelLoadBalanceSplit(const std::vector<int>& total_input_tokens,
                                      std::vector<int>&       input_tokens,
                                      std::vector<int>&       shuffle_indices,
                                      int                     cp_rank,
                                      int                     cp_size,
-                                     int                     cp_chunk_size) {
+                                     int                     cp_chunk_size,
+                                     int                     cp_padding_size) {
     const int input_token_size      = static_cast<int>(total_input_tokens.size());
-    const int padded_seq_token_size = context_stream.contextParallelPaddedSeqLen();
+    const int padded_seq_token_size = input_token_size + cp_padding_size;
     RTP_LLM_CHECK(cp_rank >= 0 && cp_rank < cp_size);
-
     // Generate zig-zag shuffle indices
     const auto zigzag_indices = generateZigZagShuffleIndices(padded_seq_token_size, cp_size);
 
