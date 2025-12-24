@@ -21,7 +21,8 @@ void registerFMHAType(py::module m) {
         .value("FLASH_INFER", FMHAType::FLASH_INFER)
         .value("XQA", FMHAType::XQA)
         .value("AITER_PREFILL", FMHAType::AITER_PREFILL)
-        .value("AITER_DECODE", FMHAType::AITER_DECODE);
+        .value("AITER_DECODE", FMHAType::AITER_DECODE)
+        .value("CP_FLASH_INFER", FMHAType::CP_FLASH_INFER);
 }
 
 void register_parallelism_distributed_config(pybind11::module& m) {

@@ -14,7 +14,8 @@ enum class FMHAType {
     TRT_V2,
     XQA,
     AITER_PREFILL,
-    AITER_DECODE
+    AITER_DECODE,
+    CP_FLASH_INFER,
 };
 
 enum AttentionMaskType {

@@ -111,7 +111,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
             return absl::OkStatus();
         }
 
-        if (device_->getDeviceProperties().cp_size > 0) {
+        if (device_->getDeviceProperties().cp_size > 1) {
             // handle context parallel inputs, do padding and shuffle and slice
             int cp_rank = device_->getDeviceProperties().cp_rank;
             int cp_size = device_->getDeviceProperties().cp_size;

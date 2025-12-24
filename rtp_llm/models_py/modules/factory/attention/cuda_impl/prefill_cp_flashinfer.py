@@ -60,6 +60,7 @@ class ContextParallelFlashInferRaggedPrefillOp:
     def __init__(
         self,
         config: GptInitModelParameters,
+        attn_inputs: PyAttentionInputs,
         backend: str = "auto",  # "auto", "fa2", or "fa3"
         causal: bool = True,
         kv_layout: str = "NHD",  # "NHD" or "HND"
@@ -91,8 +92,12 @@ class ContextParallelFlashInferRaggedPrefillOp:
         self.cp_rank = config.cp_rank
 
         self.rotate_method = CPRotateMethod.ALL_GATHER
+        self.context_parallel_info: PyContextParallelParams = (
+            attn_inputs.context_parallel_info
+        )
         self.prefill_wrappers = {}
 
+        # init flashinfer attention wrapper
         if self.rotate_method == CPRotateMethod.ALL_GATHER:
             # Zig-zag load balancing: when using all_gather, each CP rank's workload
             # is split into two causal attention computations for better load distribution.
@@ -129,7 +134,6 @@ class ContextParallelFlashInferRaggedPrefillOp:
                     backend=backend,
                 )
             )
-
         elif self.rotate_method == CPRotateMethod.ALL_GATHER_WITH_OVERLAP:
             # using all_gather with partial overlap: split to local attention and non-local attention
             self.prefill_wrappers["casual"] = BatchPrefillWithRaggedKVCacheWrapper(
@@ -219,10 +223,9 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 kv_indptr=kv_indptr_part0,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                page_size=None,  # Not used in ragged mode
+                head_dim_qk=self.head_dim,
                 causal=True,  # Part0 uses causal attention
-                q_data_type=attention_inputs.dtype,
+                q_data_type=torch.bfloat16,
             )
             # Part1: Second part of attention computation
             self.prefill_wrappers["part1"].plan(
@@ -230,10 +233,9 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 kv_indptr=kv_indptr_part1,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                page_size=None,  # Not used in ragged mode
+                head_dim_qk=self.head_dim,
                 causal=True,
-                q_data_type=attention_inputs.dtype,
+                q_data_type=torch.bfloat16,
             )
         elif self.rotate_method == CPRotateMethod.ALLTOALL:
             # Use ring attention with multi-round compute and send/recv pass kv with zig-zag load balancing
@@ -285,10 +287,9 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 kv_indptr=cu_seqlens,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                page_size=None,  # Not used in ragged mode
+                head_dim_qk=self.head_dim,
                 causal=True,
-                q_data_type=attention_inputs.dtype,
+                q_data_type=torch.bfloat16,
             )
             # non-causal attention with full-chunk-q and half-chunk-kv
             self.prefill_wrappers["non_causal_pattern_0"].plan(
@@ -296,10 +297,9 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 kv_indptr=cu_seqlens // 2,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                page_size=None,  # Not used in ragged mode
+                head_dim_qk=self.head_dim,
                 causal=False,
-                q_data_type=attention_inputs.dtype,
+                q_data_type=torch.bfloat16,
             )
             # non-causal attention with half-chunk-q and full-chunk-kv
             self.prefill_wrappers["non_causal_pattern_1"].plan(
@@ -307,10 +307,9 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 kv_indptr=cu_seqlens,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                page_size=None,  # Not used in ragged mode
+                head_dim_qk=self.head_dim,
                 causal=False,
-                q_data_type=attention_inputs.dtype,
+                q_data_type=torch.bfloat16,
             )
         elif self.rotate_method == CPRotateMethod.ALL_GATHER_WITH_OVERLAP:
             # TODO
@@ -323,18 +322,27 @@ class ContextParallelFlashInferRaggedPrefillOp:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context_parallel_info: PyContextParallelParams,
     ) -> torch.Tensor:
         # all gather key and value across all CP ranks
-        key = all_gather(k, group=Group.CP)
-        value = all_gather(v, group=Group.CP)
-        # reshuffle
+        cp_info = self.context_parallel_info
+        all_key = all_gather(k, group=Group.CP)
+        all_value = all_gather(v, group=Group.CP)
+        from rtp_llm import ForkedPdb
+
+        ForkedPdb().set_trace()
+        # # split and reshuffle
+        # q0 =
+        # q1 =
+        # k0 =
+        # k1 =
+        # v0 =
+        # v1 =
         # Split attention computation into two parts
         # Part0: First part of computation with causal attention
-        attn_output_part0 = self.prefill_wrappers["part0"].run(q, k, v)
+        attn_output_part0 = self.prefill_wrappers["part0"].run(q0, k0, v0)
 
         # Part1: Second part of computation with non-causal attention
-        attn_output_part1 = self.prefill_wrappers["part1"].run(q, k, v)
+        attn_output_part1 = self.prefill_wrappers["part1"].run(q1, k1, v1)
 
         # Combine results from both parts
         attn_output = attn_output_part0 + attn_output_part1
@@ -344,13 +352,13 @@ class ContextParallelFlashInferRaggedPrefillOp:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context_parallel_info: PyContextParallelParams,
     ) -> torch.Tensor:
         # Ring attention with multi-round send/recv
         # send(k[i], dst=i, group=Group.CP)
         # send(v[i], dst=i, group=Group.CP)
         # i == 0, caculate local causal attention  directly
         attn_output = self.prefill_wrappers["causal"].run(q, k, v)
+        cp_info = self.context_parallel_info
         for i in range(1, self.cp_size):
             # attn_output = recv(k[i], src=i, group=Group.CP)
             if i <= self.cp_rank:
@@ -375,10 +383,6 @@ class ContextParallelFlashInferRaggedPrefillOp:
             ],
             dim=-1,
         )
-        q = q.reshape(q.shape[0], self.num_qo_heads, self.head_dim)
-        k = k.reshape(k.shape[0], self.num_kv_heads, self.head_dim)
-        v = v.reshape(v.shape[0], self.num_kv_heads, self.head_dim)
-
         if self.rotate_method == CPRotateMethod.ALL_GATHER:
             attn_output = self.forward_all_gather(q, k, v)
         elif self.rotate_method == _CPRotateMethod.ALLTOALL:
@@ -393,7 +397,9 @@ class PrefillContextParallelFlashInferImpl(FMHAPrefillImplBase):
         attn_inputs: PyAttentionInputs,
     ):
         super().__init__(
-            fmha_impl=ContextParallelFlashInferRaggedPrefillOp(config.gpt_init_params),
+            fmha_impl=ContextParallelFlashInferRaggedPrefillOp(
+                config.gpt_init_params, attn_inputs
+            ),
             rope_kvcache_impl=FusedRopeKVCachePrefillOp(config.gpt_init_params),
             attn_inputs=attn_inputs,
         )
@@ -403,7 +409,7 @@ class PrefillContextParallelFlashInferImpl(FMHAPrefillImplBase):
         return self.fmha_impl.support(self.attn_inputs)
 
     def fmha_type(self) -> FMHAType:
-        return FMHAType.FLASH_INFER
+        return FMHAType.CP_FLASH_INFER
 
     def support_cuda_graph(self) -> bool:
         return False
