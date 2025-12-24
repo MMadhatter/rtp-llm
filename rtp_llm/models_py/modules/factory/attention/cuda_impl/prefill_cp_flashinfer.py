@@ -30,7 +30,8 @@ class CPRotateMethod(Enum):
 
     ALL_GATHER = auto()  # Use all_gather with zig-zag load balancing
     ALL_GATHER_WITH_OVERLAP = auto()  # Use all_gather with overlap
-    RING = auto()  # Use ring attention with zig-zag load balancing
+    ALLTOALL = auto()  # Use alltoall communication with zig-zag load balancing
+    # reference: https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/experimental/_context_parallel/_attention.py
 
 
 def get_workspace_buffer(device: torch.device) -> torch.Tensor:
@@ -107,34 +108,57 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 kv_layout=kv_layout,
                 backend=backend,
             )
-        else:
+        elif self.rotate_method == CPRotateMethod.ALLTOALL:
             # ring attention impl: Multi round send/recv for prefill
             self.prefill_wrappers["casual"] = BatchPrefillWithRaggedKVCacheWrapper(
                 self.workspace_buffer,
                 kv_layout=kv_layout,
                 backend=backend,
             )
-            self.prefill_wrappers["non_casual"] = BatchPrefillWithRaggedKVCacheWrapper(
+            self.prefill_wrappers["non_casual_pattern_0"] = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.workspace_buffer,
+                    kv_layout=kv_layout,
+                    backend=backend,
+                )
+            )
+            self.prefill_wrappers["non_casual_pattern_1"] = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.workspace_buffer,
+                    kv_layout=kv_layout,
+                    backend=backend,
+                )
+            )
+
+        elif self.rotate_method == CPRotateMethod.ALL_GATHER_WITH_OVERLAP:
+            # using all_gather with partial overlap: split to local attention and non-local attention
+            self.prefill_wrappers["casual"] = BatchPrefillWithRaggedKVCacheWrapper(
                 self.workspace_buffer,
                 kv_layout=kv_layout,
                 backend=backend,
             )
+            self.prefill_wrappers["non_casual_part_0"] = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.workspace_buffer,
+                    kv_layout=kv_layout,
+                    backend=backend,
+                )
+            )
+            self.prefill_wrappers["non_casual_part_1"] = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.workspace_buffer,
+                    kv_layout=kv_layout,
+                    backend=backend,
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported rotate method: {self.rotate_method}")
 
         self._is_warmed_up = False
 
     def support(self, attention_inputs: PyAttentionInputs) -> bool:
         """Check if this operator supports the given attention inputs."""
         return attention_inputs.is_prefill and self.config.cp_size > 1
-
-    def _prepare_cp_data(
-        self,
-        cp_chunk_lengths: torch.Tensor,
-        cp_shuffle_indices: torch.Tensor,
-        cp_padding_lengths: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
-        # return q_lens, kv_lens之类的东西
-        return
 
     def prepare(self, attention_inputs: PyAttentionInputs) -> ParamsBase:
         """
@@ -190,8 +214,6 @@ class ContextParallelFlashInferRaggedPrefillOp:
             kv_indptr_part0 = qo_indptr * (self.cp_rank + 1)
             kv_indptr_part1 = qo_indptr * (2 * self.cp_size - self.cp_rank)
             # Part0: First part of attention computation
-            part_0_kv_indptr = cu_seqlens_wo_padding[:-1]
-            part_1_kv_indptr = cu_seqlens_wo_padding[:-1]
             self.prefill_wrappers["part0"].plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr_part0,
@@ -213,12 +235,54 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 causal=True,
                 q_data_type=attention_inputs.dtype,
             )
-        elif self.rotate_method == CPRotateMethod.RING:
-            # Use ring attention with multi-round send/recv
-            qo_indptr = cu_seqlens // 2
+        elif self.rotate_method == CPRotateMethod.ALLTOALL:
+            # Use ring attention with multi-round compute and send/recv pass kv with zig-zag load balancing
+            """example: cp_size=4, N=16, chunk_size=4
+            Ring attention with zig-zag load balancing: KV chunks rotate across ranks while Q stays local.
+            Each rank computes attention between its local Q and the received KV chunks.
+
+                      rank0                rank1                     rank2                 rank3
+            --------------------------------------------------------------------------------------------------
+            iter0: Caculate local causal attention
+                         kv0 kv1 kv14 kv15      kv2 kv3 kv12 kv13       kv4 kv5 kv10 kv11      kv6 kv7 kv8 kv9
+                   [q0    Y   X   X    X ][q2    Y   X   X    X ][q4    Y   X   X    X ][q6    Y   X   X    X ]
+                   [q1    Y   Y   X    X ][q3    Y   Y   X    X ][q5    Y   Y   X    X ][q7    Y   Y   X    X ]
+                   [q14   Y   Y   Y    X ][q12   Y   Y   Y    X ][q10   Y   Y   Y    X ][q8    Y   Y   Y    X ]
+                   [q15   Y   Y   Y    Y ][q13   Y   Y   Y    Y ][q11   Y   Y   Y    Y ][q9    Y   Y   Y    Y ]
+            ---------------------------------------------------------------------------------------------------
+            iter1: KV rotates right (rank0->rank1, rank1->rank2, rank2->rank3, rank3->rank0)
+                         kv6 kv7 kv8 kv9        kv0 kv1 kv14 kv15      kv2 kv3 kv12 kv13     kv4 kv5 kv10 kv11
+                   [q0    X   X   X    X ][q2    Y   Y   X    X ][q4    Y   Y   X    X ][q6    Y   Y   X    X ]
+                   [q1    X   X   X    X ][q3    Y   Y   X    X ][q5    Y   Y   X    X ][q7    Y   Y   X    X ]
+                   [q14   Y   Y   Y    Y ][q12   Y   Y   X    X ][q10   Y   Y   X    X ][q8    Y   Y   X    X ]
+                   [q15   Y   Y   Y    Y ][q13   Y   Y   X    X ][q11   Y   Y   X    X ][q9    Y   Y   X    X ]
+            ---------------------------------------------------------------------------------------------------
+            iter2: KV rotates right again
+                         kv4 kv5 kv10 kv11       kv6 kv7 kv8 kv9        kv0 kv1 kv14 kv15     kv2 kv3 kv12 kv13
+                   [q0    X   X   X    X ][q2    X   X   X    X ][q4    Y   Y   X    X ][q6    Y   Y   X    X ]
+                   [q1    X   X   X    X ][q3    X   X   X    X ][q5    Y   Y   X    X ][q7    Y   Y   X    X ]
+                   [q14   Y   Y   Y    Y ][q12   Y   Y   Y    Y ][q10   Y   Y   X    X ][q8    Y   Y   X    X ]
+                   [q15   Y   Y   Y    Y ][q13   Y   Y   Y    Y ][q11   Y   Y   X    X ][q9    Y   Y   X    X ]
+            ---------------------------------------------------------------------------------------------------
+            iter3: KV rotates right again (final iteration)
+                         kv2 kv3 kv12 kv13      kv4 kv5 kv10 kv11       kv6 kv7 kv8 kv9      kv0 kv1 kv14 kv15
+                   [q0    X   X   X    X ][q2    X   X   X    X ][q4    X   X   X    X ][q6    Y   Y   X    X ]
+                   [q1    X   X   X    X ][q3    X   X   X    X ][q5    X   X   X    X ][q7    Y   Y   X    X ]
+                   [q14   Y   Y   Y    Y ][q12   Y   Y   Y    Y ][q10   Y   Y   Y    Y ][q8    Y   Y   X    X ]
+                   [q15   Y   Y   Y    Y ][q13   Y   Y   Y    Y ][q11   Y   Y   Y    Y ][q9    Y   Y   X    X ]
+            ---------------------------------------------------------------------------------------------------
+
+            Key observations:
+            All chunk attention has 3 pattern:
+            1. local rank(i.e. iter=0), all rank compute causal attention
+            2. iter_i <= cp_rank: compute non-causal attention with half of the chunk kv
+            3. iter_i > cp_rank: compute non-causal attention with half of the chunk q
+            """
+
+            # local attention
             self.prefill_wrappers["causal"].plan(
-                qo_indptr=cu_seqlens_wo_padding,
-                kv_indptr=cu_seqlens_wo_padding,
+                qo_indptr=cu_seqlens,
+                kv_indptr=cu_seqlens,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
@@ -226,10 +290,21 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 causal=True,
                 q_data_type=attention_inputs.dtype,
             )
-
-            self.prefill_wrappers["non_causal"].plan(
-                qo_indptr=cu_seqlens_wo_padding,
-                kv_indptr=cu_seqlens_wo_padding,
+            # non-causal attention with full-chunk-q and half-chunk-kv
+            self.prefill_wrappers["non_causal_pattern_0"].plan(
+                qo_indptr=cu_seqlens,
+                kv_indptr=cu_seqlens // 2,
+                num_qo_heads=self.num_qo_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                page_size=None,  # Not used in ragged mode
+                causal=False,
+                q_data_type=attention_inputs.dtype,
+            )
+            # non-causal attention with half-chunk-q and full-chunk-kv
+            self.prefill_wrappers["non_causal_pattern_1"].plan(
+                qo_indptr=cu_seqlens // 2,
+                kv_indptr=cu_seqlens,
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
@@ -238,26 +313,8 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 q_data_type=attention_inputs.dtype,
             )
         elif self.rotate_method == CPRotateMethod.ALL_GATHER_WITH_OVERLAP:
-            # 拆成casual和两个非casual
-            self.prefill_wrappers["casual"] = BatchPrefillWithRaggedKVCacheWrapper(
-                self.workspace_buffer,
-                kv_layout=kv_layout,
-                backend=backend,
-            )
-            self.prefill_wrappers["non_casual_1"] = (
-                BatchPrefillWithRaggedKVCacheWrapper(
-                    self.workspace_buffer,
-                    kv_layout=kv_layout,
-                    backend=backend,
-                )
-            )
-            self.prefill_wrappers["non_casual_2"] = (
-                BatchPrefillWithRaggedKVCacheWrapper(
-                    self.workspace_buffer,
-                    kv_layout=kv_layout,
-                    backend=backend,
-                )
-            )
+            # TODO
+            pass
 
         return ParamsBase()
 
@@ -272,7 +329,6 @@ class ContextParallelFlashInferRaggedPrefillOp:
         key = all_gather(k, group=Group.CP)
         value = all_gather(v, group=Group.CP)
         # reshuffle
-
         # Split attention computation into two parts
         # Part0: First part of computation with causal attention
         attn_output_part0 = self.prefill_wrappers["part0"].run(q, k, v)
@@ -291,16 +347,16 @@ class ContextParallelFlashInferRaggedPrefillOp:
         context_parallel_info: PyContextParallelParams,
     ) -> torch.Tensor:
         # Ring attention with multi-round send/recv
-        for i in range(self.cp_size):
-            if i == self.cp_rank:
-                attn_output = self.prefill_wrappers["causal"].run(q, k, v)
+        # send(k[i], dst=i, group=Group.CP)
+        # send(v[i], dst=i, group=Group.CP)
+        # i == 0, caculate local causal attention  directly
+        attn_output = self.prefill_wrappers["causal"].run(q, k, v)
+        for i in range(1, self.cp_size):
+            # attn_output = recv(k[i], src=i, group=Group.CP)
+            if i <= self.cp_rank:
+                attn_output = self.prefill_wrappers["non_causal_pattern_0"].run(q, k, v)
             else:
-                send(k[i], dst=i, group=Group.CP)
-                send(v[i], dst=i, group=Group.CP)
-                attn_output = recv(k[i], src=i, group=Group.CP)
-                attn_output = recv(v[i], src=i, group=Group.CP)
-                attn_output = self.prefill_wrappers["non_causal"].run(q, k, v)
-                attn_output = attn_output + attn_output
+                attn_output = self.prefill_wrappers["non_causal_pattern_1"].run(q, k, v)
 
     def forward(
         self,
@@ -325,7 +381,7 @@ class ContextParallelFlashInferRaggedPrefillOp:
 
         if self.rotate_method == CPRotateMethod.ALL_GATHER:
             attn_output = self.forward_all_gather(q, k, v)
-        elif self.rotate_method == _CPRotateMethod.RING:
+        elif self.rotate_method == _CPRotateMethod.ALLTOALL:
             attn_output = self.forward_all_to_all(q, k, v)
         return attn_output
 
