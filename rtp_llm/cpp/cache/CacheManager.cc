@@ -23,9 +23,9 @@ CacheManager::CacheManager(const CacheConfig&                 config,
                            rtp_llm::DeviceBase*               device,
                            bool                               warmup,
                            const kmonitor::MetricsReporterPtr metrics_reporter,
-                           const KVCacheConfig&                kv_cache_config,
-                           const ParallelismConfig&            parallelism_config,
-                           const RuntimeConfig&                runtime_config):
+                           const KVCacheConfig&               kv_cache_config,
+                           const ParallelismConfig&           parallelism_config,
+                           const RuntimeConfig&               runtime_config):
     config_(config),
     seq_size_per_block_(config.seq_size_per_block),
     block_cache_(config.seq_size_per_block),
@@ -59,8 +59,7 @@ CacheManager::CacheManager(const CacheConfig&                 config,
     }
 
     if (kv_cache_config_.memory_block_cache_size_mb > 0) {
-        int64_t block_nums =
-            (int64_t)kv_cache_config_.memory_block_cache_size_mb * 1024 * 1024 / config_.block_size;
+        int64_t block_nums = (int64_t)kv_cache_config_.memory_block_cache_size_mb * 1024 * 1024 / config_.block_size;
         RTP_LLM_LOG_INFO("init memory block cache, size: %d MB, block nums: %ld",
                          kv_cache_config_.memory_block_cache_size_mb,
                          block_nums);
@@ -69,14 +68,18 @@ CacheManager::CacheManager(const CacheConfig&                 config,
         memory_block_cache_config.block_nums = block_nums;
         memory_block_cache_config.refresh();
 
-        memory_block_cache_ = std::make_shared<MemoryBlockCache>(
-            memory_block_cache_config, device_, allocator_.get(), parallelism_config_, kv_cache_config_, runtime_config_, metrics_reporter_);
+        memory_block_cache_ = std::make_shared<MemoryBlockCache>(memory_block_cache_config,
+                                                                 device_,
+                                                                 allocator_.get(),
+                                                                 parallelism_config_,
+                                                                 kv_cache_config_,
+                                                                 runtime_config_,
+                                                                 metrics_reporter_);
         if (!memory_block_cache_->init()) {
             RTP_LLM_FAIL("memory block cache init failed");
         }
     }
 }
-
 
 void CacheManager::regUserMr(size_t model_id) {
     allocator_->regUserMr(model_id);
@@ -127,19 +130,72 @@ void CacheManager::reportMetricsLoop() {
 void CacheManager::allocateAndSync() {
     const auto properties = device_->getDeviceProperties();
     size_t     world_size = properties.tp_size * properties.dp_size;
+
+    RTP_LLM_LOG_INFO(
+        "allocateAndSync start: tp_size=%zu, dp_size=%zu, world_size=%zu, tp_rank=%zu, dp_rank=%zu, initial block_nums=%d",
+        properties.tp_size,
+        properties.dp_size,
+        world_size,
+        properties.tp_rank,
+        properties.dp_rank,
+        config_.block_nums);
+
     if (world_size > 1) {
-        size_t    local_rank = properties.tp_size * properties.dp_rank + properties.tp_rank;
+        size_t local_rank = properties.tp_size * properties.dp_rank + properties.tp_rank;
+        RTP_LLM_LOG_INFO("computed local_rank=%zu (should equal to dp_rank * tp_size + tp_rank = %zu * %zu + %zu)",
+                         local_rank,
+                         properties.dp_rank,
+                         properties.tp_size,
+                         properties.tp_rank);
+
         BufferPtr block_num_infos =
             device_->allocateBuffer({rtp_llm::DataType::TYPE_INT32, {world_size}, rtp_llm::AllocationType::HOST});
-        auto block_num_ptr        = block_num_infos->data<int>();
+        auto block_num_ptr = block_num_infos->data<int>();
+
+        // Log initial buffer state (may contain garbage)
+        std::string init_str = "buffer after allocation (before setting): [";
+        for (size_t i = 0; i < world_size; i++) {
+            init_str += std::to_string(block_num_ptr[i]);
+            if (i < world_size - 1)
+                init_str += ", ";
+        }
+        init_str += "]";
+        RTP_LLM_LOG_INFO("%s", init_str.c_str());
+
         block_num_ptr[local_rank] = config_.block_nums;
+        RTP_LLM_LOG_INFO("set block_num_ptr[%zu] = %d", local_rank, config_.block_nums);
+
+        // Log buffer state before allGather
+        std::string before_str = "buffer before allGather: [";
+        for (size_t i = 0; i < world_size; i++) {
+            before_str += std::to_string(block_num_ptr[i]);
+            if (i < world_size - 1)
+                before_str += ", ";
+        }
+        before_str += "]";
+        RTP_LLM_LOG_INFO("%s", before_str.c_str());
+
         device_->allGather({{block_num_infos}, ParallelMode::DP_AND_TP});
         device_->syncCommunication(false);
         device_->syncAndCheck();
+
+        // Log buffer state after allGather
+        std::string after_str = "buffer after allGather: [";
+        for (size_t i = 0; i < world_size; i++) {
+            after_str += std::to_string(block_num_ptr[i]);
+            if (i < world_size - 1)
+                after_str += ", ";
+        }
+        after_str += "]";
+        RTP_LLM_LOG_INFO("%s", after_str.c_str());
+
         if (properties.ffn_as_service) {
+            RTP_LLM_LOG_INFO("ffn_as_service=true, setting block_nums to 1");
             config_.block_nums = 1;
         } else {
-            config_.block_nums = *std::min_element(block_num_ptr, block_num_ptr + world_size);
+            int min_block_nums = *std::min_element(block_num_ptr, block_num_ptr + world_size);
+            RTP_LLM_LOG_INFO("taking min of all ranks: min_block_nums=%d", min_block_nums);
+            config_.block_nums = min_block_nums;
         }
     }
     RTP_LLM_LOG_INFO("block nums is %d after tp sync", config_.block_nums);
