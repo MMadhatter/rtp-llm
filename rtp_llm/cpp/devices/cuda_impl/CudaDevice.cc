@@ -93,8 +93,9 @@ CudaDevice::CudaDevice(const DeviceInitParams& params): DeviceBase(params) {
     }
 
     if (params.ep_size > 1) {
-        initNcclParam(params.dp_rank * params.tp_size + params.tp_rank,
-                      params.dp_size * params.tp_size,
+        initNcclParam(params.dp_rank * params.tp_size * params.cp_size + params.tp_size * params.cp_rank
+                          + params.tp_rank,
+                      params.dp_size * params.cp_size * params.tp_size,
                       params.master_ip,
                       params.dp_tp_master_port,
                       "RTP_LLM_DP_TP_GROUP_",

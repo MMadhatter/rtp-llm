@@ -256,8 +256,8 @@ absl::StatusOr<GptModelInputs> NormalBatchStreamProcessor::gatherModelInput(cons
     }
 
     // debug print
-    // auto str_0 = model_input.debugString(true);
-    // std::cout << "construct model_input in normalbatchstreamprocessor: " << str_0 << std::endl;
+    auto str_0 = model_input.debugString(true);
+    std::cout << "construct model_input in normalbatchstreamprocessor: " << str_0 << std::endl;
     return model_input;
 }
 

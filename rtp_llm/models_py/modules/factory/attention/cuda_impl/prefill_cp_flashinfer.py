@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, recv, send
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import (
     FMHAPrefillImplBase,
 )
@@ -22,26 +23,6 @@ logger = logging.getLogger(__name__)
 # Global workspace buffer shared across all wrappers
 _g_workspace_buffer = None
 _g_workspace_size = 512 * 1024 * 1024  # 512MB
-
-
-def _generate_half_q_indices(cp_chunk_lengths):
-    half_q_indices = []
-    offset = 0
-    for chunk_len in cp_chunk_lengths:
-        assert chunk_len % 2 == 0
-        half_q_indices.extend(range(offset + (chunk_len) // 2, offset + chunk_len))
-        offset += chunk_len
-    return half_q_indices
-
-
-def _generate_half_kv_indices(cp_chunk_lengths):
-    half_kv_indices = []
-    offset = 0
-    for chunk_len in cp_chunk_lengths:
-        assert chunk_len % 2 == 0
-        half_kv_indices.extend(range(offset, offset + (chunk_len) // 2))
-        offset += chunk_len
-    return half_kv_indices
 
 
 class CPRotateMethod(Enum):
@@ -106,10 +87,8 @@ class ContextParallelFlashInferRaggedPrefillOp:
         self.causal = causal
         self.kv_layout = kv_layout
 
-        # Delay CUDA object creation to avoid serialization issues
-        self._workspace_buffer = None
-        self._communication_stream = None
-        self._comm_events = None
+        self.device = torch.cuda.current_device()
+        self.workspace_buffer = get_workspace_buffer(self.device)
         self.cp_size = 1
         self.cp_rank = 0
 
@@ -119,49 +98,8 @@ class ContextParallelFlashInferRaggedPrefillOp:
         )
         self.prefill_wrappers = {}
 
-        # Delay wrapper initialization
-        self._wrappers_initialized = False
-
-        self._is_warmed_up = False
-
-    @property
-    def workspace_buffer(self):
-        """Lazy initialization of workspace buffer."""
-        if self._workspace_buffer is None:
-            self._workspace_buffer = get_workspace_buffer(torch.cuda.current_device())
-        return self._workspace_buffer
-
-    @property
-    def communication_stream(self):
-        """Lazy initialization of communication stream."""
-        if self._communication_stream is None:
-            self._communication_stream = torch.cuda.Stream(
-                device=torch.cuda.current_device()
-            )
-        return self._communication_stream
-
-    @property
-    def comm_events(self):
-        """Lazy initialization of communication events."""
-        if self._comm_events is None:
-            self._comm_events = [torch.cuda.Event() for _ in range(self.cp_size)]
-        return self._comm_events
-
-    def _ensure_wrappers_initialized(self):
-        """Ensure FlashInfer wrappers are initialized (lazy initialization)."""
-        if self._wrappers_initialized:
-            return
-
-        backend = self.backend
-        kv_layout = self.kv_layout
-
-    def _ensure_wrappers_initialized(self):
-        """Ensure FlashInfer wrappers are initialized (lazy initialization)."""
-        if self._wrappers_initialized:
-            return
-
-        backend = self.backend
-        kv_layout = self.kv_layout
+        self.communication_stream = torch.cuda.Stream(device=self.device)
+        self.comm_events = [torch.cuda.Event() for _ in range(self.cp_size)]
 
         # init flashinfer attention wrapper
         if self.rotate_method == CPRotateMethod.ALL_GATHER:
@@ -200,13 +138,6 @@ class ContextParallelFlashInferRaggedPrefillOp:
                     backend=backend,
                 )
             )
-            # init producer and consumer events for each round
-            for i in range(self.cp_size):
-                self.consumer_event[f"round_{i}_compute_finish"] = torch.cuda.Event()
-                self.producer_event[f"round_{i}_communication_finish"] = (
-                    torch.cuda.Event()
-                )
-
         elif self.rotate_method == CPRotateMethod.ALL_GATHER_WITH_OVERLAP:
             # using all_gather with partial overlap: split to local attention and non-local attention
             self.prefill_wrappers["causal"] = BatchPrefillWithRaggedKVCacheWrapper(
@@ -230,20 +161,6 @@ class ContextParallelFlashInferRaggedPrefillOp:
             )
         else:
             raise ValueError(f"Unsupported rotate method: {self.rotate_method}")
-
-        self._wrappers_initialized = True
-
-    @cached_property
-    def _collective_ops(self):
-        """Lazy import collective operations to avoid serialization issues."""
-        from rtp_llm.models_py.distributed.collective_torch import (
-            Group,
-            all_gather,
-            recv,
-            send,
-        )
-
-        return {"Group": Group, "recv": recv, "send": send, "all_gather": all_gather}
 
     def support(self, attention_inputs: PyAttentionInputs) -> bool:
         """Check if this operator supports the given attention inputs."""
@@ -286,9 +203,6 @@ class ContextParallelFlashInferRaggedPrefillOp:
            rank_i_part_0: q_len=chunk_size, kv_len=chunk_size*(rank_id + 1)
            rank_i_part_1: q_len=chunk_size, kv_len=chunk_size*(2 * cp_size - rank_id)
         """
-        # Ensure CUDA objects are initialized
-        self._ensure_wrappers_initialized()
-
         # Get batch information
         batch_size = attention_inputs.input_lengths.size(0)
         device = attention_inputs.input_lengths.device
@@ -520,10 +434,6 @@ class ContextParallelFlashInferRaggedPrefillOp:
         v: torch.Tensor,
     ) -> torch.Tensor:
         # all gather key and value across all CP ranks
-        # Note: all_gather concatenates on dim=1, so we need to reshape to concatenate on dim=0
-        Group = self._collective_ops["Group"]
-        all_gather = self._collective_ops["all_gather"]
-
         cp_info = self.context_parallel_info
         cp_rank = self.cp_rank
         cp_size = self.cp_size
@@ -594,9 +504,26 @@ class ContextParallelFlashInferRaggedPrefillOp:
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
-        Group = self._collective_ops["Group"]
-        recv = self._collective_ops["recv"]
-        send = self._collective_ops["send"]
+
+        def _generate_half_q_indices(cp_chunk_lengths):
+            half_q_indices = []
+            offset = 0
+            for chunk_len in cp_chunk_lengths:
+                assert chunk_len % 2 == 0
+                half_q_indices.extend(
+                    range(offset + (chunk_len) // 2, offset + chunk_len)
+                )
+                offset += chunk_len
+            return half_q_indices
+
+        def _generate_half_kv_indices(cp_chunk_lengths):
+            half_kv_indices = []
+            offset = 0
+            for chunk_len in cp_chunk_lengths:
+                assert chunk_len % 2 == 0
+                half_kv_indices.extend(range(offset, offset + (chunk_len) // 2))
+                offset += chunk_len
+            return half_kv_indices
 
         # TODO: use cpu tensor
         cp_info = self.context_parallel_info

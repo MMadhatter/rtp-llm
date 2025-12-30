@@ -305,7 +305,7 @@ def setup_parallelism_config(
     # Set port and IP related fields
     parallelism_config.nccl_ip = g_master_info.ip
     parallelism_config.tp_nccl_port = g_master_info.tp_nccl_port
-    parallelism_config.cp_nccl_port = g_master_info.tp_nccl_port
+    parallelism_config.cp_nccl_port = g_master_info.cp_nccl_port
     parallelism_config.dp_tp_nccl_port = g_master_info.dp_tp_nccl_port
     parallelism_config.ffn_tp_nccl_port = g_master_info.ffn_tp_nccl_port
     parallelism_config.model_rpc_port = g_worker_info.rpc_server_port
