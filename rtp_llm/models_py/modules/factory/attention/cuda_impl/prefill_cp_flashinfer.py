@@ -18,6 +18,42 @@ from rtp_llm.ops.compute_ops import (
     PyContextParallelParams,
 )
 
+
+def merge_state_torch(
+    prefix_output: torch.Tensor,  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    prefix_lse: torch.Tensor,  # [NUM_TOKENS, NUM_HEADS]
+    suffix_output: torch.Tensor,  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    suffix_lse: torch.Tensor,  # [NUM_TOKENS, NUM_HEADS]
+    output: Optional[torch.Tensor] = None,  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+    output_lse: Optional[torch.Tensor] = None,  # [NUM_TOKENS, NUM_HEADS]
+):
+    # Avoid creating new tensors if they are already provided
+    if output is None:
+        output = torch.empty_like(prefix_output)
+    if output_lse is None:
+        output_lse = torch.empty_like(prefix_lse)
+    p_lse = prefix_lse
+    s_lse = suffix_lse
+    # inf -> -inf
+    p_lse[p_lse == torch.inf] = -torch.inf
+    s_lse[s_lse == torch.inf] = -torch.inf
+    # max_lse [NUM_HEADS, NUM_TOKENS]
+    max_lse = torch.maximum(p_lse, s_lse)
+    p_lse = p_lse - max_lse
+    s_lse = s_lse - max_lse
+    p_lse_exp = torch.exp(p_lse)
+    s_lse_exp = torch.exp(s_lse)
+    out_se = p_lse_exp + s_lse_exp
+    if output_lse is not None:
+        output_lse = torch.log(out_se) + max_lse
+    p_scale = p_lse_exp / out_se
+    s_scale = s_lse_exp / out_se
+    p_scale = p_scale.unsqueeze(2)  # [NUM_TOKENS, NUM_HEADS, 1]
+    s_scale = s_scale.unsqueeze(2)  # [NUM_TOKENS, NUM_HEADS, 1]
+    output = prefix_output * p_scale + suffix_output * s_scale
+    return output.to(torch.bfloat16), output_lse
+
+
 logger = logging.getLogger(__name__)
 
 # Global workspace buffer shared across all wrappers
@@ -90,7 +126,7 @@ class ContextParallelFlashInferRaggedPrefillOp:
 
         self.device = torch.cuda.current_device()
         self.workspace_buffer = get_workspace_buffer(self.device)
-        self.rotate_method = CPRotateMethod.ALL_GATHER_WITH_OVERLAP
+        self.rotate_method = CPRotateMethod.ALLTOALL
         self.context_parallel_info: PyContextParallelParams = (
             attn_inputs.context_parallel_info
         )
@@ -526,8 +562,7 @@ class ContextParallelFlashInferRaggedPrefillOp:
         kv_buffer = torch.cat([k, v], dim=0)
         remote_kv_buffer = torch.empty_like(kv_buffer)
 
-        for round_id in range(0, self.cp_size - 1):
-
+        for round_id in range(0, self.cp_size):
             out_buffer = torch.zeros(
                 [q.shape[0], self.num_qo_heads, self.head_dim],
                 dtype=q.dtype,
@@ -542,7 +577,7 @@ class ContextParallelFlashInferRaggedPrefillOp:
 
             if round_id < self.cp_size - 1:
                 with torch.cuda.stream(self.communication_stream):
-                    prev_rank_id = (self.cp_rank - round_id + 1) % self.cp_size
+                    prev_rank_id = (self.cp_rank - round_id - 1) % self.cp_size
                     next_rank_id = (self.cp_rank + round_id + 1) % self.cp_size
 
                     # TODO: avoid deadlock...
@@ -658,9 +693,6 @@ class ContextParallelFlashInferRaggedPrefillOp:
         kv_restore_indices = self._generate_kv_restore_indices(
             cp_chunk_lengths, all_cp_indices, cp_rank, cp_size
         )
-        from rtp_llm import ForkedPdb
-
-        ForkedPdb().set_trace()
         retore_keys = all_keys[kv_restore_indices]
         retore_values = all_values[kv_restore_indices]
         # generate q indices
@@ -699,36 +731,36 @@ class ContextParallelFlashInferRaggedPrefillOp:
             .contiguous()
             .reshape(-1, self.num_kv_heads, self.head_dim)
         )
-
+        out_buffer = torch.zeros(
+            [q.shape[0], self.num_qo_heads, self.head_dim],
+            dtype=q.dtype,
+            device=q.device,
+        )
+        lse_buffer = torch.full(
+            [q.shape[0], self.num_qo_heads],
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
         if k0.numel() > 0:
-            out_part0, lse_part0 = self.prefill_wrappers["non_causal_part_0"].run(
-                q=q0, k=k0, v=v0, return_lse=True
+            out_buffer[q_part_0_indices, :, :], lse_buffer[q_part_0_indices, :] = (
+                self.prefill_wrappers["non_causal_part_0"].run(
+                    q=q0, k=k0, v=v0, return_lse=True
+                )
             )
-            output_merge, lse_merge = merge_state(
-                v_a=output[q_part_0_indices],
-                s_a=lse[q_part_0_indices],
-                v_b=out_part0,
-                s_b=lse_part0,
-            )
-            output[q_part_0_indices] = output_merge
-            lse[q_part_0_indices] = lse_merge
         if k1.numel() > 0:
-            out_part1, lse_part1 = self.prefill_wrappers["non_causal_part_1"].run(
-                q=q1, k=k1, v=v1, return_lse=True
+            out_buffer[q_part_1_indices, :, :], lse_buffer[q_part_1_indices, :] = (
+                self.prefill_wrappers["non_causal_part_1"].run(
+                    q=q1, k=k1, v=v1, return_lse=True
+                )
             )
-            output_merge, lse_merge = merge_state(
-                v_a=output[q_part_1_indices],
-                s_a=lse[q_part_1_indices],
-                v_b=out_part1,
-                s_b=lse_part1,
-            )
-            output[q_part_1_indices] = output_merge
-            lse[q_part_1_indices] = lse_merge
-
-        from rtp_llm import ForkedPdb
-
-        ForkedPdb().set_trace()
-        return output
+        merged_output, merged_lse = merge_state(
+            v_a=output,
+            s_a=lse,
+            v_b=out_buffer,
+            s_b=lse_buffer,
+        )
+        return merged_output
 
     def forward(
         self,
