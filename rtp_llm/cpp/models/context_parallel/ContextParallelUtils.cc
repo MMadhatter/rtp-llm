@@ -77,4 +77,67 @@ bool contextParallelLoadBalanceSplit(const std::vector<int>& total_input_tokens,
     return true;
 }
 
+torch::Tensor generateQKVRestoreIndices(const torch::Tensor& prefill_cp_chunk_lengths, int cp_size) {
+    int           num_prefill_streams = prefill_cp_chunk_lengths.size(0);
+    int           total_token_size    = torch::sum(prefill_cp_chunk_lengths).item<int>();
+    torch::Tensor qkv_restore_indices =
+        torch::empty({cp_size, total_token_size}, torch::TensorOptions(torch::kInt32).device(torch::kCPU));
+
+    int* qkv_data = qkv_restore_indices.data_ptr<int>();
+
+    // Fill restore indices for each cp rank
+    int chunk_offset = 0;
+    for (int i = 0; i < num_prefill_streams; i++) {
+        int chunk_length    = prefill_cp_chunk_lengths[i].item<int>();
+        int prefill_qkv_len = chunk_length * cp_size;
+
+        std::vector<int> shuffle_indices = generateZigZagShuffleIndices(prefill_qkv_len, cp_size);
+
+        // Directly copy data for each rank using pointer arithmetic
+        for (int cp_rank = 0; cp_rank < cp_size; cp_rank++) {
+            const int* src = shuffle_indices.data() + cp_rank * chunk_length;
+            int*       dst = qkv_data + cp_rank * total_token_size + chunk_offset;
+            std::memcpy(dst, src, chunk_length * sizeof(int));
+        }
+
+        chunk_offset += chunk_length;
+    }
+
+    torch::Tensor qkv_restore_indices_1d = qkv_restore_indices.reshape({-1});
+    torch::Tensor sorted_indices         = torch::argsort(qkv_restore_indices_1d);
+    return sorted_indices;
+}
+
+torch::Tensor generateQKVPaddingMask(const torch::Tensor& prefill_cp_chunk_lengths,
+                                     const torch::Tensor& prefill_cp_padding_lengths,
+                                     int                  cp_size) {
+    int num_prefill_streams = prefill_cp_chunk_lengths.size(0);
+
+    // Calculate padded sequence lengths: chunk_length * cp_size
+    auto padded_seq_lengths = prefill_cp_chunk_lengths * cp_size;
+
+    // Calculate total mask size
+    int total_size = torch::sum(padded_seq_lengths).item<int>();
+
+    // Create output tensor on CPU first for efficient construction
+    torch::Tensor padding_mask = torch::empty({total_size}, torch::TensorOptions(torch::kInt32).device(torch::kCPU));
+    int*          mask_data    = padding_mask.data_ptr<int>();
+
+    // Fill mask for each stream
+    int offset = 0;
+    for (int i = 0; i < num_prefill_streams; i++) {
+        int padded_length = padded_seq_lengths[i].item<int>();
+        int padding_count = prefill_cp_padding_lengths[i].item<int>();
+        int valid_count   = padded_length - padding_count;
+
+        // Set valid tokens to 1
+        std::fill_n(mask_data + offset, valid_count, 1);
+        // Set padding tokens to 0
+        std::fill_n(mask_data + offset + valid_count, padding_count, 0);
+
+        offset += padded_length;
+    }
+    return padding_mask;
+}
+
 }  // namespace rtp_llm

@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include "rtp_llm/cpp/core/torch_utils/BufferTorchUtils.h"
 
 namespace rtp_llm {
 
@@ -53,5 +54,11 @@ bool contextParallelLoadBalanceSplit(const std::vector<int>& total_input_tokens,
                                      int                     cp_size,
                                      int                     cp_chunk_size,
                                      int                     cp_padding_size);
+
+torch::Tensor generateQKVRestoreIndices(const torch::Tensor& prefill_cp_chunk_lengths, int cp_size);
+
+torch::Tensor generateQKVPaddingMask(const torch::Tensor& prefill_cp_chunk_lengths,
+                                     const torch::Tensor& prefill_cp_padding_lengths,
+                                     int                  cp_size);
 
 }  // namespace rtp_llm
