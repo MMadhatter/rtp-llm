@@ -241,17 +241,7 @@ class ContextParallelFlashInferRaggedPrefillOp:
         ]
         cp_info = attention_inputs.context_parallel_info
         prefill_cp_chunk_lengths = cp_info.prefill_cp_chunk_lengths
-        prefill_shuffle_indices = cp_info.prefill_shuffle_indices
-
-        self.all_shuffle_indices = all_gather(
-            prefill_shuffle_indices.unsqueeze(0), group=Group.CP
-        ).squeeze(0)
-        self.kv_restore_indices = self._generate_kv_restore_indices(
-            prefill_cp_chunk_lengths,
-            self.all_shuffle_indices,
-            self.cp_rank,
-            self.cp_size,
-        )
+        self.kv_restore_indices = cp_info.prefill_qkv_restore_indice
 
         if self.rotate_method == CPRotateMethod.ALL_GATHER:
             # Plan for both part0 and part1 wrappers

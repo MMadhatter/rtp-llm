@@ -201,10 +201,10 @@ size_t PyWrappedModel::handleContextParallelOutputs(BufferPtr&                  
     auto prefill_qkv_restore_indice = cp_params.prefill_qkv_restore_indice;
     auto prefill_qkv_padding_mask   = cp_params.prefill_qkv_padding_mask;
 
-    torch::Tensor reordered_hidden_states = all_hidden_states_tensor.index_select(0, prefill_qkv_restore_indice);
-    torch::Tensor valid_indices           = torch::nonzero(prefill_qkv_padding_mask).squeeze(-1);
-    int64_t       num_valid_tokens        = valid_indices.size(0);
-    torch::Tensor valid_hidden_states     = reordered_hidden_states.index_select(0, valid_indices);
+    torch::Tensor valid_indices       = torch::nonzero(prefill_qkv_padding_mask).squeeze(-1);
+    int64_t       num_valid_tokens    = valid_indices.size(0);
+    torch::Tensor combined_indices    = prefill_qkv_restore_indice.index_select(0, valid_indices);
+    torch::Tensor valid_hidden_states = all_hidden_states_tensor.index_select(0, combined_indices);
 
     hidden_states = torchTensor2Buffer(valid_hidden_states);
     return num_valid_tokens;
