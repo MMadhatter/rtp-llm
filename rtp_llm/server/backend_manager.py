@@ -77,7 +77,6 @@ class BackendManager(object):
             engine_config.parallelism_config,
             world_info,
         )
-
         # Build main model_config
         model_config = ModelFactory.create_model_config(
             model_args=self.py_env_configs.model_args,

@@ -75,6 +75,14 @@ struct PyPrefillCudaGaphCopyParams {
     int           max_batch_size                = 0;
 };
 
+struct PyContextParallelParams {
+    torch::Tensor prefill_cp_padding_lengths;
+    torch::Tensor prefill_cp_chunk_lengths;
+    torch::Tensor prefill_shuffle_indices;
+    torch::Tensor prefill_qkv_restore_indice;
+    torch::Tensor prefill_qkv_padding_mask;
+};
+
 struct PyAttentionInputs {
     bool             is_prefill{false};
     torch::Tensor    prefix_lengths;
@@ -91,6 +99,7 @@ struct PyAttentionInputs {
     int           context_total_kv_length = 0;
     int           total_tokens            = 0;
     torch::Tensor padding_offset;
+    torch::Tensor position_ids;
 
     // for write cache store
     std::optional<PyCacheStoreInputs> cache_store_inputs;
@@ -102,6 +111,8 @@ struct PyAttentionInputs {
     torch::Tensor sequence_lengths_plus_1_d;
     torch::Tensor input_lengths_d;
     torch::Tensor decode_cu_seqlens_d;
+
+    std::optional<PyContextParallelParams> context_parallel_info;
 };
 
 struct BertEmbeddingInputs {

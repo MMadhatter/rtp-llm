@@ -18,6 +18,7 @@
 #include "rtp_llm/models_py/bindings/cuda/TrtFp8QuantOp.h"
 #include "rtp_llm/models_py/bindings/cuda/ReuseKVCacheOp.h"
 #include "rtp_llm/models_py/bindings/cuda/MlaKMergeOp.h"
+#include "rtp_llm/models_py/bindings/cuda/UserBuffersOp.h"
 
 using namespace rtp_llm;
 
@@ -204,6 +205,7 @@ void registerBaseCudaBindings(py::module& rtp_ops_m) {
     // RtpProcessGroup is deprecated, use rtp_llm.distribute.collective_torch instead
     // registerRtpProcessGroup(rtp_ops_m);
     registerTrtFp8QuantOp(rtp_ops_m);
+    registerUserBuffersOp(rtp_ops_m);
 }
 
 }  // namespace torch_ext
