@@ -44,9 +44,11 @@ private:
     void                           setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs& py_attn_inputs,
                                                                   const GptModelInputs&         inputs,
                                                                   BufferPtr&                    kv_cache_block_id_device);
-    GptModelOutputs
-                  callForwardPostLayers(BufferPtr hidden_states, const GptModelInputs& inputs, bool is_forward_method);
-    torch::Tensor tensorHoldHostAndToCuda(const torch::Tensor& tensor);
+    GptModelOutputs                callForwardPostLayers(BufferPtr             hidden_states,
+                                                         const GptModelInputs& inputs,
+                                                         bool                  skip_final_layernorm,
+                                                         size_t                num_valid_tokens = -1);
+    torch::Tensor                  tensorHoldHostAndToCuda(const torch::Tensor& tensor);
 
     GraphBase*    graph_runner_{nullptr};
     py::object    py_model_;

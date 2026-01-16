@@ -221,22 +221,25 @@ class UserBufferCommunicator:
         """
         Synchronize ALL CUDA streams created here.
         """
-        for stream in self._communicate_streams.values():
+        for stream in self._send_streams.values():
             stream.synchronize()
         self._current_stream.synchronize()
+        self._recv_stream.synchronize()
 
     def cleanup(self):
         """Clean up resources."""
+        self.synchronize()
         dispose_communicator(self._communicator_ptr)
-        self._communicate_streams.clear()
+        self._send_streams.clear()
 
     def __del__(self):
         """Destructor to ensure cleanup."""
         try:
             self.cleanup()
-        except:
+        except Exception as e:
             logging.warning(
-                "Error happend during destructing UbCommunicator, may causing resource leak."
+                f"Error happend during destructing UbCommunicator, may causing resource leak."
+                f"Error: {type(e).__name__}: {str(e)}"
             )
 
 
@@ -282,8 +285,15 @@ def get_user_buffers_communicator() -> Optional[UserBufferCommunicator]:
     return _global_communicator
 
 
+def destroy_user_buffers_communicator() -> None:
+    global _global_communicator
+    if _global_communicator is not None:
+        del _global_communicator
+
+
 __all__ = [
     "UserBufferCommunicator",
     "init_user_buffers_communicator",
     "get_user_buffers_communicator",
+    "destroy_user_buffers_communicator",
 ]

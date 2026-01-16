@@ -31,7 +31,6 @@ py_library(
     srcs = ["user_buffers.py"],
     deps = [
         "//rtp_llm:torch",
-        "//rtp_llm/ops:compute_ops",
     ],
     visibility = ["//visibility:public"],
 )

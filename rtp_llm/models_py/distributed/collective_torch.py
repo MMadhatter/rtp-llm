@@ -14,7 +14,7 @@ from rtp_llm.models_py.distributed.symm_mem import (
     get_symm_mem_communicator,
     init_symm_mem_communicator,
 )
-from rtp_llm.models_py.distributed.user_buffers import init_user_buffers_communicator
+from rtp_llm.models_py.utils.arch import is_cuda
 from rtp_llm.ops import ParallelismConfig
 
 
@@ -114,12 +114,6 @@ def init_distributed_environment(
 
     _parallelism_config = parallelism_config
     _initialized = True
-
-    if parallelism_config.cp_size > 1:
-        # parallelism_config 加一个 cp buffer size的参数： max_seq_len * 2 * sizeof(act_type) * num_kv_head * head_dim
-        init_user_buffers_communicator(
-            _get_group(Group.CP), local_rank, world_size, 1024 * 1024 * 1024
-        )
 
 
 def _create_process_groups(
@@ -230,6 +224,54 @@ def distributed_environment_initialized() -> bool:
     return torch.distributed.is_initialized()
 
 
+def init_user_buffers_environment(
+    parallelism_config: ParallelismConfig,
+    buffer_size: int = 1024 * 1024 * 1024,
+):
+    """Initialize user buffers communicator for context parallelism.
+
+    This function initializes the user buffers communicator for CP (Context Parallelism).
+    It should be called after init_distributed_environment() if cp_size > 1.
+
+    Args:
+        parallelism_config: Configuration for parallelism setup
+        buffer_size: Size of the communication buffer in bytes (default: 1GB)
+                    Recommended calculation: max_seq_len * 2 * sizeof(act_type) * num_kv_head * head_dim
+                    where:
+                    - max_seq_len: maximum sequence length
+                    - 2: factor for bidirectional communication
+                    - sizeof(act_type): size of activation data type (e.g., 2 for fp16, 4 for fp32)
+                    - num_kv_head: number of key-value heads
+                    - head_dim: dimension of each attention head
+
+    Raises:
+        RuntimeError: If distributed environment is not initialized
+    """
+    if not torch.distributed.is_initialized():
+        raise RuntimeError(
+            "Distributed environment is not initialized. "
+            "Call init_distributed_environment(parallelism_config) first."
+        )
+
+    if parallelism_config.cp_size > 1:
+        # parallelism_config 加 cp buffer size的参数： max_seq_len * 2 * sizeof(act_type) * num_kv_head * head_dim
+        if is_cuda():
+            from rtp_llm.models_py.distributed.user_buffers import (
+                init_user_buffers_communicator,
+            )
+
+            local_rank = parallelism_config.local_rank
+            world_size = parallelism_config.world_size
+
+            logging.info(
+                f"[rank: {parallelism_config.world_rank}] Initializing user buffers communicator "
+                f"with buffer_size: {buffer_size}, local_rank: {local_rank}, world_size: {world_size}"
+            )
+            init_user_buffers_communicator(
+                _get_group(Group.CP), local_rank, world_size, buffer_size
+            )
+
+
 def destroy_distributed_environment():
     """Destroy distributed environment and clean up process groups.
 
@@ -240,6 +282,13 @@ def destroy_distributed_environment():
 
     rank = torch.distributed.get_rank()
     logging.info(f"[rank: {rank}] Destroying distributed environment")
+
+    if is_cuda():
+        from rtp_llm.models_py.distributed.user_buffers import (
+            destroy_user_buffers_communicator,
+        )
+
+        destroy_user_buffers_communicator()
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
     _group_map.clear()
@@ -415,6 +464,7 @@ def barrier(group: Group) -> None:
 __all__ = [
     "Group",
     "init_distributed_environment",
+    "init_user_buffers_environment",
     "distributed_environment_initialized",
     "destroy_distributed_environment",
     "send",

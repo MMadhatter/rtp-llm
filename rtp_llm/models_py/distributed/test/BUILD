@@ -26,15 +26,14 @@ py_test(
 )
 
 py_test(
-    name = "user_buffers_test",
-    srcs = ["user_buffers_test.py"],
-    deps = [
-        "//rtp_llm:testlib",
-        "//rtp_llm/models_py/distributed:user_buffers",
-        "//rtp_llm/test/utils:port_util",
-    ],
-    timeout = 'moderate',
-    env = {"GPU_COUNT": "2"},
-    tags = ["open_skip", "H20"],
-    exec_properties = {'gpu':'H20', 'gpu_count':'2'},
+   name = "user_buffers_test",
+   srcs = ["user_buffers_test.py"],
+   deps = [
+       "//rtp_llm:testlib",
+       "//rtp_llm/models_py/distributed:user_buffers",
+       "//rtp_llm/models_py/distributed:collective_torch"
+   ],
+   env = {"GPU_COUNT": "4"},
+   tags = ["open_skip", "H20"],
+   exec_properties = {'gpu':'H20', 'gpu_count':'4'},
 )

@@ -3,7 +3,7 @@ import libth_transformer_config
 import torch
 import typing
 from . import rtp_llm_ops
-__all__: list[str] = ['BertEmbeddingInputs', 'DeviceExporter', 'DeviceType', 'KVCache', 'MlaParams', 'ParamsBase', 'PyAttentionInputs', 'PyCacheStoreInputs', 'PyCaptureMetaData', 'PyModelInitResources', 'PyModelInputs', 'PyModelOutputs', 'PyPrefillCudaGaphCopyParams', 'TypeMeta', 'get_device', 'get_typemeta', 'init_device', 'rtp_llm_ops']
+__all__: list[str] = ['BertEmbeddingInputs', 'DeviceExporter', 'DeviceType', 'KVCache', 'MlaParams', 'ParamsBase', 'PyAttentionInputs', 'PyCacheStoreInputs', 'PyCaptureMetaData', 'PyContextParallelParams', 'PyModelInitResources', 'PyModelInputs', 'PyModelOutputs', 'PyPrefillCudaGaphCopyParams', 'TypeMeta', 'get_device', 'get_typemeta', 'init_device', 'rtp_llm_ops']
 class BertEmbeddingInputs:
     @typing.overload
     def __init__(self) -> None:
@@ -134,7 +134,6 @@ class KVCache:
     @kv_scale_base.setter
     def kv_scale_base(self, arg0: torch.Tensor) -> None:
         ...
-
     @property
     def layer_id(self) -> int:
         """
@@ -144,19 +143,6 @@ class KVCache:
     def seq_size_per_block(self) -> int:
         """
         Sequence size per block
-        """
-    @property
-    def v_cache_base(self) -> torch.Tensor:
-        """
-        Value cache base tensor
-        """
-    @v_cache_base.setter
-    def v_cache_base(self, arg0: torch.Tensor) -> None:
-        ...
-    @property
-    def v_scale_base(self) -> torch.Tensor:
-        """
-        Value cache scale tensor
         """
 class MlaParams(ParamsBase):
     def __init__(self) -> None:
@@ -200,6 +186,7 @@ class ParamsBase:
         """
 class PyAttentionInputs:
     cache_store_inputs: PyCacheStoreInputs | None
+    context_parallel_info: PyContextParallelParams | None
     context_total_kv_length: int
     cu_kv_seqlens: torch.Tensor
     cu_seqlens: torch.Tensor
@@ -209,8 +196,10 @@ class PyAttentionInputs:
     kv_cache_block_id_device: torch.Tensor
     kv_cache_block_id_host: torch.Tensor
     padding_offset: torch.Tensor
+    position_ids: torch.Tensor
     prefix_lengths: torch.Tensor
     sequence_lengths: torch.Tensor
+    sequence_lengths_plus_1_d: torch.Tensor
     total_tokens: int
     def __init__(self) -> None:
         ...
@@ -231,13 +220,18 @@ class PyAttentionInputs:
     @property
     def prefix_lengths_d(self) -> torch.Tensor:
         ...
-    @property
-    def sequence_lengths_plus_1_d(self) -> torch.Tensor:
-        ...
 class PyCacheStoreInputs:
     def __init__(self) -> None:
         ...
 class PyCaptureMetaData:
+    def __init__(self) -> None:
+        ...
+class PyContextParallelParams:
+    prefill_cp_chunk_lengths: torch.Tensor
+    prefill_cp_padding_lengths: torch.Tensor
+    prefill_qkv_padding_mask: torch.Tensor
+    prefill_qkv_restore_indice: torch.Tensor
+    prefill_shuffle_indices: torch.Tensor
     def __init__(self) -> None:
         ...
 class PyModelInitResources:

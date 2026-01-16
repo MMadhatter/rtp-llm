@@ -53,6 +53,7 @@ torch::Tensor generateQKVRestoreIndices(const torch::Tensor& prefill_cp_chunk_le
 
     // Optimized: Directly compute indices without generating full shuffle_indices each time
     int chunk_offset = 0;
+    int seq_offset   = 0;
     for (int stream = 0; stream < num_prefill_streams; stream++) {
         int chunk_length    = prefill_cp_chunk_lengths[stream].item<int>();
         int prefill_qkv_len = chunk_length * cp_size;
@@ -63,14 +64,15 @@ torch::Tensor generateQKVRestoreIndices(const torch::Tensor& prefill_cp_chunk_le
             int* dst = qkv_data + cp_rank * total_token_size + chunk_offset;
 
             // Even pair (from start): indices are [cp_rank * pair_size, ...)
-            const int even_source = cp_rank * pair_size;
+            const int even_source = cp_rank * pair_size + seq_offset;
             std::iota(dst, dst + pair_size, even_source);
 
             // Odd pair (from end): indices are [prefill_qkv_len - pair_size * (cp_rank + 1), ...)
-            const int odd_source = prefill_qkv_len - pair_size * (cp_rank + 1);
+            const int odd_source = prefill_qkv_len - pair_size * (cp_rank + 1) + seq_offset;
             std::iota(dst + pair_size, dst + pair_size * 2, odd_source);
         }
         chunk_offset += chunk_length;
+        seq_offset += prefill_qkv_len;
     }
     torch::Tensor sorted_indices = torch::empty(
         {cp_size * total_token_size}, torch::TensorOptions(torch::kInt32).device(torch::kCPU).pinned_memory(true));

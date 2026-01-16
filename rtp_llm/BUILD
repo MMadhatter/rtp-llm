@@ -99,7 +99,7 @@ requirement([
     "librosa",
     "matplotlib", # required by qwen vl tokenizer
     "flash_attn",
-    "av",
+    # "av",
     "pyrsmi",
     "amdsmi",
     "fast-safetensors",
@@ -226,7 +226,7 @@ py_library(
         #":decord",
         ":nest_asyncio",
         ":matplotlib",
-        ":av",
+        # ":av",
         "//rtp_llm/model_loader:loader",
         "//rtp_llm/models_py:models",
     ] + arch_dep + select({
@@ -573,7 +573,7 @@ whl_reqs = [
     "partial_json_parser",
     "librosa",
     "matplotlib",
-    "av",
+    # "av",
     "setproctitle",
     "bitsandbytes",
     "portalocker",
