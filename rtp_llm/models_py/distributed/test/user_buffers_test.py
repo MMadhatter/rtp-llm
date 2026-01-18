@@ -18,6 +18,7 @@ import torch.distributed as dist
 from rtp_llm.models_py.distributed.collective_torch import (
     destroy_distributed_environment,
     init_distributed_environment,
+    init_user_buffers_environment,
 )
 from rtp_llm.models_py.distributed.user_buffers import (
     UserBufferCommunicator,
@@ -25,6 +26,8 @@ from rtp_llm.models_py.distributed.user_buffers import (
 )
 from rtp_llm.ops import ParallelismConfig
 from rtp_llm.test.utils.port_util import PortManager
+
+BUFFER_SIZE = 128 * 1024 * 1024
 
 
 def get_parallelism_config(world_rank, world_size, tp_size, dp_size, cp_size, port):
@@ -115,8 +118,7 @@ def run_user_buffer_test_main(rank: int, world_size: int, port: int):
         torch.cuda.set_device(parallelism_config.local_rank)
         torch.set_default_device(f"cuda:{parallelism_config.local_rank}")
         init_distributed_environment(parallelism_config, backend="nccl", timeout=60)
-
-        BUFFER_SIZE = 1024 * 1024 * 1024
+        init_user_buffers_environment(parallelism_config, buffer_size=BUFFER_SIZE)
         # use cp group for test
         ub_communicator = get_user_buffers_communicator()
 
@@ -132,6 +134,7 @@ def run_user_buffer_test_main(rank: int, world_size: int, port: int):
 
     except Exception as e:
         print(f"Rank {rank} error in collective operations test: {e}")
+        raise
 
 
 class TestUserBufferCommunicator(unittest.TestCase):
