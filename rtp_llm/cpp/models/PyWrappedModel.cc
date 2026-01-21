@@ -111,6 +111,7 @@ void PyWrappedModel::handleContextParallelInputs(GptModelInputs& model_input, Py
     auto& input_lengths      = model_input.input_lengths;     // prefill + decode
     auto& sequence_lengths   = model_input.sequence_lengths;  // decode
     // auto& prefix_lengths = model_input.prefix_lengths; TODO
+    auto input_lengths_cpu_tensor = Buffer2torchTensor(input_lengths, true);
 
     size_t num_decode_stream  = sequence_lengths->shape()[0];
     size_t num_prefill_stream = input_lengths->shape()[0] - num_decode_stream;
@@ -186,11 +187,12 @@ void PyWrappedModel::handleContextParallelInputs(GptModelInputs& model_input, Py
     auto qkv_restore_indice = generateQKVRestoreIndices(cp_chunk_lengths, cp_size);
     auto qkv_padding_mask   = generateQKVPaddingMask(cp_chunk_lengths, cp_padding_lengths, cp_size);
 
-    cp_params.prefill_cp_padding_lengths = cp_padding_lengths.cuda();
-    cp_params.prefill_cp_chunk_lengths   = cp_chunk_lengths.cuda();
-    cp_params.prefill_shuffle_indices    = shuffle_indices.cuda();
-    cp_params.prefill_qkv_restore_indice = qkv_restore_indice.cuda();
-    cp_params.prefill_qkv_padding_mask   = qkv_padding_mask.cuda();
+    cp_params.prefill_cp_padding_lengths       = cp_padding_lengths.cuda();
+    cp_params.prefill_cp_chunk_lengths         = cp_chunk_lengths.cuda();
+    cp_params.prefill_shuffle_indices          = shuffle_indices.cuda();
+    cp_params.prefill_qkv_restore_indice       = qkv_restore_indice.cuda();
+    cp_params.prefill_qkv_padding_mask         = qkv_padding_mask.cuda();
+    cp_params.prefill_actual_input_lengths_cpu = input_lengths_cpu_tensor;
 }
 
 size_t PyWrappedModel::handleContextParallelOutputs(BufferPtr&                     hidden_states,

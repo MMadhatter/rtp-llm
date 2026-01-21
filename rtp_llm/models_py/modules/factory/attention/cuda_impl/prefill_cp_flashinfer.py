@@ -4,6 +4,7 @@ from functools import cached_property
 from typing import Any, Dict, Optional
 
 import torch
+from numpy import append
 
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, recv, send
 from rtp_llm.models_py.distributed.user_buffers import get_user_buffers_communicator
@@ -17,6 +18,7 @@ from rtp_llm.ops.compute_ops import (
     ParamsBase,
     PyAttentionInputs,
     PyContextParallelParams,
+    fill_mla_params,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,7 +41,8 @@ def get_workspace_buffer(device: torch.device) -> torch.Tensor:
 
 
 from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
-from flashinfer.cascade import merge_state, merge_state_in_place
+from flashinfer.cascade import merge_state
+from flashinfer.page import append_paged_kv_cache
 
 
 class ContextParallelFlashInferRaggedPrefillOp:
@@ -159,6 +162,7 @@ class ContextParallelFlashInferRaggedPrefillOp:
             kv_layout: KV cache layout ("NHD" or "HND")
         """
         super().__init__()
+        self.attn_inputs = attn_inputs
         self.attn_configs = attn_configs
         self.num_qo_heads = attn_configs.head_num
         self.num_kv_heads = attn_configs.kv_head_num
@@ -200,6 +204,11 @@ class ContextParallelFlashInferRaggedPrefillOp:
         self.kv_part_0_indices = self.kv_part_1_indices = None
         self.half_q_indices = self.half_kv_indices = None
 
+        # write kv cache params
+        self.kv_restore_unpad_indices = None
+        self.actual_input_lengths = None
+        self.actual_cu_seqlens = None
+
         # init flashinfer attention wrapper
         wrapper_configs = {
             CPRotateMethod.ALL_GATHER: ["part0", "part1"],
@@ -237,7 +246,14 @@ class ContextParallelFlashInferRaggedPrefillOp:
         ]
         cp_info = attention_inputs.context_parallel_info
         prefill_cp_chunk_lengths = cp_info.prefill_cp_chunk_lengths
+        padding_mask = cp_info.prefill_qkv_padding_mask
         self.kv_restore_indices = cp_info.prefill_qkv_restore_indice
+        self.kv_restore_unpad_indices = self.kv_restore_indices[padding_mask == 1]
+        self.actual_input_lengths = cp_info.prefill_actual_input_lengths_cpu
+        shuffle_indices = cp_info.prefill_shuffle_indices
+        self.all_shuffle_indices = all_gather(shuffle_indices, group=Group.CP).reshape(
+            -1, shuffle_indices.shape[0]
+        )
 
         if self.rotate_method == CPRotateMethod.ALL_GATHER:
             # Plan for both part0 and part1 wrappers
@@ -275,6 +291,15 @@ class ContextParallelFlashInferRaggedPrefillOp:
             self.q_part_0_indices = torch.tensor(q_part_0_indices, device=device)
             self.q_part_1_indices = torch.tensor(q_part_1_indices, device=device)
 
+            params = fill_mla_params(
+                self.attn_inputs.prefix_lengths,
+                self.attn_inputs.sequence_lengths,
+                self.actual_input_lengths,
+                self.attn_inputs.kv_cache_block_id_host,
+                self.attn_configs.tokens_per_block,
+            )
+            return params
+
         elif self.rotate_method == CPRotateMethod.ALLTOALL:
             # local attention
             self.prefill_wrappers["causal"].plan(
@@ -311,6 +336,13 @@ class ContextParallelFlashInferRaggedPrefillOp:
 
             self.half_q_indices = torch.tensor(half_q_indices, device=self.device)
             self.half_kv_indices = torch.tensor(half_kv_indices, device=self.device)
+            return fill_mla_params(
+                self.attn_inputs.prefix_lengths,
+                self.attn_inputs.sequence_lengths,
+                self.attn_inputs.input_lengths,
+                self.attn_inputs.kv_cache_block_id_host,
+                self.attn_configs.tokens_per_block,
+            )
 
         elif self.rotate_method == CPRotateMethod.ALL_GATHER_WITH_OVERLAP:
             # Plan for both part0 and part1 wrappers
@@ -357,6 +389,14 @@ class ContextParallelFlashInferRaggedPrefillOp:
             self.q_part_1_indices = torch.tensor(q_part_1_indices, device=device)
             self.kv_part_0_indices = self.kv_restore_indices[kv_part_0_indices]
             self.kv_part_1_indices = self.kv_restore_indices[kv_part_1_indices]
+
+            return fill_mla_params(
+                self.attn_inputs.prefix_lengths,
+                self.attn_inputs.sequence_lengths,
+                self.actual_input_lengths,
+                self.attn_inputs.kv_cache_block_id_host,
+                self.attn_configs.tokens_per_block,
+            )
         else:
             raise ValueError(f"Unsupported rotate method: {self.rotate_method}")
         return ParamsBase()
@@ -458,6 +498,8 @@ class ContextParallelFlashInferRaggedPrefillOp:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+        params: ParamsBase = None,
     ) -> torch.Tensor:
         all_keys = all_gather(k, group=Group.CP).reshape(
             k.shape[0] * self.cp_size, self.num_kv_heads, self.head_dim
@@ -467,6 +509,20 @@ class ContextParallelFlashInferRaggedPrefillOp:
         )
         q_reshaped = q.reshape(-1, self.num_qo_heads, self.head_dim)
 
+        # TODO: make write local kvcache async
+        restore_k = all_keys[self.kv_restore_unpad_indices]
+        restore_v = all_values[self.kv_restore_unpad_indices]
+        append_paged_kv_cache(
+            append_key=restore_k,
+            append_value=restore_v,
+            batch_indices=params.batch_indice,
+            positions=params.positions,
+            paged_kv_cache=kv_cache.kv_cache_base,
+            kv_indices=params.page_indice,
+            kv_indptr=params.prefill_page_indptr,
+            kv_last_page_len=params.paged_kv_last_page_len,
+            kv_layout="HND",
+        )
         q0 = torch.index_select(q_reshaped, 0, self.q_part_0_indices).contiguous()
         q1 = torch.index_select(q_reshaped, 0, self.q_part_1_indices).contiguous()
         k0 = torch.index_select(all_keys, 0, self.kv_part_0_indices).contiguous()
@@ -484,6 +540,8 @@ class ContextParallelFlashInferRaggedPrefillOp:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+        params: ParamsBase = None,
     ) -> torch.Tensor:
         # init kv buffer
         kv_buffer = torch.cat([k, v], dim=0)
@@ -509,8 +567,11 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 with torch.cuda.stream(self.communication_stream):
                     prev_rank_id = (self.cp_rank - round_id - 1) % self.cp_size
                     next_rank_id = (self.cp_rank + round_id + 1) % self.cp_size
-                    if self.ub_communicator is not None:
-                        # in ub_communicator, send is non-blocking, recv is blocking
+
+                    if (
+                        self.ub_communicator is not None
+                        and self.ub_communicator.can_handle_tensor(kv_buffer)
+                    ):
                         self.ub_communicator.send(kv_buffer, dst=next_rank_id)
                         self.ub_communicator.recv(remote_kv_buffer, src=prev_rank_id)
                     else:
@@ -525,10 +586,26 @@ class ContextParallelFlashInferRaggedPrefillOp:
 
             if round_id == 0:  # local attention
                 self.math_events[round_id].record()
+                # TODO: make write local kvcache async
+
+                k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+                v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+
+                append_paged_kv_cache(
+                    append_key=k,
+                    append_value=v,
+                    batch_indices=params.batch_indice,
+                    positions=self.all_shuffle_indices[self.cp_rank],
+                    paged_kv_cache=kv_cache.kv_cache_base,
+                    kv_indices=params.page_indice,
+                    kv_indptr=params.prefill_page_indptr,
+                    kv_last_page_len=params.paged_kv_last_page_len,
+                    kv_layout="HND",
+                )
                 merged_out, merged_lse = self.prefill_wrappers["causal"].run(
                     q.reshape(-1, self.num_qo_heads, self.head_dim),
-                    k.reshape(-1, self.num_kv_heads, self.head_dim),
-                    v.reshape(-1, self.num_kv_heads, self.head_dim),
+                    k,
+                    v,
                     return_lse=True,
                 )
             else:
@@ -537,6 +614,25 @@ class ContextParallelFlashInferRaggedPrefillOp:
                 remote_k, remote_v = torch.split(
                     remote_kv_buffer, [k.shape[0], v.shape[0]], dim=0
                 )
+                remote_k = remote_k.contiguous().reshape(
+                    -1, self.num_kv_heads, self.head_dim
+                )
+                remote_v = remote_v.contiguous().reshape(
+                    -1, self.num_kv_heads, self.head_dim
+                )
+                # TODO: make write local kvcache async
+                src_rank = (self.cp_rank - round_id - 1) % self.cp_size
+                append_paged_kv_cache(
+                    append_key=remote_k,
+                    append_value=remote_v,
+                    batch_indices=params.batch_indice,
+                    positions=self.all_shuffle_indices[src_rank],
+                    paged_kv_cache=kv_cache.kv_cache_base,
+                    kv_indices=params.page_indice,
+                    kv_indptr=params.prefill_page_indptr,
+                    kv_last_page_len=params.paged_kv_last_page_len,
+                    kv_layout="HND",
+                )
                 if round_id > self.cp_rank:
                     # half q and full kv
                     q_split = (
@@ -544,13 +640,8 @@ class ContextParallelFlashInferRaggedPrefillOp:
                         .contiguous()
                         .reshape(-1, self.num_qo_heads, self.head_dim)
                     )
-                    k_split = remote_k.contiguous().reshape(
-                        -1, self.num_kv_heads, self.head_dim
-                    )
-                    v_split = remote_v.contiguous().reshape(
-                        -1, self.num_kv_heads, self.head_dim
-                    )
-
+                    k_split = remote_k
+                    v_split = remote_v
                     self.math_events[round_id].record()
                     (
                         out_buffer[self.half_q_indices, :, :],
@@ -569,16 +660,12 @@ class ContextParallelFlashInferRaggedPrefillOp:
                     )
                 else:
                     # half kv and full q
-                    k_split = (
-                        torch.index_select(remote_k, 0, self.half_kv_indices)
-                        .contiguous()
-                        .reshape(-1, self.num_kv_heads, self.head_dim)
-                    )
-                    v_split = (
-                        torch.index_select(remote_v, 0, self.half_kv_indices)
-                        .contiguous()
-                        .reshape(-1, self.num_kv_heads, self.head_dim)
-                    )
+                    k_split = torch.index_select(
+                        remote_k, 0, self.half_kv_indices
+                    ).contiguous()
+                    v_split = torch.index_select(
+                        remote_v, 0, self.half_kv_indices
+                    ).contiguous()
                     q_split = q.contiguous().reshape(
                         -1, self.num_qo_heads, self.head_dim
                     )
@@ -603,11 +690,19 @@ class ContextParallelFlashInferRaggedPrefillOp:
         return merged_out
 
     def forward_all_gather_with_overlap(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+        params: ParamsBase = None,
     ) -> torch.Tensor:
         self.communication_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.communication_stream):
-            if self.ub_communicator is not None:
+            if (
+                self.ub_communicator is not None
+                and self.ub_communicator.can_handle_tensor(k)
+            ):
                 all_keys = self.ub_communicator.all_gather(k).reshape(
                     k.shape[0] * self.cp_size, self.num_kv_heads, self.head_dim
                 )
@@ -629,6 +724,21 @@ class ContextParallelFlashInferRaggedPrefillOp:
             return_lse=True,
         )
         torch.cuda.current_stream().wait_stream(self.communication_stream)
+
+        # TODO: make write local kvcache async
+        restore_k = all_keys[self.kv_restore_unpad_indices]
+        restore_v = all_values[self.kv_restore_unpad_indices]
+        append_paged_kv_cache(
+            append_key=restore_k,
+            append_value=restore_v,
+            batch_indices=params.batch_indice,
+            positions=params.positions,
+            paged_kv_cache=kv_cache.kv_cache_base,
+            kv_indices=params.page_indice,
+            kv_indptr=params.prefill_page_indptr,
+            kv_last_page_len=params.paged_kv_last_page_len,
+            kv_layout="HND",
+        )
 
         q0 = torch.index_select(q_reshaped, 0, self.q_part_0_indices).contiguous()
         q1 = torch.index_select(q_reshaped, 0, self.q_part_1_indices).contiguous()
@@ -692,11 +802,13 @@ class ContextParallelFlashInferRaggedPrefillOp:
         v = v.contiguous()
 
         if self.rotate_method == CPRotateMethod.ALL_GATHER:
-            attn_output = self.forward_all_gather(q, k, v)
+            attn_output = self.forward_all_gather(q, k, v, kv_cache, params)
         elif self.rotate_method == CPRotateMethod.ALLTOALL:
-            attn_output = self.forward_all_to_all(q, k, v)
+            attn_output = self.forward_all_to_all(q, k, v, kv_cache, params)
         elif self.rotate_method == CPRotateMethod.ALL_GATHER_WITH_OVERLAP:
-            attn_output = self.forward_all_gather_with_overlap(q, k, v)
+            attn_output = self.forward_all_gather_with_overlap(
+                q, k, v, kv_cache, params
+            )
         return attn_output
 
 
@@ -741,3 +853,28 @@ class PrefillContextParallelFlashInferImpl(FMHAPrefillImplBase):
     @cp_size.setter
     def cp_size(self, value: int):
         self.fmha_impl.cp_size = value
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        kv_cache: Optional[KVCache],
+        need_rope_kv_cache: bool = True,
+    ) -> torch.Tensor:
+        assert self.rope_kvcache_impl is not None and self.rope_params is not None
+        if need_rope_kv_cache:
+            fmha_input = self.rope_kvcache_impl.forward(
+                qkv, self.fmha_type(), kv_cache, self.rope_params
+            )
+        else:
+            fmha_input = qkv
+
+        assert self.fmha_impl is not None
+        res = self.fmha_impl.forward(fmha_input, kv_cache, self.fmha_params)
+
+        # delay write cachestore until local kvcache finish writing
+        if (
+            self.attn_inputs.cache_store_inputs
+            and self.write_cache_store_impl is not None
+        ):
+            self.write_cache_store_impl(kv_cache)
+        return res

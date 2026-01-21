@@ -46,6 +46,7 @@ class UserBufferCommunicator:
         self.world_size = world_size
         self.device = torch.device(f"cuda:{local_rank}")
         self.buffer_size = buffer_size
+        self.per_rank_buffer_size = buffer_size // world_size
         self.group = group
         torch.cuda.set_device(self.device)
         # check p2p access between all pairs of GPUs
@@ -138,25 +139,46 @@ class UserBufferCommunicator:
                     f"[Rank {current_device}] Error checking P2P access to rank {other_rank}: {e}"
                 )
 
+    def can_handle_tensor(self, tensor: torch.Tensor) -> bool:
+        """
+        Check if tensor size is within the per-rank buffer limit.
+
+        Args:
+            tensor: Tensor to check
+
+        Returns:
+            bool: True if tensor can be handled by user buffers, False otherwise
+        """
+        data_bytes = tensor.numel() * tensor.element_size()
+        if data_bytes > self.per_rank_buffer_size:
+            logging.debug(
+                f"Tensor size {data_bytes} bytes exceeds per-rank buffer limit "
+                f"{self.per_rank_buffer_size} bytes"
+            )
+            return False
+        return True
+
     def send(
         self,
         tensor: torch.Tensor,
         dst: int,
-    ) -> None:
+    ) -> bool:
         """
         Send data to destination GPU using CUDA IPC shared buffers.
         Copies data to local shared buffer using cudaMemcpyAsync.
         The receiver will access this shared buffer via IPC handles.
+
         Args:
-            data: Tensor to send (must be on local CUDA device)
+            tensor: Tensor to send (must be on local CUDA device)
             dst: Destination GPU rank (same node, different GPU)
+
+        Returns:
+            bool: True if data was sent successfully, False if tensor size exceeds per-rank buffer limit
         """
-        # Check data size
+        if not self.can_handle_tensor(tensor):
+            return False
+
         data_bytes = tensor.numel() * tensor.element_size()
-        if data_bytes > self.buffer_size:
-            raise ValueError(
-                f"Data size {data_bytes} bytes exceeds buffer size {self.buffer_size} bytes"
-            )
         userbuffers_send(
             tensor,
             self._ub_handle,
@@ -168,12 +190,13 @@ class UserBufferCommunicator:
             self._send_streams[dst].cuda_stream,
         )
         torch.cuda.current_stream().wait_stream(self._send_streams[dst])
+        return True
 
     def recv(
         self,
         tensor: torch.Tensor,
         src: int,
-    ) -> torch.Tensor:
+    ) -> bool:
         """
         Receive data from source GPU using CUDA IPC shared buffers.
 
@@ -183,9 +206,13 @@ class UserBufferCommunicator:
         Args:
             tensor: Destination tensor to store received data
             src: Source GPU rank (same node, different GPU)
+
         Returns:
-            Received tensor on local device
+            bool: True if data was received successfully, False if tensor size exceeds per-rank buffer limit
         """
+        if not self.can_handle_tensor(tensor):
+            return False
+
         userbuffers_recv(
             tensor,
             self._ub_handle,
@@ -196,17 +223,34 @@ class UserBufferCommunicator:
             self._recv_stream.cuda_stream,
         )
         torch.cuda.current_stream().wait_stream(self._recv_stream)
-        return tensor
+        return True
 
-    def all_gather(self, tensor: torch.Tensor) -> List[torch.Tensor]:
+    def all_gather(
+        self, tensor: torch.Tensor, output_tensor: Optional[torch.Tensor] = None
+    ) -> tuple[bool, Optional[torch.Tensor]]:
+        """
+        Perform all-gather operation using user buffers.
 
-        all_gather_tensor = torch.empty(
-            [self.world_size * tensor.shape[0]] + list(tensor.shape)[1:],
-            device=tensor.device,
-            dtype=tensor.dtype,
-        )
+        Args:
+            tensor: Input tensor to gather
+            output_tensor: Optional output tensor to store result
+
+        Returns:
+            tuple[None, Optional[torch.Tensor]]: (None, output_tensor)
+                - output_tensor: Gathered tensor if successful, None otherwise
+        """
+        if not self.can_handle_tensor(tensor):
+            return None
+
+        if output_tensor is None:
+            output_tensor = torch.empty(
+                [self.world_size * tensor.shape[0]] + list(tensor.shape)[1:],
+                device=tensor.device,
+                dtype=tensor.dtype,
+            )
+
         userbuffers_ring_all_gather(
-            all_gather_tensor,
+            output_tensor,
             tensor,
             self._ub_handle,
             self._rank_offset_lists,
@@ -215,7 +259,7 @@ class UserBufferCommunicator:
             self._recv_stream.cuda_stream,
         )
         torch.cuda.current_stream().wait_stream(self._recv_stream)
-        return all_gather_tensor
+        return output_tensor
 
     def synchronize(self):
         """
