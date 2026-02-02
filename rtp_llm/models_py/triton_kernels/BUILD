@@ -23,6 +23,13 @@ py_library(
     visibility = ["//visibility:public"]
 )
 
+
+py_library(
+    name = "mhc",
+    srcs = glob(["mhc/*.py"]),
+    visibility = ["//visibility:public"]
+)
+
 py_library(
     name = "sparse_mla",
     srcs = glob(["sparse_mla/*.py"]),
@@ -37,6 +44,7 @@ py_library(
         ":moe",
         ":common",
         ":sparse_mla",
+        ":mhc",
     ],
     visibility = ["//visibility:public"]
 )
