@@ -83,8 +83,11 @@ class ShortConv(nn.Module):
         self.activation = activation
 
         self.total_channels = self.hidden_size * self.hc_mult
-        self.bias = False
-        self.conv_weight = weights[W.engram_conv_w]
+        self.conv_bias = None
+        self.conv_weights = weights[W.engram_conv_w]
+
+        # 3 * (4 - 1)
+        self.padding_size = self.dilation * (self.kernel_size - 1)
 
         # TODO: impl chunked rmsnorm
         self.norms = []
@@ -97,8 +100,8 @@ class ShortConv(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Input:  (L,HC_MULT,D)
-        Output: (L,HC_MULT,D)
+        Input:  (L, HC_MULT, D)
+        Output: (L, HC_MULT, D)
         """
         L, HC_MULT, D = x.shape
 
@@ -113,21 +116,24 @@ class ShortConv(nn.Module):
             normed_chunks.append(self.norms[i](chunk))
         # [L, HC_MULT * D]
         x_norm = torch.cat(normed_chunks, dim=-1)
+
+        # 需要cache: [self.padding_size, padding_size]的大小
+        # -----魔改一下--casual conv_1d---带dialation---------
         # [HC_MULT * D, L]
         x_bct = x_norm.transpose(0, 1)
-
-        # # -------casual conv_1d----------------------
-        # y_bct = F.conv_1d(
-
-        # )
-        # y_bct = y_bct[..., :T]
-        # # --------------------------
-        y_bct = x_bct
-
+        y_bct = F.conv1d(
+            input=x_bct,
+            weight=self.conv_weights,
+            bias=None,
+            padding=(self.padding_size,),
+            dilation=(self.dilation,),
+            groups=self.total_channels,
+        )
+        y_bct = y_bct[..., :L]
         if self.activation:
             y_bct = self.act_fn(y_bct)
-
         y = y_bct.transpose(0, 1).view(L, HC_MULT, D).contiguous()
+        # --------------------------------------------------------
         return y
 
 
@@ -170,6 +176,7 @@ class Engram(nn.Module):
 
         self.engram_hidden_size = (config.max_ngram_size - 1) * config.n_embed_per_ngram
 
+        # TODO: block quant scale
         self.value_proj = LinearFactory.create_linear_from_weights(
             weights,
             W.engram_v_proj_w,
@@ -191,17 +198,16 @@ class Engram(nn.Module):
             norm = RMSNorm(weights[W.engram_k_norms_w][i], eps=config.layernorm_eps)
             self.k_norms.append(norm)
 
-    def forward(self, hidden_states, input_ids):
+    def forward(self, inputs: PyModelInputs, hidden_states: torch.Tensor):
         """
         hidden_states: [B*S, HC_MULT, D]
         input_ids: [B*S]
         """
         # TODO: 修改hash function支持B*S在一个维度并做对应的padding
-        input_ids_cpu = input_ids.to("cpu").unsqueeze(0)
+        input_ids_cpu = inputs.input_ids.to("cpu").unsqueeze(0)
         hash_input_ids = torch.from_numpy(
             self.hash_mapping.hash(input_ids_cpu)[self.layer_id]
         )
-
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
         embeddings = embeddings.to(hidden_states.device)
 
@@ -212,14 +218,13 @@ class Engram(nn.Module):
         keys = torch.bmm(embeddings_expanded, self.key_projs_weights)
 
         for hc_idx in range(self.config.hc_mult):
-
-            # q k norm
+            # q k norm [TODO: chunked norm]
             key = keys[hc_idx].contiguous()
             normed_key = self.k_norms[hc_idx](key)
             query = hidden_states[:, hc_idx, :].contiguous()
             normed_query = self.q_norms[hc_idx](query)
 
-            # scaled dot product
+            # scaled dot product [TODO: do not use loop]
             gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(
                 self.config.hidden_size
             )
@@ -233,6 +238,9 @@ class Engram(nn.Module):
         # casual conv_1d
         output = value + self.short_conv(value)
         return output
+
+    def forward_decode(self, inputs: PyModelInputs, hidden_states: torch.Tensor):
+        return hidden_states
 
 
 class ManifoldHyperConnections(nn.Module):
@@ -250,26 +258,26 @@ class ManifoldHyperConnections(nn.Module):
         self.hidden_size = config.hidden_size
         self.max_sk_it = config.max_sk_it
 
-        # [pre, post, res]
+        # h_proj: [pre, post, res]
         self._weight = weights[W.mhc_h_proj_w]
         self._bias = weights[W.mhc_h_proj_b]
         self._alpha = weights[W.mhc_h_proj_alpha]
 
     def forward(self, x: torch.Tensor):
         """
-        RMSNorm weight被吸收到h_proj中, 计算也与h_proj合并;
+        RMSNorm weight被吸收到h_proj[self._weight]中, 计算与h_proj合并;
         h_pre, h_post, h_res的linear_proj和add bias拆成了三个kernel去实现;
         当前的linear proj先合并;
         """
         _, hc_mult, hidden_size = x.shape
         x = x.reshape(-1, hc_mult * hidden_size)
 
-        # ------------fuse single kernel----------------------------
-        # (15)
+        # -----------------single kernel--[deep_gemm.tf32_hc_prenorm_gemm]-------
+        # (15) norm:  1/r
         r_inv = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True))
         # (14)
         h_out = F.linear(x.float(), self._weight.T)
-        # ----------------------------------------------------------
+        # -----------------------------------------------------------------------
 
         # ------------single kernel------------
         # (16)
@@ -284,9 +292,9 @@ class ManifoldHyperConnections(nn.Module):
         # (17) (18)
         h_pre = F.sigmoid(h_pre)
         h_post = 2 * F.sigmoid(h_post)
-        # -------------------------------------
+        # --------------------------------------
 
-        # (19)--Sinkhorn-Knopp--single kernel----
+        # (19) --Sinkhorn-Knopp--single kernel----
         h_res_exp = torch.exp(h_res.reshape(-1, hc_mult, hc_mult))
 
         def sinkhorn_knopp_torch(x: torch.Tensor, max_it: int = 20):
@@ -324,6 +332,7 @@ class ManifoldHyperConnections(nn.Module):
             return res, u, v
 
         h_res, _, _ = sinkhorn_knopp_torch(h_res_exp, max_it=self.max_sk_it)
+        # -----------------------------------------
         return h_pre, h_post, h_res
 
 
@@ -377,7 +386,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 layer_id=layer_idx,
             )
 
-        # 使用 RMSResNorm 来 fuse residual add 和 layernorm
         self.input_layernorm = RMSNorm(
             weights[W.pre_ln_gamma], eps=config.layernorm_eps
         )
@@ -393,24 +401,24 @@ class DeepseekV4DecoderLayer(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        inputs: PyModelInputs,
         hidden_states: torch.Tensor,
         fmha_impl: FMHAImplBase,
         kv_cache: Optional[KVCache] = None,
     ) -> torch.Tensor:
+        if self.engram is not None:
+            # TODO: 查询和与hidden_states的cross attention拆开两部分
+            hidden_states = hidden_states + self.engram(inputs, hidden_states)
+
         # 计算缩放因子
         h_pre, h_post, h_res = self.mhc(hidden_states)
 
-        if self.engram is not None:
-            # TODO: 查询和与hidden_states的cross attention拆开两部分
-            hidden_states = hidden_states + self.engram(hidden_states, input_ids)
-
+        # TODO: kernel优化-----------------------------------------------------------
         # [num_token, 1, hc_mult] @ [num_token, hc_mult, hidden_size] -> [num_tokens, 1, hidden_size] -> [num_tokens, hidden_size]
-        # TODO: kernel优化
         hidden_pre = torch.matmul(
             h_pre.to(torch.bfloat16).unsqueeze(1), hidden_states
         ).squeeze(1)
-
+        # --------------------------------------------------------------------------
         hidden_pre = self.input_layernorm(hidden_pre)
         hidden_pre = self.self_attn(
             hidden_states=hidden_pre, fmha_impl=fmha_impl, kv_cache=kv_cache
@@ -418,12 +426,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_pre = self.post_attention_layernorm(hidden_pre)
         hidden_pre = self.mlp(hidden_pre)
 
+        # TODO: kernel优化-------------------------------------------------------------
         # hidden_res + hidden_post的部分也被dpsk优化为一个kernel
-        #
         output = torch.matmul(h_res.to(torch.bfloat16), hidden_states) + torch.matmul(
             h_post.to(torch.bfloat16).unsqueeze(2), hidden_pre.unsqueeze(1)
         )
-
+        # ----------------------------------------------------------------------------
         return output
 
 
@@ -494,7 +502,7 @@ class DeepseekV4Model(GptModelBase):
                     -1, self.config.hc_mult, -1
                 )
             hidden_states = decoder_layer(
-                input_ids,
+                inputs,
                 hidden_states,
                 fmha_impl,
                 kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
