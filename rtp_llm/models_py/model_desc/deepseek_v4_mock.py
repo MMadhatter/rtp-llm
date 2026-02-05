@@ -203,6 +203,7 @@ class Engram(nn.Module):
         hidden_states: [B*S, HC_MULT, D]
         input_ids: [B*S]
         """
+        # embedding lookup
         # TODO: 修改hash function支持B*S在一个维度并做对应的padding
         input_ids_cpu = inputs.input_ids.to("cpu").unsqueeze(0)
         hash_input_ids = torch.from_numpy(
