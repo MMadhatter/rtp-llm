@@ -27,6 +27,7 @@ from rtp_llm.models_py.modules import (
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
+from rtp_llm.models_py.triton_kernels.mhc.group_rmsnorm import GroupRMSNorm
 from rtp_llm.models_py.utils.deepseek_v4_utils import NgramHashMapping
 from rtp_llm.ops import HWKernelConfig, MoeConfig, ParallelismConfig
 from rtp_llm.ops.compute_ops import KVCache, PyModelInputs, PyModelOutputs
@@ -85,42 +86,35 @@ class ShortConv(nn.Module):
         self.total_channels = self.hidden_size * self.hc_mult
         self.conv_bias = None
         self.conv_weights = weights[W.engram_conv_w]
-
         # 3 * (4 - 1)
         self.padding_size = self.dilation * (self.kernel_size - 1)
-
-        # TODO: impl chunked rmsnorm
-        self.norms = []
-        for i in range(self.hc_mult):
-            norm = RMSNorm(weights[W.engram_conv_norms_w][i], eps=config.layernorm_eps)
-            self.norms.append(norm)
-
+        self.group_norm = GroupRMSNorm(
+            weights[W.engram_conv_norms_w],
+            group_size=self.hc_mult,
+            eps=config.layernorm_eps,
+        )
         if self.activation:
             self.act_fn = nn.SiLU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, inputs: PyModelInputs) -> torch.Tensor:
         """
-        Input:  (L, HC_MULT, D)
-        Output: (L, HC_MULT, D)
+        Input:  (num_tokens, hc_mult, hidden_size)
+        Output: (num_tokens, hc_mult, hidden_size)
         """
-        L, HC_MULT, D = x.shape
+        num_tokens, hc_mult, hidden_size = x.shape
 
         assert (
-            HC_MULT == self.hc_mult
-        ), f"Input groups {HC_MULT} != hc_mult {self.hc_mult}"
+            hc_mult == self.hc_mult
+        ), f"Input groups {hc_mult} != hc_mult {self.hc_mult}"
 
-        # chunked rms_norm
-        normed_chunks = []
-        for i in range(HC_MULT):
-            chunk = x[:, i, :].contiguous()
-            normed_chunks.append(self.norms[i](chunk))
-        # [L, HC_MULT * D]
-        x_norm = torch.cat(normed_chunks, dim=-1)
+        x_norm = self.group_norm(x.transpose(0, 1).contiguous())
 
-        # 需要cache: [self.padding_size, padding_size]的大小
-        # -----魔改一下--casual conv_1d---带dialation---------
-        # [HC_MULT * D, L]
-        x_bct = x_norm.transpose(0, 1)
+        # 需要cache: [self.padding_size, hidden_size]的大小
+        # -----魔改一下--casual conv_1d---哎，它的带dialation-------
+
+        # x_bct: [hc_mult * hidden_size, num_tokens]
+        x_bct = x_norm_1.permute(0, 2, 1).reshape(-1, L).contiguous()
+
         y_bct = F.conv1d(
             input=x_bct,
             weight=self.conv_weights,
@@ -176,7 +170,7 @@ class Engram(nn.Module):
 
         self.engram_hidden_size = (config.max_ngram_size - 1) * config.n_embed_per_ngram
 
-        # TODO: block quant scale
+        # TODO: with block quant scale
         self.value_proj = LinearFactory.create_linear_from_weights(
             weights,
             W.engram_v_proj_w,
@@ -188,20 +182,21 @@ class Engram(nn.Module):
         # merge mhc k_projs
         self.key_projs_weights = weights[W.engram_k_projs_w]
 
-        self.q_norms = []
-        for i in range(config.hc_mult):
-            norm = RMSNorm(weights[W.engram_q_norms_w][i], eps=config.layernorm_eps)
-            self.q_norms.append(norm)
-
-        self.k_norms = []
-        for i in range(config.hc_mult):
-            norm = RMSNorm(weights[W.engram_k_norms_w][i], eps=config.layernorm_eps)
-            self.k_norms.append(norm)
+        self.q_group_norm = GroupRMSNorm(
+            weights[W.engram_q_norms_w],
+            group_size=config.hc_mult,
+            eps=config.layernorm_eps,
+        )
+        self.k_group_norm = GroupRMSNorm(
+            weights[W.engram_k_norms_w],
+            group_size=config.hc_mult,
+            eps=config.layernorm_eps,
+        )
 
     def forward(self, inputs: PyModelInputs, hidden_states: torch.Tensor):
         """
-        hidden_states: [B*S, HC_MULT, D]
-        input_ids: [B*S]
+        inputs: PyModelInputs,
+        hidden_states: [num_tokens, hc_mult, hidden_size]
         """
         # embedding lookup
         # TODO: 修改hash function支持B*S在一个维度并做对应的padding
@@ -212,32 +207,28 @@ class Engram(nn.Module):
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
         embeddings = embeddings.to(hidden_states.device)
 
-        gates = []
+        # k_projs: 一次bmm expand ->[hc_mult, num_tokens, engram_hiddensize] @ [hc_mult, engram_hiddensize, hidden_size]
+        keys = torch.bmm(
+            embeddings.expand(self.config.hc_mult, -1, -1), self.key_projs_weights
+        )
 
-        # [1, num_tokens, engram_hiddensize] @ [hc_mult, engram_hidden_size, hidden_size], 一次bmm
-        embeddings_expanded = embeddings.expand(self.config.hc_mult, -1, -1)
-        keys = torch.bmm(embeddings_expanded, self.key_projs_weights)
+        # qk group norm: [hc_mult, num_tokens, hidden_size]
+        key_norm = self.k_group_norm(keys)
+        query_norm = self.q_group_norm(hidden_states.transpose(0, 1).contiguous())
 
-        for hc_idx in range(self.config.hc_mult):
-            # q k norm [TODO: chunked norm]
-            key = keys[hc_idx].contiguous()
-            normed_key = self.k_norms[hc_idx](key)
-            query = hidden_states[:, hc_idx, :].contiguous()
-            normed_query = self.q_norms[hc_idx](query)
+        # scaled dot product TODO: fuse kernel
+        gate = (key_norm * query_norm).sum(dim=-1) / math.sqrt(self.config.hidden_size)
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gate = gate.sigmoid()
 
-            # scaled dot product [TODO: do not use loop]
-            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(
-                self.config.hidden_size
-            )
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = gate.sigmoid().unsqueeze(-1)
-            gates.append(gate)
+        # gate transpose回去:  [num_tokens，hc_mult, 1]
+        gate = gate.unsqueeze(-1).transpose(0, 1).contiguous()
 
-        gates = torch.stack(gates, dim=1)
-        value = gates * self.value_proj(embeddings.squeeze(0)).unsqueeze(1)
+        # [num_tokens, hc_mult, 1] * [num_tokens, 1, hidden_size] -> [num_tokens, hc_mult, hidden_size]
+        value = gate * self.value_proj(embeddings.squeeze(0)).unsqueeze(1)
 
         # casual conv_1d
-        output = value + self.short_conv(value)
+        output = value + self.short_conv(value, inputs)
         return output
 
     def forward_decode(self, inputs: PyModelInputs, hidden_states: torch.Tensor):
