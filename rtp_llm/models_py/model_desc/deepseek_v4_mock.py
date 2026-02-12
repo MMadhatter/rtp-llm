@@ -27,6 +27,10 @@ from rtp_llm.models_py.modules import (
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
+from rtp_llm.models_py.triton_kernels.causal_conv1d import (
+    causal_conv1d_dilated,
+    causal_conv1d_update_dilated,
+)
 from rtp_llm.models_py.triton_kernels.mhc.group_rmsnorm import GroupRMSNorm
 from rtp_llm.models_py.triton_kernels.mhc.scaled_dot_product_gate import (
     scaled_dot_product_gate,
@@ -99,7 +103,9 @@ class ShortConv(nn.Module):
         if self.activation:
             self.act_fn = nn.SiLU()
 
-    def forward(self, x: torch.Tensor, inputs: PyModelInputs) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, inputs: PyModelInputs, kv_cache: KVCache
+    ) -> torch.Tensor:
         """
         Input:  (num_tokens, hc_mult, hidden_size)
         Output: (num_tokens, hc_mult, hidden_size)
@@ -114,17 +120,34 @@ class ShortConv(nn.Module):
         # x_bct: [hc_mult * hidden_size, num_tokens]
         x_bct = x_norm.permute(0, 2, 1).reshape(-1, num_tokens).contiguous()
 
-        # 需要cache: [self.padding_size, hidden_size]的大小
-        # -----魔改一下--casual conv_1d---哎，它的带dialation-------
-        y_bct = F.conv1d(
-            input=x_bct,
-            weight=self.conv_weights,
-            bias=None,
-            padding=(self.padding_size,),
-            dilation=(self.dilation,),
-            groups=self.total_channels,
-        )
-        y_bct = y_bct[..., :num_tokens]
+        if inputs.attention_inputs.is_prefill:
+            cu_seqlens = inputs.attention_inputs.cu_seqlens
+            x_padding, indices = conv1d_prefill_padding(
+                x_bct, cu_seqlens, self.padding_size
+            )
+            y = F.conv1d(
+                input=x_padding,
+                weight=self.conv_weights,
+                bias=None,
+                padding=0,
+                dilation=(self.dilation,),
+                groups=self.total_channels,
+            )
+            y = y[:, indices]
+
+        else:
+            # 需要cache: [self.padding_size, hidden_size]的大小
+            # -----魔改一下--casual conv_1d---哎，它的带dialation-------
+
+            y_bct = F.conv1d(
+                input=x_bct,
+                weight=self.conv_weights,
+                bias=None,
+                padding=(self.padding_size,),
+                dilation=(self.dilation,),
+                groups=self.total_channels,
+            )
+            y_bct = y_bct[..., :num_tokens]
         if self.activation:
             y_bct = self.act_fn(y_bct)
         y = y_bct.transpose(0, 1).view(num_tokens, hc_mult, hidden_size).contiguous()
@@ -194,10 +217,13 @@ class Engram(nn.Module):
             eps=config.layernorm_eps,
         )
 
-    def forward(self, inputs: PyModelInputs, hidden_states: torch.Tensor):
+    def forward(
+        self, inputs: PyModelInputs, hidden_states: torch.Tensor, kv_cache: KVCache
+    ):
         """
         inputs: PyModelInputs,
         hidden_states: [num_tokens, hc_mult, hidden_size]
+        kv_cache: KVCache
         """
         # embedding lookup
         # TODO: 修改hash function支持B*S在一个维度并做对应的padding
@@ -229,11 +255,8 @@ class Engram(nn.Module):
         value = gate * self.value_proj(embeddings.squeeze(0)).unsqueeze(1)
 
         # casual conv_1d
-        output = value + self.short_conv(value, inputs)
+        output = value + self.short_conv(value, inputs, kv_cache)
         return output
-
-    def forward_decode(self, inputs: PyModelInputs, hidden_states: torch.Tensor):
-        return hidden_states
 
 
 class ManifoldHyperConnections(nn.Module):
@@ -401,7 +424,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if self.engram is not None:
             # TODO: 查询和与hidden_states的cross attention拆开两部分
-            hidden_states = hidden_states + self.engram(inputs, hidden_states)
+            hidden_states = hidden_states + self.engram(inputs, hidden_states, kv_cache)
 
         # 计算缩放因子
         h_pre, h_post, h_res = self.mhc(hidden_states)

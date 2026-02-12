@@ -65,6 +65,7 @@ enum GptModelInputIndex : size_t {
     skipRun,
     gptModelRequestLength,  // length of request id & pd_separation
     isFakeStream,
+    decodeNgramInput,
     gptModelInputLength,
 };
 

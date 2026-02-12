@@ -72,6 +72,7 @@ void registerPyOpDefs(pybind11::module& m) {
         .def_readonly("input_lengths_d", &PyAttentionInputs::input_lengths_d)
         .def_readwrite("decode_cu_seqlens_d", &PyAttentionInputs::decode_cu_seqlens_d)
         .def_readonly("decode_cu_seqlens_host", &PyAttentionInputs::decode_cu_seqlens_host)
+        .def_readwrite("decode_ngram_input_host", &PyAttentionInputs::decode_ngram_input_host)
         .def_readwrite("cache_store_inputs", &PyAttentionInputs::cache_store_inputs)
         .def("__repr__", [](const PyAttentionInputs& self) { return "PyAttentionInputs"; })
         .def_readonly("prefill_cuda_graph_copy_params", &PyAttentionInputs::prefill_cuda_graph_copy_params);

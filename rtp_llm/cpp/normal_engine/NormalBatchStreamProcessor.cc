@@ -60,6 +60,9 @@ absl::StatusOr<GptModelInputs> NormalBatchStreamProcessor::gatherModelInput(cons
         model_input.text_tokens_mask = CACHED_HOST_BUF(TYPE_INT32, {current_tokens_size});
         model_input.mm_features_locs = CACHED_HOST_BUF(TYPE_INT32, {multimodal_features_len});
     }
+    if (has_ngram_input_) {
+        model_input.decode_ngram_input = CACHED_HOST_BUF(TYPE_INT32, {total_decode_batch_size * max_ngram_size_});
+    }
     model_input.kv_block_stride_bytes = block_stride_bytes_;
     model_input.kv_scale_stride_bytes = scale_stride_bytes_;
     model_input.seq_size_per_block    = seq_size_per_block_;
@@ -68,19 +71,20 @@ absl::StatusOr<GptModelInputs> NormalBatchStreamProcessor::gatherModelInput(cons
     model_input.decode_entrance       = decode_entrance_;
     model_input.is_fake_stream        = stream_groups.isFakeStream();
 
-    int* merged_tokens      = (int*)model_input.combo_tokens->data();
-    int* input_lengths      = (int*)model_input.input_lengths->data();
-    int* lora_ids           = (int*)model_input.lora_ids->data();
-    int* lora_input_lengths = (int*)model_input.lora_input_lengths->data();
-    int* sequence_lengths   = (int*)model_input.sequence_lengths->data();
-    int* lm_output_indexes  = (int*)model_input.lm_output_indexes->data();
-    int* lm_output_lengths  = (int*)model_input.lm_output_lengths->data();
-    int* prefix_lengths     = (int*)model_input.prefix_lengths->data();
-    int* combo_position_ids = need_cal_position_id ? (int*)model_input.combo_position_ids->data() : nullptr;
-    int* merged_text_mask   = has_multimodal_input ? (int*)model_input.text_tokens_mask->data() : nullptr;
-    int* mm_features_locs   = has_multimodal_input ? (int*)model_input.mm_features_locs->data() : nullptr;
-    int  batch_idx          = 0;
-    int  input_vocab_size   = input_vocab_size_ ? input_vocab_size_ : vocab_size_;
+    int* merged_tokens          = (int*)model_input.combo_tokens->data();
+    int* input_lengths          = (int*)model_input.input_lengths->data();
+    int* lora_ids               = (int*)model_input.lora_ids->data();
+    int* lora_input_lengths     = (int*)model_input.lora_input_lengths->data();
+    int* sequence_lengths       = (int*)model_input.sequence_lengths->data();
+    int* lm_output_indexes      = (int*)model_input.lm_output_indexes->data();
+    int* lm_output_lengths      = (int*)model_input.lm_output_lengths->data();
+    int* prefix_lengths         = (int*)model_input.prefix_lengths->data();
+    int* combo_position_ids     = need_cal_position_id ? (int*)model_input.combo_position_ids->data() : nullptr;
+    int* merged_text_mask       = has_multimodal_input ? (int*)model_input.text_tokens_mask->data() : nullptr;
+    int* mm_features_locs       = has_multimodal_input ? (int*)model_input.mm_features_locs->data() : nullptr;
+    int  batch_idx              = 0;
+    int  input_vocab_size       = input_vocab_size_ ? input_vocab_size_ : vocab_size_;
+    int* decode_ngram_input_ptr = has_ngram_input_ ? (int*)model_input.decode_ngram_input->data() : nullptr;
 
     auto* kv_cache_update_mapping =
         model_input.kv_cache_update_mapping ? (BlockIdPair*)model_input.kv_cache_update_mapping->data() : nullptr;
@@ -117,6 +121,11 @@ absl::StatusOr<GptModelInputs> NormalBatchStreamProcessor::gatherModelInput(cons
             sequence_lengths[batch_idx] = stream->seqLength() - 1;  // need remove
             if (need_cal_position_id) {
                 stream->generateNextPositionId(combo_position_ids + batch_idx * position_id_len_factor_, device_);
+            }
+            if (has_ngram_input_) {
+                std::memcpy(decode_ngram_input_ptr + batch_idx * max_ngram_size_,
+                            stream->getLatestTokens(max_ngram_size_).data(),
+                            max_ngram_size_ * sizeof(int));
             }
             lora_ids[batch_idx]           = stream->loraId();
             lora_input_lengths[batch_idx] = 1;
@@ -383,7 +392,7 @@ void NormalBatchStreamProcessor::setCommonSamplerInputs(SamplerInputs&          
     int32_t*  no_repeat_ngram_size = sampler_inputs.no_repeat_ngram_size->data<int32_t>();
     bool*     do_sample            = sampler_inputs.do_sample->data<bool>();
 
-    int  batch_idx       = 0;
+    int batch_idx = 0;
     for (auto& stream : all_streams) {
         int sampler_batch_size;
         if (score_batch) {
@@ -416,7 +425,7 @@ void NormalBatchStreamProcessor::setCommonSamplerInputs(SamplerInputs&          
                 top_p[batch_idx]       = 1;
                 temperature[batch_idx] = 1;
             }
-            no_repeat_ngram_size[batch_idx] = stream->generateConfig()->no_repeat_ngram_size.value_or(0);
+            no_repeat_ngram_size[batch_idx]     = stream->generateConfig()->no_repeat_ngram_size.value_or(0);
             sampler_inputs.generator[batch_idx] = stream->getGenerator();
             batch_idx += 1;
         }

@@ -100,6 +100,7 @@ class ModelConfig(CppModelConfig):
         "position_ids_style",
         "pre_seq_len",
         "use_kvcache",
+        "engram_config",
         "logit_scale",
         "qk_norm",
         "expert_num",

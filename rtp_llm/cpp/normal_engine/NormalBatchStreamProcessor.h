@@ -22,6 +22,8 @@ public:
         use_int8_kv_cache_(model_config.attn_config.kv_cache_dtype == rtp_llm::KvCacheDataType::INT8),
         has_positional_encoding_(model_config.has_positional_encoding),
         is_multimodal_(model_config.mm_model_config.is_multimodal),
+        has_ngram_input_(model_config.engram_config.hasEngram()),
+        max_ngram_size_(model_config.engram_config.max_ngram_size),
         mm_position_ids_style_((PositionIdsStyle)model_config.mm_model_config.mm_position_ids_style),
         position_id_len_factor_(model_config.attn_config.rope_config.index_factor),
         role_type_(pd_sep_config.role_type),
@@ -67,6 +69,8 @@ protected:
     bool             use_int8_kv_cache_;
     bool             has_positional_encoding_;
     bool             is_multimodal_;
+    bool             has_ngram_input_;
+    size_t           max_ngram_size_;
     PositionIdsStyle mm_position_ids_style_;
     size_t           position_id_len_factor_;
     RoleType         role_type_;

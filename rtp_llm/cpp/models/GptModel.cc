@@ -1766,6 +1766,10 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
         inputs.lm_output_lengths.get() ? inputs.lm_output_lengths->size() : 0;
     shape_hints_ptr[GptModelInputIndex::comboPositionIds] =
         inputs.combo_position_ids.get() ? inputs.combo_position_ids->size() : 0;
+
+    shape_hints_ptr[GptModelInputIndex::decodeNgramInput] =
+        inputs.decode_ngram_input.get() ? inputs.decode_ngram_input->size() : 0;
+
     shape_hints_ptr[GptModelInputIndex::loraIds] = inputs.lora_ids.get() ? inputs.lora_ids->size() : 0;
     shape_hints_ptr[GptModelInputIndex::loraInputLengths] =
         inputs.lora_input_lengths.get() ? inputs.lora_input_lengths->size() : 0;
@@ -1909,6 +1913,12 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
                                             rtp_llm::AllocationType::DEVICE}));
             }
             inputs.multimodal_features = std::move(mm_features);
+        }
+        if (shape_hints_ptr[GptModelInputIndex::decodeNgramInput]) {
+            inputs.decode_ngram_input =
+                device->allocateBuffer({rtp_llm::DataType::TYPE_INT32,
+                                        {(size_t)shape_hints_ptr[GptModelInputIndex::decodeNgramInput]},
+                                        rtp_llm::AllocationType::HOST});
         }
     }
 

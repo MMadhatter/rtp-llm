@@ -14,6 +14,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <sstream>
 
 namespace rtp_llm {
 
@@ -27,6 +28,42 @@ enum TaskType {
     RERANKER           = 6,
     LINEAR_SOFTMAX     = 7,
     BGE_M3             = 8
+};
+
+class EngramConfig {
+public:
+    std::vector<int64_t> layer_index       = {};
+    std::vector<int64_t> vocab_size        = {};
+    int64_t              n_head_per_ngram  = 0;
+    int64_t              n_embed_per_ngram = 0;
+    int64_t              max_ngram_size    = 0;
+    int64_t              pad_id            = 2;
+    int64_t              kernel_size       = 4;
+    int64_t              seed              = 0;
+
+    bool hasEngram() const {
+        return !layer_index.empty();
+    }
+
+    std::string to_string() const {
+        std::ostringstream oss;
+        oss << "  layer_index: [";
+        for (size_t i = 0; i < layer_index.size(); ++i) {
+            oss << layer_index[i];
+            if (i < layer_index.size() - 1)
+                oss << ", ";
+        }
+        oss << "]\n  vocab_size: [";
+        for (size_t i = 0; i < vocab_size.size(); ++i) {
+            oss << vocab_size[i];
+            if (i < vocab_size.size() - 1)
+                oss << ", ";
+        }
+        oss << "]\n  n_head_per_ngram: " << n_head_per_ngram << "\n  n_embed_per_ngram: " << n_embed_per_ngram
+            << "\n  max_ngram_size: " << max_ngram_size << "\n  pad_id: " << pad_id
+            << "\n  kernel_size: " << kernel_size << "\n  seed: " << seed;
+        return oss.str();
+    }
 };
 
 class MMModelConfig {
@@ -103,6 +140,9 @@ public:
     bool   has_moe_norm               = false;
     double logit_scale                = 1.0;
     bool   use_kvcache                = true;
+
+    // Engram configuration
+    EngramConfig engram_config;
 
     int64_t pre_seq_len       = 0;
     bool    prefix_projection = false;

@@ -112,6 +112,9 @@ struct GptModelInputs {
     rtp_llm::BufferPtr combo_tokens_type_ids;  // [cumulated_seq_len]
     rtp_llm::BufferPtr combo_position_ids;     // [cumulated_seq_len]
 
+    // for engram model
+    rtp_llm::BufferPtr decode_ngram_input;  // [decoder_batch_size, max_ngram_size]
+
     // for mtp model
     rtp_llm::BufferPtr last_hidden_states;
 

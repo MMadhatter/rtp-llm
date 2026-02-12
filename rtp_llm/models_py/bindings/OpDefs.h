@@ -87,6 +87,9 @@ struct PyAttentionInputs {
     torch::Tensor input_lengths_d;
     torch::Tensor decode_cu_seqlens_d;
 
+    // host tensor
+    torch::Tensor decode_ngram_input_host;
+
     // CUDA Graph mode flag
     bool is_cuda_graph = false;
 };

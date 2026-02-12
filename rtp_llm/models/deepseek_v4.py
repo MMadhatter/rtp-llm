@@ -416,18 +416,33 @@ class DeepSeekV4(DeepSeekV2):
             config.config_dtype = config_json.get("torch_dtype", None)
 
             # Engram config
-            config.engram_layer_index = config_json.get("engram_layer_index", [])
-            config.engram_vocab_size = config_json.get("engram_vocab_size", [])
-            config.n_head_per_ngram = config_json.get("n_head_per_ngram", 0)
-            config.n_embed_per_ngram = config_json.get("n_embed_per_ngram", 0)
-            config.max_ngram_size = config_json.get("max_ngram_size", 0)
-            config.pad_id = config_json.get("pad_id", 2)
-            config.kernel_size = config_json.get("kernel_size", 4)
-            config.seed = config_json.get("seed", 0)
+            config.engram_config.layer_index = config_json.get("engram_layer_index", [])
+            config.engram_config.vocab_size = config_json.get("engram_vocab_size", [])
+            config.engram_config.n_head_per_ngram = config_json.get(
+                "n_head_per_ngram", 0
+            )
+            config.engram_config.n_embed_per_ngram = config_json.get(
+                "n_embed_per_ngram", 0
+            )
+            config.engram_config.max_ngram_size = config_json.get("max_ngram_size", 0)
+            config.engram_config.pad_id = config_json.get("pad_id", 2)
+            config.engram_config.kernel_size = config_json.get("kernel_size", 4)
+            config.engram_config.seed = config_json.get("seed", 0)
 
             # manifold hyperconnections (MHC) config
             config.hc_mult = config_json.get("hc_mult", 1)
             config.max_sk_it = config_json.get("max_sk_it", 0)
+
+            # # Hybrid attention configuration
+            # attention_step = config_json["full_attention_interval"]
+            # config.hybrid_attention_config.enable_hybrid_attention = True
+            # hybrid_layer_types: List[HybridAttentionType] = []
+            # for i in range(config.num_layers):
+            #     if (i + 1) % attention_step == 0:
+            #         hybrid_layer_types.append(HybridAttentionType.NONE)
+            #     else:
+            #         hybrid_layer_types.append(HybridAttentionType.LINEAR)
+            # config.hybrid_attention_config.hybrid_attention_types = hybrid_layer_types
 
     @staticmethod
     def get_weight_cls():
