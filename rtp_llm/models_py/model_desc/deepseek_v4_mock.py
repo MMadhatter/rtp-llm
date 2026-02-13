@@ -28,7 +28,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
 from rtp_llm.models_py.triton_kernels.causal_conv1d import (
-    causal_conv1d_dilated,
+    causal_conv1d_fn_dilated,
     causal_conv1d_update_dilated,
 )
 from rtp_llm.models_py.triton_kernels.mhc.group_rmsnorm import GroupRMSNorm
@@ -52,7 +52,7 @@ class MultiHeadEmbedding(nn.Module):
         hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
         super().__init__()
-        self.list_of_N = config.engram_vocab_size
+        self.list_of_N = config.engram_config.vocab_size
         self.num_heads = len(self.list_of_N)
         self.embedding_weight = weights[W.engram_multihead_embedding]
 
@@ -85,14 +85,15 @@ class ShortConv(nn.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.kernel_size = config.kernel_size
-        self.dilation = config.max_ngram_size
+        self.kernel_size = config.engram_config.kernel_size
+        self.dilation = config.engram_config.max_ngram_size
         self.hc_mult = config.hc_mult
         self.activation = activation
 
         self.total_channels = self.hidden_size * self.hc_mult
         self.conv_bias = None
-        self.conv_weights = weights[W.engram_conv_w]
+        self.conv_weights = weights[W.engram_conv_w].squeeze(1)
+
         # 3 * (4 - 1)
         self.padding_size = self.dilation * (self.kernel_size - 1)
         self.group_norm = GroupRMSNorm(
@@ -102,6 +103,30 @@ class ShortConv(nn.Module):
         )
         if self.activation:
             self.act_fn = nn.SiLU()
+
+        self.conv_states_shape = [
+            self.dilation * (self.kernel_size - 1),
+            self.hidden_size * self.hc_mult,
+        ]
+
+    def _get_conv_states(self, kv_cache_raw_tensor: torch.Tensor) -> torch.Tensor:
+        # 现在是错的，跟mla共用了kv cache, 实际上engram的cache是当前transformer layer额外分出来的一块，等hybrid kvcache进去了改这一块逻辑
+        num_blocks = kv_cache_raw_tensor.shape[0]
+        stride = torch.empty((num_blocks, *self.conv_states_shape)).stride()
+        # actual page size
+        stride_0 = (
+            self.dilation * (self.kernel_size - 1) * self.hidden_size * self.hc_mult
+        )
+        target_stride = (stride_0, *stride[1:])
+
+        # 现在只把conv state保存在这里, 所以storage_offset为0
+        conv_states = torch.as_strided(
+            kv_cache_raw_tensor.view(torch.bfloat16),
+            size=(num_blocks, *self.conv_states_shape),
+            stride=target_stride,
+            storage_offset=0,
+        )
+        return conv_states
 
     def forward(
         self, x: torch.Tensor, inputs: PyModelInputs, kv_cache: KVCache
@@ -117,41 +142,42 @@ class ShortConv(nn.Module):
         ), f"Input groups {hc_mult} != hc_mult {self.hc_mult}"
 
         x_norm = self.group_norm(x.transpose(0, 1).contiguous())
-        # x_bct: [hc_mult * hidden_size, num_tokens]
-        x_bct = x_norm.permute(0, 2, 1).reshape(-1, num_tokens).contiguous()
+
+        # x_bct: [num_tokens, hc_mult * hidden_size]
+        x = x_norm.transpose(0, 1).reshape(num_tokens, -1).contiguous()
+
+        assert kv_cache is not None
+        seq_size_per_block = kv_cache.seq_size_per_block
+        conv_states = self._get_conv_states(kv_cache.kv_cache_base).transpose(1, 2)
 
         if inputs.attention_inputs.is_prefill:
             cu_seqlens = inputs.attention_inputs.cu_seqlens
-            x_padding, indices = conv1d_prefill_padding(
-                x_bct, cu_seqlens, self.padding_size
-            )
-            y = F.conv1d(
-                input=x_padding,
+            y = causal_conv1d_fn_dilated(
+                x=x.transpose(0, 1),
                 weight=self.conv_weights,
                 bias=None,
-                padding=0,
-                dilation=(self.dilation,),
-                groups=self.total_channels,
+                conv_states=conv_states,
+                query_start_loc=cu_seqlens,
+                block_map=inputs.attention_inputs.kv_cache_block_id_device,
+                prefix_lengths=inputs.attention_inputs.prefix_lengths,
+                seq_size_per_block=seq_size_per_block,
+                dilation=self.dilation,
+                activation="silu",
             )
-            y = y[:, indices]
-
         else:
-            # 需要cache: [self.padding_size, hidden_size]的大小
-            # -----魔改一下--casual conv_1d---哎，它的带dialation-------
-
-            y_bct = F.conv1d(
-                input=x_bct,
+            y = causal_conv1d_update_dilated(
+                x=x,
+                conv_states=conv_states,
                 weight=self.conv_weights,
                 bias=None,
-                padding=(self.padding_size,),
-                dilation=(self.dilation,),
-                groups=self.total_channels,
+                activation="silu",
+                cache_seqlens=None,
+                block_map=inputs.attention_inputs.kv_cache_block_id_device,
+                sequence_lengths=inputs.attention_inputs.sequence_lengths_plus_1_d,
+                seq_size_per_block=seq_size_per_block,
+                dilation=self.dilation,
             )
-            y_bct = y_bct[..., :num_tokens]
-        if self.activation:
-            y_bct = self.act_fn(y_bct)
-        y = y_bct.transpose(0, 1).view(num_tokens, hc_mult, hidden_size).contiguous()
-        # --------------------------------------------------------
+        y = y.transpose(0, 1).view(num_tokens, hc_mult, hidden_size).contiguous()
         return y
 
 
@@ -169,15 +195,16 @@ class Engram(nn.Module):
         self.layer_id = layer_id
         self.config = config
         self.hash_mapping = NgramHashMapping(
-            engram_vocab_size=config.engram_vocab_size,
-            max_ngram_size=config.max_ngram_size,
-            n_embed_per_ngram=config.n_embed_per_ngram,
-            n_head_per_ngram=config.n_head_per_ngram,
+            engram_vocab_size=self.config.engram_config.vocab_size,
+            max_ngram_size=self.config.engram_config.max_ngram_size,
+            n_embed_per_ngram=self.config.engram_config.n_embed_per_ngram,
+            n_head_per_ngram=self.config.engram_config.n_head_per_ngram,
             layer_ids=[layer_id],
             tokenizer_name_or_path=config.ckpt_path,
-            pad_id=config.pad_id,
-            seed=config.seed,
+            pad_id=self.config.engram_config.pad_id,
+            seed=self.config.engram_config.seed,
         )
+        self.eps = 1e-6
         self.multi_head_embedding = MultiHeadEmbedding(
             config=config,
             parallelism_config=parallelism_config,
@@ -191,9 +218,6 @@ class Engram(nn.Module):
             weights=weights,
             activation=True,
         )
-
-        self.engram_hidden_size = (config.max_ngram_size - 1) * config.n_embed_per_ngram
-
         # TODO: with block quant scale
         self.value_proj = LinearFactory.create_linear_from_weights(
             weights,
@@ -225,9 +249,14 @@ class Engram(nn.Module):
         hidden_states: [num_tokens, hc_mult, hidden_size]
         kv_cache: KVCache
         """
-        # embedding lookup
+        # mock ngram embedding lookup
         # TODO: 修改hash function支持B*S在一个维度并做对应的padding
-        input_ids_cpu = inputs.input_ids.to("cpu").unsqueeze(0)
+        if inputs.attention_inputs.is_prefill:
+            input_ids_cpu = inputs.input_ids.to("cpu").unsqueeze(0)
+        else:
+            input_ids_cpu = inputs.attention_inputs.decode_ngram_input_host.unsqueeze(0)
+
+        input_ids_cpu = input_ids_cpu[:, 0 : inputs.input_ids.shape[0]]
         hash_input_ids = torch.from_numpy(
             self.hash_mapping.hash(input_ids_cpu)[self.layer_id]
         )
@@ -244,9 +273,8 @@ class Engram(nn.Module):
         query_norm = self.q_group_norm(hidden_states.transpose(0, 1).contiguous())
 
         # scaled dot product gate
-        eps = 1e-6
         gate = scaled_dot_product_gate(
-            key_norm, query_norm, self.config.hidden_size, eps
+            key_norm, query_norm, self.config.hidden_size, self.eps
         )
         # gate transpose回去:  [num_tokens，hc_mult, 1]
         gate = gate.unsqueeze(-1).transpose(0, 1).contiguous()
@@ -394,7 +422,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 enable_cuda_graph=enable_cuda_graph,
             )
         self.engram = None
-        if layer_idx in config.engram_layer_index:
+        if layer_idx in config.engram_config.layer_index:
             self.engram = Engram(
                 config=config,
                 parallelism_config=parallelism_config,

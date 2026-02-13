@@ -19,82 +19,11 @@ from rtp_llm.utils.model_weight import (
     CkptWeightInfo,
     W,
     concat_0,
+    concat_1,
     identity,
     stack_0,
     yarn_get_mscale,
 )
-
-
-def merge_2d_tensors_list(ts: List[torch.Tensor], dim: int):
-    """
-    Merge a list of tensors along the specified dimension.
-
-    Args:
-        ts: List of tensors to merge
-        dim: Dimension along which to concatenate tensors
-
-    Returns:
-        Merged tensor
-
-    Raises:
-        ValueError: If tensor list is empty or tensors have incompatible shapes
-    """
-    if not ts:
-        raise ValueError("Cannot merge empty tensor list")
-
-    if len(ts) == 1:
-        return ts[0].contiguous()
-
-    # Check that all non-concat dimensions match
-    ref_shape = list(ts[0].shape)
-    ndim = len(ref_shape)
-    for i, t in enumerate(ts[1:], 1):
-        for d in range(ndim):
-            if d != dim and t.shape[d] != ref_shape[d]:
-                raise ValueError(
-                    f"All tensors must have the same size in non-concat dimensions. "
-                    f"Dimension {d}: tensor 0 has size {ref_shape[d]}, "
-                    f"but tensor {i} has size {t.shape[d]}"
-                )
-    merged = torch.concat(ts, dim=dim).contiguous()
-    return merged
-
-
-def merge_2d_tensors_list_transpose(ts: List[torch.Tensor], dim: int):
-    """
-    Transpose each tensor and then merge along the specified dimension.
-
-    Args:
-        ts: List of 2D tensors to transpose and merge
-        dim: Dimension along which to concatenate tensors after transposing
-
-    Returns:
-        Merged tensor
-
-    Raises:
-        ValueError: If tensor list is empty or tensors have incompatible shapes
-    """
-    if not ts:
-        raise ValueError("Cannot merge empty tensor list")
-
-    if len(ts) == 1:
-        return ts[0].T.contiguous()
-
-    # Transpose all tensors
-    transposed = [t.T for t in ts]
-
-    # Check that all non-concat dimensions match after transpose
-    ref_shape = list(transposed[0].shape)
-    for i, t in enumerate(transposed[1:], 1):
-        for d in range(2):
-            if d != dim and t.shape[d] != ref_shape[d]:
-                raise ValueError(
-                    f"All tensors must have the same size in non-concat dimensions after transpose. "
-                    f"Dimension {d}: tensor 0 has size {ref_shape[d]}, "
-                    f"but tensor {i} has size {t.shape[d]}"
-                )
-    merged = torch.concat(transposed, dim=dim).contiguous()
-    return merged
 
 
 class DeepSeekV4Weight(DeepSeekV2Weight):
@@ -121,18 +50,18 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
     def _get_engram_layer_weight_info(self, layer_id: int):
         # hidden dimension multiplier
         hc_mult = self.model_config.hc_mult
-        n_head_per_ngram = self.model_config.n_head_per_ngram
-        n_embed_per_ngram = self.model_config.n_embed_per_ngram
+        n_head_per_ngram = self.model_config.engram_config.n_head_per_ngram
+        n_embed_per_ngram = self.model_config.engram_config.n_embed_per_ngram
 
-        attn_config = AttnConfig(
-            hidden_size=n_embed_per_ngram,
-            size_per_head=n_embed_per_ngram // n_head_per_ngram,
-            head_num=n_head_per_ngram,
-            head_num_kv=n_head_per_ngram,
-        )
+        # attn_config = AttnConfig(
+        #     hidden_size=n_embed_per_ngram,
+        #     size_per_head=n_embed_per_ngram // n_head_per_ngram,
+        #     head_num=n_head_per_ngram,
+        #     head_num_kv=n_head_per_ngram,
+        # )
 
         engram_weights = [
-            AttnAtomicWeight(
+            AtomicWeight(
                 W.engram_multihead_embedding,
                 [
                     CkptWeightInfo(
@@ -140,9 +69,9 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     ),
                 ],
                 identity,
-                config=attn_config,
+                # config=attn_config,
             ),
-            AttnAtomicWeight(
+            AtomicWeight(
                 W.engram_v_proj_w,
                 [
                     CkptWeightInfo(
@@ -150,9 +79,9 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     ),
                 ],
                 identity,
-                config=attn_config,
+                # config=attn_config,
             ),
-            AttnAtomicWeight(
+            AtomicWeight(
                 W.engram_k_projs_w,
                 [
                     CkptWeightInfo(
@@ -161,7 +90,7 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     for j in range(hc_mult)
                 ],
                 stack_0,
-                config=attn_config,
+                # config=attn_config,
             ),
             AtomicWeight(
                 W.engram_q_norms_w,
@@ -172,7 +101,6 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     for j in range(hc_mult)
                 ],
                 stack_0,
-                data_type=torch.bfloat16,
             ),
             AtomicWeight(
                 W.engram_k_norms_w,
@@ -183,7 +111,6 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     for j in range(hc_mult)
                 ],
                 stack_0,
-                data_type=torch.bfloat16,
             ),
             AtomicWeight(
                 W.engram_conv_w,
@@ -193,7 +120,6 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     ),
                 ],
                 identity,
-                data_type=torch.bfloat16,
             ),
             AtomicWeight(
                 W.engram_conv_norms_w,
@@ -205,7 +131,6 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     for j in range(hc_mult)
                 ],
                 stack_0,
-                data_type=torch.bfloat16,
             ),
         ]
         return engram_weights
@@ -230,7 +155,7 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                         identity,
                     ),
                 ],
-                functools.partial(merge_2d_tensors_list, dim=1),
+                concat_1,
                 data_type=torch.float32,
             ),
             AtomicWeight(
@@ -261,7 +186,7 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
         layer_weights = weight_info.layer_weights
 
         for layer in range(self._num_layers):
-            if layer in self.model_config.engram_layer_index:
+            if layer in self.model_config.engram_config.layer_index:
                 layer_weights[layer].extend(self._get_engram_layer_weight_info(layer))
             layer_weights[layer].extend(self._get_mhc_layer_weight_info(layer))
         return ModelWeightInfo(weights=weight_info.weights, layer_weights=layer_weights)
@@ -416,8 +341,14 @@ class DeepSeekV4(DeepSeekV2):
             config.config_dtype = config_json.get("torch_dtype", None)
 
             # Engram config
-            config.engram_config.layer_index = config_json.get("engram_layer_index", [])
-            config.engram_config.vocab_size = config_json.get("engram_vocab_size", [])
+            engram_layer_index = config_json.get("engram_layer_index", [])
+            if engram_layer_index:
+                config.engram_config.layer_index = engram_layer_index
+
+            engram_vocab_size = config_json.get("engram_vocab_size", [])
+            if engram_vocab_size:
+                config.engram_config.vocab_size = engram_vocab_size
+
             config.engram_config.n_head_per_ngram = config_json.get(
                 "n_head_per_ngram", 0
             )
@@ -433,7 +364,7 @@ class DeepSeekV4(DeepSeekV2):
             config.hc_mult = config_json.get("hc_mult", 1)
             config.max_sk_it = config_json.get("max_sk_it", 0)
 
-            # # Hybrid attention configuration
+            # # Hybrid attention configuration （TODO)
             # attention_step = config_json["full_attention_interval"]
             # config.hybrid_attention_config.enable_hybrid_attention = True
             # hybrid_layer_types: List[HybridAttentionType] = []

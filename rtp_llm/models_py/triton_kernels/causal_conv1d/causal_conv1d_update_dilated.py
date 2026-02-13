@@ -328,7 +328,7 @@ def _causal_conv1d_dilated_update_kernel(
 
 def causal_conv1d_update_dilated(
     x: torch.Tensor,
-    conv_state: torch.Tensor,
+    conv_states: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     activation: Union[bool, str, None] = None,
@@ -364,24 +364,24 @@ def causal_conv1d_update_dilated(
         assert activation in ["silu", "swish"]
 
     original_x_dtype = x.dtype
-    x = x.to(conv_state.dtype)
+    x = x.to(conv_states.dtype)
     unsqueeze = query_start_loc is None and x.dim() == 2
     if unsqueeze:
         # make it (batch, dim, seqlen) with seqlen == 1
         x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
     _, width = weight.shape
-    # conv_state: (..., dim, state_len), where state_len >= width - 1
-    num_cache_lines, _, state_len = conv_state.size()
+    # conv_states: (..., dim, state_len), where state_len >= width - 1
+    num_cache_lines, _, state_len = conv_states.size()
 
     if validate_data:
         assert dim == weight.size(0)
         assert (
-            conv_state.stride(-2) == 1
-        ), f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
+            conv_states.stride(-2) == 1
+        ), f"ERROR: expect contiguous along feat-dim of conv_states (currently stride={conv_states.stride()})"
         assert state_len >= width - 1
-        # when above happens, we don't shift-left to keep any records in conv_state
-        assert dim == conv_state.size(1)
+        # when above happens, we don't shift-left to keep any records in conv_states
+        assert dim == conv_states.size(1)
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
         assert cache_seqlens is None  # not needed for vLLM - circular buffer
@@ -396,11 +396,11 @@ def causal_conv1d_update_dilated(
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()
     stride_o_seq, stride_o_dim, stride_o_token = out.stride()
 
-    stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
+    stride_istate_seq, stride_istate_dim, stride_istate_token = conv_states.stride()
 
     state_len = (width - 1) * dilation
     np2_statelen = triton.next_power_of_2(state_len)
-    # when speculative, we load (state_len - 1) token from conv_state and (seqlen) token from x, then store them in different block
+    # when speculative, we load (state_len - 1) token from conv_states and (seqlen) token from x, then store them in different block
     np2_statelen_total = triton.next_power_of_2(state_len - 1 + seqlen)
 
     stride_block_map = block_map.size(1) if block_map is not None else 0
@@ -416,7 +416,7 @@ def causal_conv1d_update_dilated(
         x,
         weight,
         bias,
-        conv_state,
+        conv_states,
         cache_seqlens,
         block_map,
         stride_block_map,
