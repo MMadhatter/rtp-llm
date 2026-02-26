@@ -55,5 +55,8 @@ class FMHAImplBase(ABC):
         """
         return callable(getattr(self, "prepare_cuda_graph", None))
 
+    def activate_group(self, gid: int):
+        pass
+
     # def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
     #     pass

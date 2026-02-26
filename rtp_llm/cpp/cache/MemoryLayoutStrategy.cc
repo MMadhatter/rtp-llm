@@ -43,7 +43,7 @@ void MemoryLayoutStrategy::clearScaleTensor(torch::Tensor& kv_scale_tensor) {
 // Shape computation functions
 std::vector<size_t> MemoryLayoutStrategy::computeKvShape() const {
     if (config_.enable_hybrid_attention) {
-        // For hybrid attention, the shape is [layer_num, block_num, kv_block_stride_elems]
+        RTP_LLM_LOG_INFO("computeKvShape hybrid: %s", config_.debugString().c_str());
         return {static_cast<size_t>(config_.layer_num),
                 static_cast<size_t>(config_.block_num),
                 static_cast<size_t>(config_.kv_block_stride_bytes / rtp_llm::getTypeSize(data_type_))};

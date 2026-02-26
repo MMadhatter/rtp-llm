@@ -71,6 +71,8 @@ class ModelConfig(CppModelConfig):
         "generate_env_config",
         "render_config",
         "phy2log_path",
+        "hc_mult",
+        "max_sk_it",
     }
 
     # Known C++ ModelConfig members (from ModelConfig.h)
@@ -90,6 +92,7 @@ class ModelConfig(CppModelConfig):
         "position_ids_style",
         "pre_seq_len",
         "use_kvcache",
+        "engram_config",
         "logit_scale",
         "qk_norm",
         "expert_num",
@@ -499,6 +502,9 @@ class ModelConfig(CppModelConfig):
         self.moe_inter_size: int = (
             0  # MOE intermediate size (for MOE expert FFN layers)
         )
+        # mhc config
+        self.hc_mult: int = 1  # hc mult
+        self.max_sk_it: int = 0  # max sk iterations
 
         # Renderer configuration fields
         self.generate_env_config: Optional[Any] = (

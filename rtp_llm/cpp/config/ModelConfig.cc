@@ -220,6 +220,8 @@ std::string ModelConfig::to_string() const {
         << "has_moe_norm: " << has_moe_norm << "\n"
         << "logit_scale: " << logit_scale << "\n"
         << "use_kvcache: " << use_kvcache << "\n"
+        << "engram_config: {\n"
+        << engram_config.to_string() << "\n}\n"
         << "pre_seq_len: " << pre_seq_len << "\n"
         << "prefix_projection: " << prefix_projection << "\n"
         << "reverse_e_h_norm: " << reverse_e_h_norm << "\n"

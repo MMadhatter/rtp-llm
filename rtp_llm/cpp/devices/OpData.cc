@@ -48,6 +48,9 @@ std::string GptModelInputs::debugString(bool force) const {
     if (combo_position_ids) {
         debug_string << ", combo_position_ids: " << combo_position_ids->debugStringWithData<int32_t>();
     }
+    if (decode_ngram_input) {
+        debug_string << ", decode_ngram_input: " << decode_ngram_input->debugStringWithData<int32_t>();
+    }
     if (lora_ids) {
         debug_string << ", lora_ids: " << lora_ids->debugStringWithData<int32_t>();
     }

@@ -8,6 +8,8 @@
 #include "rtp_llm/cpp/devices/DeviceFactory.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 
+#include <iostream>
+
 namespace rtp_llm {
 
 CacheConfig CacheConfigCreator::createBasicConfig(const ModelConfig&       model_config,
@@ -53,6 +55,7 @@ CacheConfig CacheConfigCreator::createConfig(const ModelConfig&                 
                             kv_cache_seq_len,
                             model_config.max_seq_len);
     }
+    std::cout << "CacheConfig debugString:\n" << config.debugString() << std::endl;
     return config;
 }
 

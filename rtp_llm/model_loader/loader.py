@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import safetensors
 import torch

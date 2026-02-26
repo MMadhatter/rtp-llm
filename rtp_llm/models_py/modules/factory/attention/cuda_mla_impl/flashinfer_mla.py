@@ -434,6 +434,12 @@ class MlaFlashInferDecodeOp(object):
 
         compressed_kv = kv_cache.kv_cache_base
 
+        compressed_kv = compressed_kv.reshape(
+            compressed_kv.shape[0],
+            self.token_per_block,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+
         q_nope = q_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
         q_pe = q_pe.view(-1, self.num_heads, self.qk_rope_head_dim)
 

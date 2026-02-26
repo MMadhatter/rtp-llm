@@ -64,6 +64,9 @@ GptModelInputs NativeGraphRunnerBase<GptModelInputs, GptModelOutputs>::prepareIn
                                       nullptr;
     input.combo_position_ids =
         old.combo_position_ids ? device_->allocateBufferLike(*old.combo_position_ids, AllocationType::HOST) : nullptr;
+
+    input.decode_ngram_input =
+        old.decode_ngram_input ? device_->allocateBufferLike(*old.decode_ngram_input, AllocationType::HOST) : nullptr;
     input.last_hidden_states =
         old.last_hidden_states ? device_->allocateBufferLike(*old.last_hidden_states, AllocationType::HOST) : nullptr;
     input.lora_ids = old.lora_ids ? device_->allocateBufferLike(*old.lora_ids, AllocationType::HOST) : nullptr;
@@ -120,6 +123,8 @@ void NativeGraphRunnerBase<GptModelInputs, GptModelOutputs>::copy(GptModelInputs
         device_->copy({*dst->combo_tokens_type_ids, *src.combo_tokens_type_ids});
     if (src.combo_position_ids)
         device_->copy({*dst->combo_position_ids, *src.combo_position_ids});
+    if (src.decode_ngram_input)
+        device_->copy({*dst->decode_ngram_input, *src.decode_ngram_input});
     if (src.last_hidden_states)
         device_->copy({*dst->last_hidden_states, *src.last_hidden_states});
     if (src.lora_ids)

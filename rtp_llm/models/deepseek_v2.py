@@ -26,16 +26,22 @@ from rtp_llm.models.base_model import BaseModel
 from rtp_llm.models.rotary_embedding.deepseek_rotary_embedding import (
     DeepseekV3YarnRotaryEmbedding,
 )
-from rtp_llm.ops import MlaOpsType
+from rtp_llm.models_py.model_desc.generic_moe import GenericMoeModel
+from rtp_llm.models_py.model_desc.module_base import GptModelBase
+from rtp_llm.ops import HybridAttentionType, MlaOpsType
+
 from rtp_llm.utils.model_weight import (
     CkptWeightInfo,
     W,
+    concat_0,
     concat_0_tranpose,
+    concat_1,
     identity,
     kv_split1,
     kv_split2,
     mla_pad_t,
     stack_,
+    stack_0,
     stack_moe_w1,
     transpose,
     transpose_kv_rope,
@@ -62,6 +68,122 @@ class DeepSeekV2Weight(ModelDeployWeightInfo):
             ):
                 self.has_e_score_correction_bias = True
                 break
+
+    def _get_engram_layer_weight_info(self, layer_id: int):
+        # hidden dimension multiplier
+        hc_mult = self.model_config.hc_mult
+        engram_weights = [
+            AtomicWeight(
+                W.engram_multihead_embedding,
+                [
+                    CkptWeightInfo(
+                        "model.layers.{i}.engram.embedding.weight", identity
+                    ),
+                ],
+                identity,
+            ),
+            AtomicWeight(
+                W.engram_v_proj_w,
+                [
+                    CkptWeightInfo(
+                        "model.layers.{i}.engram.value_proj.weight", identity
+                    ),
+                ],
+                identity,
+            ),
+            AtomicWeight(
+                W.engram_k_projs_w,
+                [
+                    CkptWeightInfo(
+                        f"model.layers.{{i}}.engram.key_projs.{j}.weight", identity
+                    )
+                    for j in range(hc_mult)
+                ],
+                stack_0,
+            ),
+            AtomicWeight(
+                W.engram_q_norms_w,
+                [
+                    CkptWeightInfo(
+                        f"model.layers.{{i}}.engram.q_norms.{j}.weight", identity
+                    )
+                    for j in range(hc_mult)
+                ],
+                stack_0,
+            ),
+            AtomicWeight(
+                W.engram_k_norms_w,
+                [
+                    CkptWeightInfo(
+                        f"model.layers.{{i}}.engram.k_norms.{j}.weight", identity
+                    )
+                    for j in range(hc_mult)
+                ],
+                stack_0,
+            ),
+            AtomicWeight(
+                W.engram_conv_w,
+                [
+                    CkptWeightInfo(
+                        "model.layers.{i}.engram.short_conv.conv.weight", identity
+                    ),
+                ],
+                identity,
+            ),
+            AtomicWeight(
+                W.engram_conv_norms_w,
+                [
+                    CkptWeightInfo(
+                        f"model.layers.{{i}}.engram.short_conv.norms.{j}.weight",
+                        identity,
+                    )
+                    for j in range(hc_mult)
+                ],
+                stack_0,
+            ),
+        ]
+        return engram_weights
+
+    def _get_mhc_layer_weight_info(self, layer_id: int):
+        mhc_weights = [
+            AtomicWeight(
+                W.mhc_h_proj_w,
+                [
+                    CkptWeightInfo("model.layers.{i}.mhc.h_pre_proj.weight", identity),
+                    CkptWeightInfo(
+                        "model.layers.{i}.mhc.h_post_proj.weight",
+                        identity,
+                    ),
+                    CkptWeightInfo(
+                        "model.layers.{i}.mhc.h_res_proj.weight",
+                        identity,
+                    ),
+                ],
+                concat_1,
+                data_type=torch.float32,
+            ),
+            AtomicWeight(
+                W.mhc_h_proj_b,
+                [
+                    CkptWeightInfo("model.layers.{i}.mhc.h_pre_proj.bias", identity),
+                    CkptWeightInfo("model.layers.{i}.mhc.h_post_proj.bias", identity),
+                    CkptWeightInfo("model.layers.{i}.mhc.h_res_proj.bias", identity),
+                ],
+                concat_0,
+                data_type=torch.float32,
+            ),
+            AtomicWeight(
+                W.mhc_h_proj_alpha,
+                [
+                    CkptWeightInfo("model.layers.{i}.mhc.alpha_pre", identity),
+                    CkptWeightInfo("model.layers.{i}.mhc.alpha_post", identity),
+                    CkptWeightInfo("model.layers.{i}.mhc.alpha_res", identity),
+                ],
+                concat_0,
+                data_type=torch.float32,
+            ),
+        ]
+        return mhc_weights
 
     def _get_hf_layer_weight_info(self, layer_id: int):
         attn_config = MlaConfig(
@@ -267,6 +389,14 @@ class DeepSeekV2Weight(ModelDeployWeightInfo):
 
         layer_weights.extend(mla_layer_weights)
         layer_weights.extend(self._get_hf_ffn_layer_weight_info(layer_id))
+
+        # Engram weights
+        if layer_id in self.model_config.engram_config.layer_index:
+            layer_weights.extend(self._get_engram_layer_weight_info(layer_id))
+
+        # mHC weights
+        if self.model_config.hc_mult > 1:
+            layer_weights.extend(self._get_mhc_layer_weight_info(layer_id))
         return layer_weights
 
     def _get_hf_ffn_layer_weight_info(self, layer_id: int):
@@ -647,6 +777,53 @@ class DeepSeekV2(BaseModel):
             ]
 
             config.config_dtype = config_json.get("torch_dtype", None)
+
+            if config_json.get("index_topk") is not None:
+                config.attn_config.is_sparse = True
+                config.attn_config.indexer_head_dim = config_json["index_head_dim"]
+                config.attn_config.indexer_head_num = config_json["index_n_heads"]
+                config.attn_config.indexer_topk = config_json["index_topk"]
+
+            if config_json.get("engram_layer_index") is not None:
+                # Engram config
+                engram_layer_index = config_json.get("engram_layer_index", [])
+                if engram_layer_index:
+                    config.engram_config.layer_index = engram_layer_index
+
+                engram_vocab_size = config_json.get("engram_vocab_size", [])
+                if engram_vocab_size:
+                    config.engram_config.vocab_size = engram_vocab_size
+
+                config.engram_config.n_head_per_ngram = config_json.get(
+                    "n_head_per_ngram", 0
+                )
+                config.engram_config.n_embed_per_ngram = config_json.get(
+                    "n_embed_per_ngram", 0
+                )
+                config.engram_config.max_ngram_size = config_json.get(
+                    "max_ngram_size", 0
+                )
+                config.engram_config.pad_id = config_json.get("pad_id", 2)
+                config.engram_config.kernel_size = config_json.get("kernel_size", 4)
+                config.engram_config.seed = config_json.get("seed", 0)
+
+                # Hybrid attention config
+                config.hybrid_attention_config.enable_hybrid_attention = True
+                hybrid_layer_types: List[HybridAttentionType] = []
+                for i in range(config.num_layers):
+                    if i in config.engram_config.layer_index:
+                        hybrid_layer_types.append(HybridAttentionType.ENGRAM)
+                    else:
+                        hybrid_layer_types.append(HybridAttentionType.NONE)
+                config.hybrid_attention_config.hybrid_attention_types = (
+                    hybrid_layer_types
+                )
+
+            # mHC config
+            if config_json.get("hc_mult") is not None:
+                config.hc_mult = config_json.get("hc_mult", 1)
+                config.engram_config.engram_hc_mult = config.hc_mult
+                config.max_sk_it = config_json.get("max_sk_it", 0)
 
     @staticmethod
     def get_weight_cls():

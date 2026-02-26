@@ -7,6 +7,8 @@
 #include "rtp_llm/cpp/model_utils/AttentionConfig.h"
 #include "rtp_llm/models_py/bindings/ParamsBase.h"
 #include "rtp_llm/cpp/utils/Logger.h"
+#include <sstream>
+#include <iostream>
 namespace torch_ext {
 
 struct KVCache {
@@ -19,10 +21,17 @@ struct KVCache {
     int                        seq_size_per_block;
     int                        layer_id = -1;
     KVCache                    getLayerCache(int idx) {
+        std::cout << "KVCache::getLayerCache idx=" << idx << ", by_layer.size=" << kv_cache_base_by_layer.size()
+                  << ", scale_by_layer.size=" << kv_scale_base_by_layer.size()
+                  << ", kv_cache_base.defined=" << kv_cache_base.defined()
+                  << ", seq_size_per_block=" << seq_size_per_block << std::endl;
         KVCache layer_cache;
         if (!kv_cache_base_by_layer.empty()) {
+            std::cout << "  using kv_cache_base_by_layer[" << idx << "], shape=" << kv_cache_base_by_layer[idx].sizes()
+                      << std::endl;
             layer_cache.kv_cache_base = kv_cache_base_by_layer[idx];
         } else {
+            std::cout << "  using kv_cache_base[" << idx << "], shape=" << kv_cache_base.sizes() << std::endl;
             layer_cache.kv_cache_base = kv_cache_base[idx];
         }
         layer_cache.seq_size_per_block = seq_size_per_block;
@@ -31,7 +40,9 @@ struct KVCache {
         } else if (kv_scale_base.defined() && kv_scale_base.numel() > 0) {
             layer_cache.kv_scale_base = kv_scale_base[idx];
         }
-        layer_cache.layer_id = idx;  // keep global layer id for debugging
+        layer_cache.layer_id = idx;
+        std::cout << "  result: kv_cache_base.shape=" << layer_cache.kv_cache_base.sizes()
+                  << ", layer_id=" << layer_cache.layer_id << std::endl;
         return layer_cache;
     }
 };
@@ -104,6 +115,9 @@ struct PyAttentionInputs {
     torch::Tensor sequence_lengths_plus_1_d;
     torch::Tensor input_lengths_d;
     torch::Tensor decode_cu_seqlens_d;
+
+    // host tensor
+    torch::Tensor decode_ngram_input_host;
 
     // CUDA Graph mode flag
     bool is_cuda_graph = false;

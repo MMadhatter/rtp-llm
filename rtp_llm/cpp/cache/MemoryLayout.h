@@ -1,6 +1,8 @@
 
 #pragma once
 
+#include <sstream>
+#include <string>
 #include "rtp_llm/cpp/core/Types.h"
 
 namespace rtp_llm {
@@ -61,6 +63,30 @@ struct MemoryLayoutConfig {
 
     bool hasScale() const {
         return enable_kv_scale && kv_scale_pool_size_bytes > 0;
+    }
+
+    std::string debugString() const {
+        std::ostringstream os;
+        os << "MemoryLayoutConfig{";
+        os << "layer_num=" << layer_num;
+        os << ", block_num=" << block_num;
+        os << ", dtype=" << static_cast<int>(dtype);
+        os << ", kv_cache_offset_bytes=" << kv_cache_offset_bytes;
+        os << ", kv_scale_offset_bytes=" << kv_scale_offset_bytes;
+        os << ", kv_block_pool_size_bytes=" << kv_block_pool_size_bytes;
+        os << ", kv_scale_pool_size_bytes=" << kv_scale_pool_size_bytes;
+        os << ", total_size_bytes=" << total_size_bytes;
+        os << ", kv_block_stride_bytes=" << kv_block_stride_bytes;
+        os << ", kv_scale_stride_bytes=" << kv_scale_stride_bytes;
+        os << ", block_stride_bytes=" << block_stride_bytes;
+        os << ", k_dim=" << k_dim << ", v_dim=" << v_dim;
+        os << ", local_head_num_kv=" << local_head_num_kv;
+        os << ", seq_size_per_block=" << seq_size_per_block;
+        os << ", is_mla=" << is_mla;
+        os << ", enable_kv_scale=" << enable_kv_scale;
+        os << ", enable_hybrid_attention=" << enable_hybrid_attention;
+        os << "}";
+        return os.str();
     }
 };
 

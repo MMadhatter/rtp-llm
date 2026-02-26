@@ -9,6 +9,7 @@ from rtp_llm.models_py.modules.base import (
     GroupTopK,
     LayerNorm,
     LayerNormTorch,
+    MultiHeadEmbedding,
     QKRMSNorm,
     RMSNorm,
     RMSNormTorch,
@@ -33,6 +34,7 @@ __all__ = [
     # Base modules
     "Embedding",
     "EmbeddingBert",
+    "MultiHeadEmbedding",
     "WriteCacheStoreOp",
     "AddBiasResLayerNorm",
     "AddBiasResLayerNormTorch",

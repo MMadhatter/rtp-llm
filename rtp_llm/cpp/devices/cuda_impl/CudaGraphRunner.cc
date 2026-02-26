@@ -1,6 +1,7 @@
 #include <cuda_runtime_api.h>
 #include <torch/torch.h>
 #include <algorithm>
+#include <iostream>
 #include <chrono>
 #include <cstring>
 #include "ATen/core/TensorBody.h"
@@ -380,6 +381,11 @@ void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_
     inputs.attention_inputs.is_s_padded               = true;
     inputs.attention_inputs.sequence_lengths_plus_1_d = torch::zeros({int(max_bs_)}, options_cuda_int32_);
     inputs.attention_inputs.decode_cu_seqlens_d       = torch::zeros({int(max_bs_)}, options_cuda_int32_);
+
+    if (max_ngram_size_ > 0) {
+        inputs.attention_inputs.decode_ngram_input_host =
+            torch::zeros({int(max_bs_) * int(max_ngram_size_)}, options_cpu_int32_).pin_memory();
+    }
 }
 
 void CudaGraphRunner::initCaptureAttentionInputsPost() {
@@ -470,6 +476,13 @@ void CudaGraphRunner::initCapture() {
         auto attn_pyobj = py_attn_pyobj_method_(capture_mem_hold_.py_model_inputs_, true);
         attn_pyobj.attr("prepare_cuda_graph")(capture_mem_hold_.py_model_inputs_.attention_inputs);
         RTP_LLM_LOG_INFO("initCapture forward for output datatype start");
+        std::cout << "[DEBUG] max_ngram_size_=" << max_ngram_size_ << ", max_bs_=" << max_bs_
+                  << ", decode_ngram_input_host defined="
+                  << capture_mem_hold_.py_model_inputs_.attention_inputs.decode_ngram_input_host.defined() << ", numel="
+                  << (capture_mem_hold_.py_model_inputs_.attention_inputs.decode_ngram_input_host.defined() ?
+                          capture_mem_hold_.py_model_inputs_.attention_inputs.decode_ngram_input_host.numel() :
+                          0)
+                  << std::endl;
         py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
         RTP_LLM_LOG_INFO("initCapture forward for output datatype end");
         output = torch::zeros({max_num_token_, hidden_size_}, options_cuda_float_);
@@ -596,6 +609,11 @@ void CudaGraphRunner::prepareCaptureInputs(PyModelInputs& inputs, int batch_size
             inputs.attention_inputs.kv_cache_block_id_host_by_group.push_back(
                 cap_attn.kv_cache_block_id_host_by_group[g].slice(0, 0, batch_size));
         }
+    }
+    if (max_ngram_size_ > 0) {
+        inputs.attention_inputs.decode_ngram_input_host =
+            capture_mem_hold_.py_model_inputs_.attention_inputs.decode_ngram_input_host.slice(
+                0, 0, batch_size * max_ngram_size_);
     }
 
     // Common direct assignments (no slice needed)

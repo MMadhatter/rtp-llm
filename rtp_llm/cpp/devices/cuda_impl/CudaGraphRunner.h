@@ -32,7 +32,8 @@ public:
         decode_capture_batch_sizes_(params.hw_kernel_config.decode_capture_batch_sizes),
         model_data_type_(model_data_type),
         kv_cache_layer_to_group_(params.kv_cache_layer_to_group),
-        kv_cache_group_num_(params.kv_cache_group_num) {
+        kv_cache_group_num_(params.kv_cache_group_num),
+        max_ngram_size_(params.model_specific_config.max_ngram_size) {
         py::gil_scoped_acquire gil;
         if (!py_instance_ || py_instance_.is_none()) {
             throw std::runtime_error("CudaGraphRunner constructor: Python instance is null or none.");
@@ -134,6 +135,7 @@ private:
 
     std::vector<int32_t> kv_cache_layer_to_group_;
     int32_t              kv_cache_group_num_ = 0;
+    int64_t              max_ngram_size_     = 0;
 
     // event to record forward done
     torch::Event forward_event_ = torch::Event(torch::kCUDA);

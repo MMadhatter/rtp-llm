@@ -194,6 +194,7 @@ struct MoeConfig {
 struct ModelSpecificConfig {
     int64_t     max_lora_model_size = -1;
     bool        load_python_model   = false;
+    int64_t     max_ngram_size      = 0;
     std::string to_string() const;
 };
 
@@ -462,6 +463,7 @@ enum class HybridAttentionType {
     NONE,
     LINEAR,
     SLIDING_WINDOW,
+    ENGRAM,
 };
 
 struct HybridAttentionConfig {

@@ -24,8 +24,9 @@ struct CacheConfig {
 
     // Model configuration
     rtp_llm::DataType dtype;
-    uint32_t          layer_num;      // the number of main model layers
-    uint32_t          layer_all_num;  // the number of all layers including mtp modules
+    uint32_t          extra_layer_num;  // extra kv cache layers appended after model layers (e.g. engram conv state)
+    uint32_t          layer_num;        // the number of main model kv cache layers (including extra kv cache layers)
+    uint32_t          layer_all_num;    // the number of all layers including mtp modules
     bool              use_mla = false;
 
     // Block configuration
@@ -74,6 +75,7 @@ struct CacheConfig {
         // Model configuration section
         os << indent1 << "# Model Configuration:\n";
         OUTPUT_FIELD_EXPR("dtype", static_cast<int>(dtype));
+        OUTPUT_FIELD(extra_layer_num);
         OUTPUT_FIELD(layer_num);
         OUTPUT_FIELD(layer_all_num);
         OUTPUT_FIELD_EXPR("use_mla", (use_mla ? "true" : "false"));

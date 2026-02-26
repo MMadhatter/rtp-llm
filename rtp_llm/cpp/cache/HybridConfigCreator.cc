@@ -1,10 +1,13 @@
 #include "rtp_llm/cpp/cache/HybridConfigCreator.h"
 
+#include <fstream>
 #include <numeric>
 
 #include "rtp_llm/cpp/cache/KVCacheSpec.h"
 #include "rtp_llm/cpp/cache/MemoryEvaluationHelper.h"
 #include "rtp_llm/cpp/devices/DeviceFactory.h"
+
+#include <iostream>
 
 namespace rtp_llm {
 
@@ -36,7 +39,8 @@ int HybridConfigCreator::calculateGroupLayerNum(int linear_layer_count, int full
 
 std::pair<std::vector<int>, std::vector<int>>
 HybridConfigCreator::splitLayersByAttentionType(const ModelConfig& model_config) {
-    int64_t layer_num = model_config.num_layers;
+    int64_t layer_num          = model_config.num_layers;
+    int     engram_layer_index = layer_num;
     RTP_LLM_CHECK_WITH_INFO(layer_num > 0, "invalid model_config.num_layers=%ld", layer_num);
 
     std::vector<int> linear_layers;
@@ -48,6 +52,9 @@ HybridConfigCreator::splitLayersByAttentionType(const ModelConfig& model_config)
     for (int i = 0; i < static_cast<int>(layer_num); ++i) {
         if (types[static_cast<size_t>(i)] == HybridAttentionType::LINEAR) {
             linear_layers.push_back(i);
+        } else if (types[static_cast<size_t>(i)] == HybridAttentionType::ENGRAM) {
+            full_layers.push_back(i);
+            linear_layers.push_back(engram_layer_index++);
         } else {
             full_layers.push_back(i);
         }
@@ -60,11 +67,15 @@ CacheConfig HybridConfigCreator::initializeConfig(const ModelConfig&      model_
                                                   const std::vector<int>& linear_layers,
                                                   const std::vector<int>& full_layers,
                                                   rtp_llm::DataType       dtype) {
-    int64_t layer_num = model_config.num_layers;
-
+    int64_t layer_num       = model_config.num_layers;
+    int64_t extra_layer_num = 0;
+    if (model_config.engram_config.hasEngram()) {
+        extra_layer_num = model_config.engram_config.layer_index.size();
+    }
     CacheConfig config;
-    config.layer_num          = static_cast<uint32_t>(layer_num);
-    config.layer_all_num      = static_cast<uint32_t>(layer_num);
+    config.layer_num          = static_cast<uint32_t>(layer_num) + extra_layer_num;
+    config.extra_layer_num    = extra_layer_num;
+    config.layer_all_num      = config.layer_num;
     config.block_num          = 0;
     config.seq_size_per_block = static_cast<uint32_t>(model_config.attn_config.tokens_per_block);
     config.use_mla            = model_config.attn_config.use_mla;
@@ -95,8 +106,15 @@ KVCacheSpecPtr HybridConfigCreator::createFullAttentionSpec(const ModelConfig&  
 KVCacheSpecPtr HybridConfigCreator::createLinearAttentionSpec(const ModelConfig&       model_config,
                                                               const ParallelismConfig& parallelism_config,
                                                               rtp_llm::DataType        dtype) {
-    auto linear_spec = std::make_shared<LinearKVCacheSpec>(
-        model_config.attn_config, parallelism_config, model_config.linear_attention_config);
+    KVCacheSpecPtr linear_spec;
+    // currently we assume that engram and linearattention are mutually exclusive
+    if (model_config.engram_config.hasEngram()) {
+        linear_spec = std::make_shared<EngramCacheSpec>(
+            model_config.attn_config, model_config.engram_config, model_config.hidden_size);
+    } else {
+        linear_spec = std::make_shared<LinearKVCacheSpec>(
+            model_config.attn_config, parallelism_config, model_config.linear_attention_config);
+    }
     linear_spec->dtype = dtype;
     return linear_spec;
 }
@@ -194,6 +212,8 @@ CacheConfig HybridConfigCreator::createHybridConfig(const ModelConfig&       mod
 
     // Setup cache config specs
     HybridConfigCreator::setupCacheConfigSpecs(config, linear_groups, full_groups, linear_spec, full_spec);
+
+    std::cout << "CacheConfig debugString:\n" << config.debugString() << std::endl;
 
     // Setup physical sizes
     HybridConfigCreator::setupPhysicalSizes(config, full_spec, linear_spec);

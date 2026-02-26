@@ -569,18 +569,20 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def(py::init<>())
         .def_readwrite("max_lora_model_size", &ModelSpecificConfig::max_lora_model_size)
         .def_readwrite("load_python_model", &ModelSpecificConfig::load_python_model)
+        .def_readwrite("max_ngram_size", &ModelSpecificConfig::max_ngram_size)
         .def("to_string", &ModelSpecificConfig::to_string)
         .def(py::pickle(
             [](const ModelSpecificConfig& self) {
-                return py::make_tuple(self.max_lora_model_size, self.load_python_model);
+                return py::make_tuple(self.max_lora_model_size, self.load_python_model, self.max_ngram_size);
             },
             [](py::tuple t) {
-                if (t.size() != 2)
+                if (t.size() != 3)
                     throw std::runtime_error("Invalid state!");
                 ModelSpecificConfig c;
                 try {
                     c.max_lora_model_size = t[0].cast<int64_t>();
                     c.load_python_model   = t[1].cast<bool>();
+                    c.max_ngram_size      = t[2].cast<int64_t>();
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("ModelSpecificConfig unpickle error: ") + e.what());
                 }
@@ -606,7 +608,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
     py::enum_<HybridAttentionType>(m, "HybridAttentionType")
         .value("NONE", HybridAttentionType::NONE)
         .value("LINEAR", HybridAttentionType::LINEAR)
-        .value("SLIDING_WINDOW", HybridAttentionType::SLIDING_WINDOW);
+        .value("SLIDING_WINDOW", HybridAttentionType::SLIDING_WINDOW)
+        .value("ENGRAM", HybridAttentionType::ENGRAM);
 
     pybind11::class_<HybridAttentionConfig>(m, "HybridAttentionConfig")
         .def(pybind11::init<bool, std::vector<HybridAttentionType>>(),
@@ -1250,6 +1253,21 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                 return c;
             }));
 
+    // Register EngramConfig
+    py::class_<EngramConfig>(m, "EngramConfig")
+        .def(py::init<>())
+        .def_readwrite("layer_index", &EngramConfig::layer_index)
+        .def_readwrite("vocab_size", &EngramConfig::vocab_size)
+        .def_readwrite("n_head_per_ngram", &EngramConfig::n_head_per_ngram)
+        .def_readwrite("n_embed_per_ngram", &EngramConfig::n_embed_per_ngram)
+        .def_readwrite("max_ngram_size", &EngramConfig::max_ngram_size)
+        .def_readwrite("pad_id", &EngramConfig::pad_id)
+        .def_readwrite("kernel_size", &EngramConfig::kernel_size)
+        .def_readwrite("seed", &EngramConfig::seed)
+        .def_readwrite("engram_hc_mult", &EngramConfig::engram_hc_mult)
+        .def("hasEngram", &EngramConfig::hasEngram)
+        .def("to_string", &EngramConfig::to_string);
+
     // Register MMModelConfig
     py::class_<MMModelConfig>(m, "MMModelConfig")
         .def(py::init<>())
@@ -1278,6 +1296,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("position_ids_style", &ModelConfig::position_ids_style)
         .def_readwrite("pre_seq_len", &ModelConfig::pre_seq_len)
         .def_readwrite("use_kvcache", &ModelConfig::use_kvcache)
+        .def_readwrite("engram_config", &ModelConfig::engram_config)
         .def_readwrite("logit_scale", &ModelConfig::logit_scale)
         .def_readwrite("qk_norm", &ModelConfig::qk_norm)
         .def_readwrite("expert_num", &ModelConfig::expert_num)

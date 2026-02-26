@@ -620,7 +620,13 @@ class ModelWeights:
         for _ in range(num_layers):
             self.weights.append({})
 
+    def _cpu_hold_weights(self, weights: Union[WeightModule, str]):
+        name = weights.name if isinstance(weights, WeightModule) else weights
+        return name in [W.engram_multihead_embedding]
+
     def set_layer_weight(self, layer_id: int, name: str, tensor: torch.Tensor):
+        if self._cpu_hold_weights(name):
+            tensor = tensor.to("cpu")
         self.weights[layer_id][name] = tensor
 
     def update_layer_weight(self, layer_id: int, name: str, data: torch.Tensor):

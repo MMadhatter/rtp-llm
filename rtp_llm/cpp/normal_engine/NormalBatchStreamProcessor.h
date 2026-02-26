@@ -23,6 +23,8 @@ public:
         use_int8_kv_cache_(model_config.attn_config.kv_cache_dtype == rtp_llm::KvCacheDataType::INT8),
         has_positional_encoding_(model_config.has_positional_encoding),
         is_multimodal_(model_config.mm_model_config.is_multimodal),
+        has_ngram_input_(model_config.engram_config.hasEngram()),
+        max_ngram_size_(model_config.engram_config.max_ngram_size),
         mm_position_ids_style_((PositionIdsStyle)model_config.mm_model_config.mm_position_ids_style),
         position_id_len_factor_(model_config.attn_config.rope_config.index_factor),
         role_type_(pd_sep_config.role_type),
@@ -32,6 +34,7 @@ public:
         seq_size_per_block_(cache_config.seq_size_per_block),
         kv_cache_group_nums_(cache_config.groupNums()),
         layer_to_kv_cache_group_id_(cache_config.layer_to_group_id),
+        extra_kv_cache_layer_num_(cache_config.extra_layer_num),
         kv_cache_group_types_(cache_config.group_types),
         warm_up_(warm_up),
         enable_detail_log_(profiling_debug_logging_config.enable_detail_log),
@@ -72,6 +75,8 @@ protected:
     bool                        use_int8_kv_cache_;
     bool                        has_positional_encoding_;
     bool                        is_multimodal_;
+    bool                        has_ngram_input_;
+    size_t                      max_ngram_size_;
     PositionIdsStyle            mm_position_ids_style_;
     size_t                      position_id_len_factor_;
     RoleType                    role_type_;
@@ -81,11 +86,11 @@ protected:
     size_t                      seq_size_per_block_;
     size_t                      kv_cache_group_nums_ = 1;
     std::vector<int32_t>        layer_to_kv_cache_group_id_;
+    size_t                      extra_kv_cache_layer_num_;
     std::vector<CacheGroupType> kv_cache_group_types_;
     bool                        warm_up_;
     bool                        enable_detail_log_;
-
-    rtp_llm::DeviceBase* device_;
+    rtp_llm::DeviceBase*        device_;
 };
 
 }  // namespace rtp_llm

@@ -54,9 +54,14 @@ class MlaKVCacheWriteOp:
             kv_cache: MLA KV cache with compressed layout
         """
         if kv_cache is not None:
-            # Split MLA cache into compressed K and position-encoded V
+            # Reshape to [num_pages, page_size, kv_lora_rank + rope_head_dim] then split
+            kv_cache_tensor = kv_cache.kv_cache_base.reshape(
+                kv_cache.kv_cache_base.shape[0],
+                self.token_per_block,
+                self.kv_lora_rank + self.rope_head_dim,
+            )
             k_cache, v_cache = torch.split(
-                kv_cache.kv_cache_base, [self.kv_lora_rank, self.rope_head_dim], dim=-1
+                kv_cache_tensor, [self.kv_lora_rank, self.rope_head_dim], dim=-1
             )
 
             page.append_paged_mla_kv_cache(

@@ -171,7 +171,8 @@ void DeviceFactory::initDevices(const ParallelismConfig&           parallelism_c
                      device_params.use_deepep_moe,
                      device_params.use_deepep_low_latency);
 
-    device_params.model_specific_config = model_specific_config;
+    device_params.model_specific_config                = model_specific_config;
+    device_params.model_specific_config.max_ngram_size = model_config.engram_config.max_ngram_size;
 
     if (!global_params.device_params.size()) {
         RTP_LLM_LOG_ERROR("No device is specified to init !");

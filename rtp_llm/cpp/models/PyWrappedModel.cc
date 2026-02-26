@@ -96,6 +96,10 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
             0, py_attn_inputs.sequence_lengths.size(0) + 1, 1, torch::TensorOptions(torch::kInt32).device(torch::kCPU));
         py_attn_inputs.decode_cu_seqlens_host = decode_cu_seqlens;
         py_attn_inputs.decode_cu_seqlens_d    = tensorHoldHostAndToCuda(decode_cu_seqlens);
+
+        if (inputs.decode_ngram_input) {
+            py_attn_inputs.decode_ngram_input_host = Buffer2torchTensor(inputs.decode_ngram_input, false);
+        }
     }
 
     // create device tensors

@@ -5,6 +5,7 @@
 #include <string>
 
 #include "rtp_llm/cpp/cache/Types.h"
+#include "rtp_llm/cpp/config/ModelConfig.h"
 #include "rtp_llm/cpp/core/Types.h"
 #include "rtp_llm/cpp/model_utils/AttentionConfig.h"
 
@@ -14,6 +15,7 @@ enum KVCacheSpecType {
     MultiHeadAttention,
     MultiHeadLatentAttention,
     LinearAttention,
+    Engram,
 };
 
 inline const char* KVCacheSpecTypeToString(KVCacheSpecType t) {
@@ -24,6 +26,8 @@ inline const char* KVCacheSpecTypeToString(KVCacheSpecType t) {
             return "MultiHeadLatentAttention";
         case KVCacheSpecType::LinearAttention:
             return "LinearAttention";
+        case KVCacheSpecType::Engram:
+            return "Engram";
         default:
             return "Unknown";
     }
@@ -429,6 +433,108 @@ struct LinearKVCacheSpec: public KVCacheSpec {
         os << indent1 << "conv_kernel_dim=" << conv_kernel_dim << "\n";
         os << indent1 << "ssm_state_size=" << ssm_state_size() << "\n";
         os << indent1 << "qkv_size=" << qkv_size() << "\n";
+        os << indent1 << "conv_state_size=" << conv_state_size() << "\n";
+        return os.str();
+    }
+};
+
+struct EngramCacheSpec: public KVCacheSpec {
+    // Engram conv state: shape = [dilation * (kernel_size - 1), hidden_dim * hc_mult]
+    // where dilation = max_ngram_size from EngramConfig.
+    uint32_t kernel_size = 0;
+    uint32_t dilation    = 0;
+    uint32_t hidden_dim  = 0;
+    uint32_t hc_mult     = 1;
+
+    EngramCacheSpec() = default;
+
+    EngramCacheSpec(const AttentionConfigs& attn_config, const EngramConfig& engram_config, size_t model_hidden_size) {
+        RTP_LLM_CHECK_WITH_INFO(
+            engram_config.kernel_size > 1, "invalid engram kernel_size=%ld (must be > 1)", engram_config.kernel_size);
+        RTP_LLM_CHECK_WITH_INFO(engram_config.max_ngram_size > 0,
+                                "invalid engram max_ngram_size (dilation)=%ld",
+                                engram_config.max_ngram_size);
+        RTP_LLM_CHECK_WITH_INFO(
+            engram_config.engram_hc_mult > 0, "invalid engram_hc_mult=%ld", engram_config.engram_hc_mult);
+
+        type               = KVCacheSpecType::Engram;
+        layer_num          = 1;  // Will be set by caller
+        local_head_num_kv  = 1;  // no head-based partitioning for engram conv state
+        seq_size_per_block = static_cast<uint32_t>(attn_config.tokens_per_block);
+        kernel_size        = static_cast<uint32_t>(engram_config.kernel_size);
+        dilation           = static_cast<uint32_t>(engram_config.max_ngram_size);
+        hidden_dim         = static_cast<uint32_t>(model_hidden_size);
+        hc_mult            = static_cast<uint32_t>(engram_config.engram_hc_mult);
+    }
+
+    size_t conv_state_size() const {
+        // dilation * (kernel_size - 1) * hidden_dim * hc_mult
+        return static_cast<size_t>(dilation) * static_cast<size_t>(kernel_size - 1) * static_cast<size_t>(hidden_dim)
+               * static_cast<size_t>(hc_mult);
+    }
+
+    size_t block_size() const override {
+        return conv_state_size();
+    }
+    size_t k_block_size() const override {
+        return conv_state_size();
+    }
+    size_t v_block_size() const override {
+        return 0;
+    }
+
+    size_t block_size_bytes() const override {
+        return block_size() * rtp_llm::getTypeSize(dtype);
+    }
+    size_t k_block_size_bytes() const override {
+        return k_block_size() * rtp_llm::getTypeSize(dtype);
+    }
+    size_t v_block_size_bytes() const override {
+        return 0;
+    }
+
+    size_t k_dim() const override {
+        return static_cast<size_t>(hidden_dim) * static_cast<size_t>(hc_mult);
+    }
+    size_t v_dim() const override {
+        return 0;
+    }
+
+    static KVPartitionBytes splitKVPartitionBytes(size_t      full_block_bytes,
+                                                  size_t      k_block_bytes,
+                                                  size_t      v_block_bytes,
+                                                  int         heads,
+                                                  int         partition_count,
+                                                  int         partition_id,
+                                                  const char* debug_name) {
+        RTP_LLM_CHECK_WITH_INFO(partition_count > 0, "partition_count must be > 0");
+        RTP_LLM_CHECK_WITH_INFO(partition_id >= 0 && partition_id < partition_count,
+                                "partition_id out of range: %d / %d",
+                                partition_id,
+                                partition_count);
+        RTP_LLM_CHECK_WITH_INFO(heads > 0, "heads must be > 0, got=%d (%s)", heads, debug_name);
+        RTP_LLM_CHECK_WITH_INFO(
+            v_block_bytes == 0, "engram v_block_bytes should be 0, got=%zu (%s)", v_block_bytes, debug_name);
+        RTP_LLM_CHECK_WITH_INFO(k_block_bytes == full_block_bytes,
+                                "engram block bytes mismatch (%s): full=%zu k=%zu",
+                                debug_name,
+                                full_block_bytes,
+                                k_block_bytes);
+
+        // return the full blocks without any head-based partitioning
+        return {0, k_block_bytes, 0, 0};
+    }
+
+    std::string debugString(size_t indent = 0) const override {
+        const std::string indent_str = std::string(indent, ' ');
+        const std::string indent1    = indent_str + "  ";
+
+        std::ostringstream os;
+        os << commonDebugString(indent);
+        os << indent1 << "kernel_size=" << kernel_size << "\n";
+        os << indent1 << "dilation=" << dilation << "\n";
+        os << indent1 << "hidden_dim=" << hidden_dim << "\n";
+        os << indent1 << "hc_mult=" << hc_mult << "\n";
         os << indent1 << "conv_state_size=" << conv_state_size() << "\n";
         return os.str();
     }
