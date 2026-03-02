@@ -207,12 +207,15 @@ class PCPAllGatherOverlapAttnOp:
         # TODO: make write local kvcache async
         restore_k = all_keys[self.kv_restore_unpad_indices]
         restore_v = all_values[self.kv_restore_unpad_indices]
+        kv_cache_tensor = kv_cache.kv_cache_base.view(
+            -1, 2, self.num_kv_heads, kv_cache.seq_size_per_block, self.head_dim
+        )
         append_paged_kv_cache(
             append_key=restore_k,
             append_value=restore_v,
             batch_indices=params.batch_indice_d,
             positions=params.positions_d,
-            paged_kv_cache=kv_cache.kv_cache_base,
+            paged_kv_cache=kv_cache_tensor,
             kv_indices=params.page_indice_d,
             kv_indptr=params.prefill_ragged_kv_len_indptr_d,
             kv_last_page_len=params.paged_kv_last_page_len_d,

@@ -173,6 +173,9 @@ class PCPAll2AllAttnOp:
             dtype=torch.float32,
             device=q.device,
         )
+        kv_cache_tensor = kv_cache.kv_cache_base.view(
+            -1, 2, self.num_kv_heads, kv_cache.seq_size_per_block, self.head_dim
+        )
         for round_id in range(0, self.prefill_cp_size):
             if round_id > 0:
                 out_buffer.zero_()
@@ -215,7 +218,7 @@ class PCPAll2AllAttnOp:
                     append_value=v,
                     batch_indices=params.batch_indice_d,
                     positions=self.all_shuffle_indices[self.prefill_cp_rank],
-                    paged_kv_cache=kv_cache.kv_cache_base,
+                    paged_kv_cache=kv_cache_tensor,
                     kv_indices=params.page_indice_d,
                     kv_indptr=params.prefill_ragged_kv_len_indptr_d,
                     kv_last_page_len=params.paged_kv_last_page_len_d,
@@ -246,7 +249,7 @@ class PCPAll2AllAttnOp:
                     append_value=remote_v,
                     batch_indices=params.batch_indice_d,
                     positions=self.all_shuffle_indices[src_rank],
-                    paged_kv_cache=kv_cache.kv_cache_base,
+                    paged_kv_cache=kv_cache_tensor,
                     kv_indices=params.page_indice_d,
                     kv_indptr=params.prefill_ragged_kv_len_indptr_d,
                     kv_last_page_len=params.paged_kv_last_page_len_d,

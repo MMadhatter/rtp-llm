@@ -14,10 +14,7 @@ from rtp_llm.models_py.distributed.symm_mem import (
     get_symm_mem_communicator,
     init_symm_mem_communicator,
 )
-
 from rtp_llm.ops import NcclCommConfig, ParallelismConfig
-from rtp_llm.models_py.utils.arch import is_cuda
-
 
 
 class Group(Enum):
@@ -231,6 +228,8 @@ def init_user_buffers_environment(parallelism_config: ParallelismConfig):
         )
 
     if parallelism_config.prefill_cp_config.is_enabled():
+        from rtp_llm.models_py.utils.arch import is_cuda
+
         if is_cuda():
             from rtp_llm.models_py.distributed.user_buffers import (
                 init_user_buffers_communicator,
@@ -261,12 +260,15 @@ def destroy_distributed_environment():
     rank = torch.distributed.get_rank()
     logging.info(f"[rank: {rank}] Destroying distributed environment")
 
+    from rtp_llm.models_py.utils.arch import is_cuda
+
     if is_cuda():
         from rtp_llm.models_py.distributed.user_buffers import (
             destroy_user_buffers_communicator,
         )
 
         destroy_user_buffers_communicator()
+
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
     _group_map.clear()
