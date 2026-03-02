@@ -1,11 +1,7 @@
 from __future__ import annotations
 import torch
 import typing
-<<<<<<< HEAD
-__all__: list[str] = ['ActivationType', 'ArpcConfig', 'AttentionConfigs', 'BatchDecodeSchedulerConfig', 'CacheStoreConfig', 'ConcurrencyConfig', 'DataType', 'DeviceResourceConfig', 'EPLBConfig', 'EplbMode', 'FIFOSchedulerConfig', 'FMHAConfig', 'FMHAType', 'FfnDisAggregateConfig', 'GrpcConfig', 'HWKernelConfig', 'HybridAttentionConfig', 'HybridAttentionType', 'KVCacheConfig', 'KvCacheDataType', 'LayerNormType', 'LinearAttentionConfig', 'MMModelConfig', 'MiscellaneousConfig', 'MlaOpsType', 'ModelConfig', 'ModelSpecificConfig', 'MoeConfig', 'NcclCommConfig', 'NormType', 'PDSepConfig', 'ParallelismConfig', 'ProfilingDebugLoggingConfig', 'QuantAlgo', 'QuantMethod', 'RoleSpecialTokens', 'RoleType', 'RopeCache', 'RopeConfig', 'RopeStyle', 'RuntimeConfig', 'SpecialTokens', 'SpeculativeExecutionConfig', 'SpeculativeType', 'TaskType', 'VitConfig', 'VitSeparation', 'check_rope_cache', 'get_block_cache_keys', 'get_rope_cache', 'get_rope_cache_once']
-=======
-__all__: list[str] = ['ALLTOALL', 'ALL_GATHER', 'ALL_GATHER_WITH_OVERLAP', 'ActivationType', 'ArpcConfig', 'AttentionConfigs', 'BatchDecodeSchedulerConfig', 'CPRotateMethod', 'CacheStoreConfig', 'ConcurrencyConfig', 'DISABLED', 'DataType', 'DeviceResourceConfig', 'EPLBConfig', 'EplbMode', 'FIFOSchedulerConfig', 'FMHAConfig', 'FMHAType', 'FfnDisAggregateConfig', 'GrpcConfig', 'HWKernelConfig', 'HybridAttentionConfig', 'HybridAttentionType', 'KVCacheConfig', 'KvCacheDataType', 'LayerNormType', 'LinearAttentionConfig', 'MMModelConfig', 'MiscellaneousConfig', 'MlaOpsType', 'ModelConfig', 'ModelSpecificConfig', 'MoeConfig', 'NcclCommConfig', 'NormType', 'PDSepConfig', 'ParallelismConfig', 'PrefillCPConfig', 'ProfilingDebugLoggingConfig', 'QuantAlgo', 'QuantMethod', 'RoleSpecialTokens', 'RoleType', 'RopeConfig', 'RopeStyle', 'RuntimeConfig', 'SpecialTokens', 'SpeculativeExecutionConfig', 'SpeculativeType', 'TaskType', 'UNKNOWN', 'VitConfig', 'VitSeparation', 'get_block_cache_keys']
->>>>>>> feat: support prefill context parallel
+__all__: list[str] = ['ALLTOALL', 'ALL_GATHER', 'ALL_GATHER_WITH_OVERLAP', 'ActivationType', 'ArpcConfig', 'AttentionConfigs', 'BatchDecodeSchedulerConfig', 'CPRotateMethod', 'CacheStoreConfig', 'ConcurrencyConfig', 'DISABLED', 'DataType', 'DeviceResourceConfig', 'EPLBConfig', 'EplbMode', 'FIFOSchedulerConfig', 'FMHAConfig', 'FMHAType', 'FfnDisAggregateConfig', 'GrpcConfig', 'HWKernelConfig', 'HybridAttentionConfig', 'HybridAttentionType', 'KVCacheConfig', 'KvCacheDataType', 'LayerNormType', 'LinearAttentionConfig', 'MMModelConfig', 'MiscellaneousConfig', 'MlaOpsType', 'ModelConfig', 'ModelSpecificConfig', 'MoeConfig', 'NcclCommConfig', 'NormType', 'PDSepConfig', 'ParallelismConfig', 'PrefillCPConfig', 'ProfilingDebugLoggingConfig', 'QuantAlgo', 'QuantMethod', 'RoleSpecialTokens', 'RoleType', 'RopeCache', 'RopeConfig', 'RopeStyle', 'RuntimeConfig', 'SpecialTokens', 'SpeculativeExecutionConfig', 'SpeculativeType', 'TaskType', 'UNKNOWN', 'VitConfig', 'VitSeparation', 'check_rope_cache', 'get_block_cache_keys', 'get_rope_cache', 'get_rope_cache_once']
 class ActivationType:
     """
     Members:
@@ -87,11 +83,8 @@ class AttentionConfigs:
     kv_cache_dtype: KvCacheDataType
     kv_head_num: int
     kv_lora_rank: int
-<<<<<<< HEAD
     max_seq_len: int
-=======
     need_rope_kv_cache: bool
->>>>>>> feat: support prefill context parallel
     nope_head_dim: int
     q_lora_rank: int
     q_scaling: float
@@ -435,17 +428,11 @@ class FMHAType:
       AITER_DECODE
     
       AITER_ASM_DECODE
-<<<<<<< HEAD
-
+    
       PY_FLASHINFER_PREFILL_PAGED
-
+    
       PY_FLASHINFER_PREFILL_RAGGED
-
-=======
     
-      PY_FLASHINFER_PREFILL
-    
->>>>>>> feat: support prefill context parallel
       PY_FLASHINFER_DECODE
     
       CP_FLASH_INFER
@@ -454,7 +441,7 @@ class FMHAType:
     AITER_ASM_PREFILL: typing.ClassVar[FMHAType]  # value = <FMHAType.AITER_ASM_PREFILL: 9>
     AITER_DECODE: typing.ClassVar[FMHAType]  # value = <FMHAType.AITER_DECODE: 10>
     AITER_PREFILL: typing.ClassVar[FMHAType]  # value = <FMHAType.AITER_PREFILL: 8>
-    CP_FLASH_INFER: typing.ClassVar[FMHAType]  # value = <FMHAType.CP_FLASH_INFER: 14>
+    CP_FLASH_INFER: typing.ClassVar[FMHAType]  # value = <FMHAType.CP_FLASH_INFER: 15>
     FLASH_INFER: typing.ClassVar[FMHAType]  # value = <FMHAType.FLASH_INFER: 0>
     NONE: typing.ClassVar[FMHAType]  # value = <FMHAType.NONE: 1>
     OPEN_SOURCE: typing.ClassVar[FMHAType]  # value = <FMHAType.OPEN_SOURCE: 2>
@@ -466,11 +453,7 @@ class FMHAType:
     TRT_V1: typing.ClassVar[FMHAType]  # value = <FMHAType.TRT_V1: 5>
     TRT_V2: typing.ClassVar[FMHAType]  # value = <FMHAType.TRT_V2: 6>
     XQA: typing.ClassVar[FMHAType]  # value = <FMHAType.XQA: 7>
-<<<<<<< HEAD
-    __members__: typing.ClassVar[dict[str, FMHAType]]  # value = {'FLASH_INFER': <FMHAType.FLASH_INFER: 0>, 'NONE': <FMHAType.NONE: 1>, 'OPEN_SOURCE': <FMHAType.OPEN_SOURCE: 2>, 'PAGED_OPEN_SOURCE': <FMHAType.PAGED_OPEN_SOURCE: 3>, 'PAGED_TRT_V2': <FMHAType.PAGED_TRT_V2: 4>, 'TRT_V1': <FMHAType.TRT_V1: 5>, 'TRT_V2': <FMHAType.TRT_V2: 6>, 'XQA': <FMHAType.XQA: 7>, 'AITER_PREFILL': <FMHAType.AITER_PREFILL: 8>, 'AITER_ASM_PREFILL': <FMHAType.AITER_ASM_PREFILL: 9>, 'AITER_DECODE': <FMHAType.AITER_DECODE: 10>, 'AITER_ASM_DECODE': <FMHAType.AITER_ASM_DECODE: 11>, 'PY_FLASHINFER_PREFILL_PAGED': <FMHAType.PY_FLASHINFER_PREFILL_PAGED: 12>, 'PY_FLASHINFER_PREFILL_RAGGED': <FMHAType.PY_FLASHINFER_PREFILL_RAGGED: 13>, 'PY_FLASHINFER_DECODE': <FMHAType.PY_FLASHINFER_DECODE: 14>}
-=======
-    __members__: typing.ClassVar[dict[str, FMHAType]]  # value = {'FLASH_INFER': <FMHAType.FLASH_INFER: 0>, 'NONE': <FMHAType.NONE: 1>, 'OPEN_SOURCE': <FMHAType.OPEN_SOURCE: 2>, 'PAGED_OPEN_SOURCE': <FMHAType.PAGED_OPEN_SOURCE: 3>, 'PAGED_TRT_V2': <FMHAType.PAGED_TRT_V2: 4>, 'TRT_V1': <FMHAType.TRT_V1: 5>, 'TRT_V2': <FMHAType.TRT_V2: 6>, 'XQA': <FMHAType.XQA: 7>, 'AITER_PREFILL': <FMHAType.AITER_PREFILL: 8>, 'AITER_ASM_PREFILL': <FMHAType.AITER_ASM_PREFILL: 9>, 'AITER_DECODE': <FMHAType.AITER_DECODE: 10>, 'AITER_ASM_DECODE': <FMHAType.AITER_ASM_DECODE: 11>, 'PY_FLASHINFER_PREFILL': <FMHAType.PY_FLASHINFER_PREFILL: 12>, 'PY_FLASHINFER_DECODE': <FMHAType.PY_FLASHINFER_DECODE: 13>, 'CP_FLASH_INFER': <FMHAType.CP_FLASH_INFER: 14>}
->>>>>>> feat: support prefill context parallel
+    __members__: typing.ClassVar[dict[str, FMHAType]]  # value = {'FLASH_INFER': <FMHAType.FLASH_INFER: 0>, 'NONE': <FMHAType.NONE: 1>, 'OPEN_SOURCE': <FMHAType.OPEN_SOURCE: 2>, 'PAGED_OPEN_SOURCE': <FMHAType.PAGED_OPEN_SOURCE: 3>, 'PAGED_TRT_V2': <FMHAType.PAGED_TRT_V2: 4>, 'TRT_V1': <FMHAType.TRT_V1: 5>, 'TRT_V2': <FMHAType.TRT_V2: 6>, 'XQA': <FMHAType.XQA: 7>, 'AITER_PREFILL': <FMHAType.AITER_PREFILL: 8>, 'AITER_ASM_PREFILL': <FMHAType.AITER_ASM_PREFILL: 9>, 'AITER_DECODE': <FMHAType.AITER_DECODE: 10>, 'AITER_ASM_DECODE': <FMHAType.AITER_ASM_DECODE: 11>, 'PY_FLASHINFER_PREFILL_PAGED': <FMHAType.PY_FLASHINFER_PREFILL_PAGED: 12>, 'PY_FLASHINFER_PREFILL_RAGGED': <FMHAType.PY_FLASHINFER_PREFILL_RAGGED: 13>, 'PY_FLASHINFER_DECODE': <FMHAType.PY_FLASHINFER_DECODE: 14>, 'CP_FLASH_INFER': <FMHAType.CP_FLASH_INFER: 15>}
     def __eq__(self, other: typing.Any) -> bool:
         ...
     def __getstate__(self) -> int:
@@ -1229,19 +1212,26 @@ class RoleType:
     @property
     def value(self) -> int:
         ...
+class RopeCache:
+    base: int
+    data: torch.Tensor
+    dim: int
+    used: bool
+    def __init__(self) -> None:
+        ...
 class RopeConfig:
     dim: int
-    scale: float
+    extrapolation_factor: float
     factor1: float
     factor2: float
-    max_pos: int
-    extrapolation_factor: float
-    mscale: float
-    offset: int
     index_factor: int
+    max_pos: int
     mrope_dim1: int
     mrope_dim2: int
     mrope_dim3: int
+    mscale: float
+    offset: int
+    scale: float
     def __init__(self) -> None:
         ...
     @property
@@ -1310,22 +1300,6 @@ class RopeStyle:
         ...
     @property
     def value(self) -> int:
-        ...
-class RopeCache:
-    """
-    RoPE cache structure containing precomputed cos/sin values.
-
-    Attributes:
-        used: Whether the cache is used
-        dim: RoPE dimension
-        base: RoPE base frequency (typically 10000)
-        data: Precomputed cos/sin cache tensor [max_seq_len, rope_dim]
-    """
-    used: bool
-    dim: int
-    base: int
-    data: torch.Tensor
-    def __init__(self) -> None:
         ...
 class RuntimeConfig:
     acext_gemm_config_dir: str
@@ -1551,51 +1525,20 @@ class VitSeparation:
         ...
 def check_rope_cache(rope_config: RopeConfig, rope_cache: RopeCache) -> bool:
     """
-    Check if RoPE cache matches the given config.
-
-    Args:
-        rope_config: RoPE configuration
-        rope_cache: RoPE cache to check
-
-    Returns:
-        True if cache matches config, False otherwise
+    Check if RoPE cache matches the given config
     """
-    ...
 def get_block_cache_keys(token_ids_list: list[list[int]]) -> list[int]:
     ...
-<<<<<<< HEAD
 def get_rope_cache(rope_config: RopeConfig, max_position_embeddings: int, interleave: bool) -> torch.Tensor:
     """
-    Get RoPE cache tensor for given config and max position embeddings.
-
-    Args:
-        rope_config: RoPE configuration
-        max_position_embeddings: Maximum position embeddings
-
-    Returns:
-        Precomputed cos/sin cache tensor [max_seq_len, rope_dim]
+    Get RoPE cache tensor for given config and max position embeddings
     """
-    ...
 def get_rope_cache_once(rope_config: RopeConfig, max_position_embeddings: int, is_cuda: bool = True, interleave: bool = True) -> RopeCache:
     """
-    Get RoPE cache object once (singleton pattern).
-
-    This function uses std::call_once to ensure the cache is only computed once
-    for the given configuration, making it efficient for repeated calls.
-
-    Args:
-        rope_config: RoPE configuration
-        max_position_embeddings: Maximum position embeddings
-        is_cuda: Whether to use CUDA (default: True)
-
-    Returns:
-        RopeCache object containing precomputed values
+    Get RoPE cache object once (singleton pattern)
     """
-    ...
-=======
 ALLTOALL: CPRotateMethod  # value = <CPRotateMethod.ALLTOALL: 3>
 ALL_GATHER: CPRotateMethod  # value = <CPRotateMethod.ALL_GATHER: 1>
 ALL_GATHER_WITH_OVERLAP: CPRotateMethod  # value = <CPRotateMethod.ALL_GATHER_WITH_OVERLAP: 2>
 DISABLED: CPRotateMethod  # value = <CPRotateMethod.DISABLED: 0>
 UNKNOWN: CPRotateMethod  # value = <CPRotateMethod.UNKNOWN: 4>
->>>>>>> feat: support prefill context parallel

@@ -164,9 +164,13 @@ class PyAttentionInputs:
     is_prefill: bool
     is_s_padded: bool
     kv_cache_block_id_device: torch.Tensor
+    kv_cache_block_id_device_by_group: list[torch.Tensor]
     kv_cache_block_id_host: torch.Tensor
+    kv_cache_block_id_host_by_group: list[torch.Tensor]
+    kv_cache_layer_to_group: torch.Tensor
     padding_offset: torch.Tensor
     position_ids: torch.Tensor
+    prefill_cuda_graph_copy_params: PyPrefillCudaGaphCopyParams | None
     prefix_lengths: torch.Tensor
     sequence_lengths: torch.Tensor
     sequence_lengths_plus_1_d: torch.Tensor
@@ -180,9 +184,6 @@ class PyAttentionInputs:
         ...
     @property
     def input_lengths_d(self) -> torch.Tensor:
-        ...
-    @property
-    def prefill_cuda_graph_copy_params(self) -> PyPrefillCudaGaphCopyParams | None:
         ...
     @property
     def prefix_lengths_d(self) -> torch.Tensor:
@@ -282,16 +283,10 @@ class PyModelOutputs:
     def params_ptr(self, arg0: ParamsBase) -> None:
         ...
 class PyPrefillCudaGaphCopyParams:
+    cuda_graph_prefill_batch_size: torch.Tensor
+    max_batch_size: int
+    max_seq_len: int
     def __init__(self) -> None:
-        ...
-    @property
-    def cuda_graph_prefill_batch_size(self) -> torch.Tensor:
-        ...
-    @property
-    def max_batch_size(self) -> int:
-        ...
-    @property
-    def max_seq_len(self) -> int:
         ...
 class TypeMeta:
     def __init__(self) -> None:
