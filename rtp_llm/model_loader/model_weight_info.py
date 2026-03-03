@@ -264,6 +264,10 @@ class ModelDeployWeightInfo:
             ffn_config.enable_ffn_disaggregate and not ffn_config.is_ffn_service()
         )
 
+        # for global weights: [lm_head]
+        self.lm_head_tp_size = parallelism_config.tp_size
+        self.lm_head_tp_rank = parallelism_config.tp_rank
+
     @property
     def support_lora(self):
         return False
@@ -597,6 +601,8 @@ class ModelDeployWeightInfo:
             ep_rank=self.ep_rank,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
+            lm_head_tp_rank=self.lm_head_tp_rank,
+            lm_head_tp_size=self.lm_head_tp_size,
             num_nodes=self.num_nodes,
             ffn_tp_rank=self.ffn_tp_rank,
             ffn_tp_size=self.ffn_tp_size,

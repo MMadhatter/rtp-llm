@@ -1676,7 +1676,7 @@ GptModelOutputs GptModel::forwardPostLayers(rtp_llm::BufferPtr       input,
                                                TransposeOperation::NONE,
                                                TransposeOperation::TRANSPOSE));
         printBufferData(*logits, "logits");
-        if (device_props_.tp_size > 1 && !device_props_.enable_prefill_cp) {
+        if (device_props_.tp_size > 1) {
             logits = tpSyncEmbeddingOrLogits(logits);
         }
         if (device_->initParams().profile_debug_logging_config.check_nan) {
