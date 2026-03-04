@@ -192,9 +192,10 @@ struct MoeConfig {
 };
 
 struct ModelSpecificConfig {
-    int64_t     max_lora_model_size = -1;
-    bool        load_python_model   = false;
-    int64_t     max_ngram_size      = 0;
+    int64_t     max_lora_model_size      = -1;
+    bool        load_python_model        = false;
+    int64_t     max_ngram_size           = 0;
+    bool        use_engram_gpu_embedding = true;
     std::string to_string() const;
 };
 

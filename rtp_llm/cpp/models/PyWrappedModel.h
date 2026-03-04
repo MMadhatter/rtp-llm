@@ -47,6 +47,8 @@ private:
     py::object    py_model_;
     bool          enable_cuda_graph_{false};
     bool          is_prefill_cuda_graph_mode_{false};
+    bool          has_engram_{false};
+    bool          use_engram_gpu_embedding_{true};
     torch::Tensor kv_cache_base_tensor_;
     torch::Tensor kv_scale_base_tensor_;
 };
@@ -57,7 +59,9 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                                       bool                      is_prefill_cuda_graph_mode):
     GptModel(params),
     enable_cuda_graph_(params.device->initParams().hw_kernel_config.enable_cuda_graph),
-    is_prefill_cuda_graph_mode_(is_prefill_cuda_graph_mode) {
+    is_prefill_cuda_graph_mode_(is_prefill_cuda_graph_mode),
+    has_engram_(params.device->initParams().model_specific_config.max_ngram_size > 0),
+    use_engram_gpu_embedding_(params.device->initParams().model_specific_config.use_engram_gpu_embedding) {
 
     if (setenv("PYTHONUNBUFFERED", "TRUE", 1) != 0) {
         RTP_LLM_LOG_WARNING("Failed to set PYTHONUNBUFFERED environment variable on POSIX.");

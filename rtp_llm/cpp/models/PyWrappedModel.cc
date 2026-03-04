@@ -96,10 +96,6 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
             0, py_attn_inputs.sequence_lengths.size(0) + 1, 1, torch::TensorOptions(torch::kInt32).device(torch::kCPU));
         py_attn_inputs.decode_cu_seqlens_host = decode_cu_seqlens;
         py_attn_inputs.decode_cu_seqlens_d    = tensorHoldHostAndToCuda(decode_cu_seqlens);
-
-        if (inputs.decode_ngram_input) {
-            py_attn_inputs.decode_ngram_input_host = Buffer2torchTensor(inputs.decode_ngram_input, false);
-        }
     }
 
     // create device tensors
@@ -349,11 +345,29 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         attention_inputs.padding_offset = tensorHoldHostAndToCuda(attention_inputs.padding_offset);
 
         auto py_model_inputs = PyModelInputs({token_ids, input_hiddens, attention_inputs, bert_embedding_inputs});
+
+        if (has_engram_) {
+            if (inputs.decode_ngram_input) {
+                py_model_inputs.engram_inputs.decode_ngram_input_host =
+                    Buffer2torchTensor(inputs.decode_ngram_input, false);
+            }
+            auto result = py_model_.attr("prepare_engram_hash")(py_model_inputs).cast<py::tuple>();
+            py_model_inputs.engram_inputs.hash_input_ids_host = result[0].cast<torch::Tensor>();
+            py_model_inputs.engram_inputs.hash_input_ids_d    = result[1].cast<torch::Tensor>();
+
+            if (!use_engram_gpu_embedding_) {
+                py_model_.attr("_start_async_engram_embedding")(py_model_inputs.engram_inputs);
+            }
+        }
+
         PyModelOutputs py_model_outputs;
         BufferPtr      hidden_states;
 
         // Cast the Python object to PyModelOutputs and extract hidden states
         if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs)) {
+            if (has_engram_ && !use_engram_gpu_embedding_) {
+                py_model_.attr("wait_async_engram_embedding")();
+            }
             DevicePerfWrapper wrapper(device_, "cuda graph python forward");
             py_model_inputs.attention_inputs.is_s_padded = true;
             py_model_outputs                             = graph_runner_->forward(py_model_inputs);

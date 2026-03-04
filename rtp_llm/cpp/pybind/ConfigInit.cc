@@ -570,19 +570,24 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("max_lora_model_size", &ModelSpecificConfig::max_lora_model_size)
         .def_readwrite("load_python_model", &ModelSpecificConfig::load_python_model)
         .def_readwrite("max_ngram_size", &ModelSpecificConfig::max_ngram_size)
+        .def_readwrite("use_engram_gpu_embedding", &ModelSpecificConfig::use_engram_gpu_embedding)
         .def("to_string", &ModelSpecificConfig::to_string)
         .def(py::pickle(
             [](const ModelSpecificConfig& self) {
-                return py::make_tuple(self.max_lora_model_size, self.load_python_model, self.max_ngram_size);
+                return py::make_tuple(self.max_lora_model_size,
+                                      self.load_python_model,
+                                      self.max_ngram_size,
+                                      self.use_engram_gpu_embedding);
             },
             [](py::tuple t) {
-                if (t.size() != 3)
+                if (t.size() != 4)
                     throw std::runtime_error("Invalid state!");
                 ModelSpecificConfig c;
                 try {
-                    c.max_lora_model_size = t[0].cast<int64_t>();
-                    c.load_python_model   = t[1].cast<bool>();
-                    c.max_ngram_size      = t[2].cast<int64_t>();
+                    c.max_lora_model_size      = t[0].cast<int64_t>();
+                    c.load_python_model        = t[1].cast<bool>();
+                    c.max_ngram_size           = t[2].cast<int64_t>();
+                    c.use_engram_gpu_embedding = t[3].cast<bool>();
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("ModelSpecificConfig unpickle error: ") + e.what());
                 }
@@ -1265,6 +1270,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("kernel_size", &EngramConfig::kernel_size)
         .def_readwrite("seed", &EngramConfig::seed)
         .def_readwrite("engram_hc_mult", &EngramConfig::engram_hc_mult)
+        .def_readwrite("use_gpu_embedding", &EngramConfig::use_gpu_embedding)
         .def("hasEngram", &EngramConfig::hasEngram)
         .def("to_string", &EngramConfig::to_string);
 

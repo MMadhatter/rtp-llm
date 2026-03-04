@@ -116,11 +116,13 @@ struct PyAttentionInputs {
     torch::Tensor input_lengths_d;
     torch::Tensor decode_cu_seqlens_d;
 
-    // host tensor
-    torch::Tensor decode_ngram_input_host;
-
     // CUDA Graph mode flag
     bool is_cuda_graph = false;
+};
+struct EngramInputs {
+    torch::Tensor decode_ngram_input_host;
+    torch::Tensor hash_input_ids_host;
+    torch::Tensor hash_input_ids_d;
 };
 
 struct BertEmbeddingInputs {
@@ -136,6 +138,7 @@ struct PyModelInputs {
     torch::Tensor       input_hiddens;
     PyAttentionInputs   attention_inputs;
     BertEmbeddingInputs bert_embedding_inputs;
+    EngramInputs        engram_inputs;
 };
 
 struct PyModelOutputs {

@@ -383,7 +383,7 @@ void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_
     inputs.attention_inputs.decode_cu_seqlens_d       = torch::zeros({int(max_bs_)}, options_cuda_int32_);
 
     if (max_ngram_size_ > 0) {
-        inputs.attention_inputs.decode_ngram_input_host =
+        inputs.engram_inputs.decode_ngram_input_host =
             torch::zeros({int(max_bs_) * int(max_ngram_size_)}, options_cpu_int32_).pin_memory();
     }
 }
@@ -478,9 +478,9 @@ void CudaGraphRunner::initCapture() {
         RTP_LLM_LOG_INFO("initCapture forward for output datatype start");
         std::cout << "[DEBUG] max_ngram_size_=" << max_ngram_size_ << ", max_bs_=" << max_bs_
                   << ", decode_ngram_input_host defined="
-                  << capture_mem_hold_.py_model_inputs_.attention_inputs.decode_ngram_input_host.defined() << ", numel="
-                  << (capture_mem_hold_.py_model_inputs_.attention_inputs.decode_ngram_input_host.defined() ?
-                          capture_mem_hold_.py_model_inputs_.attention_inputs.decode_ngram_input_host.numel() :
+                  << capture_mem_hold_.py_model_inputs_.engram_inputs.decode_ngram_input_host.defined() << ", numel="
+                  << (capture_mem_hold_.py_model_inputs_.engram_inputs.decode_ngram_input_host.defined() ?
+                          capture_mem_hold_.py_model_inputs_.engram_inputs.decode_ngram_input_host.numel() :
                           0)
                   << std::endl;
         py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
@@ -611,8 +611,8 @@ void CudaGraphRunner::prepareCaptureInputs(PyModelInputs& inputs, int batch_size
         }
     }
     if (max_ngram_size_ > 0) {
-        inputs.attention_inputs.decode_ngram_input_host =
-            capture_mem_hold_.py_model_inputs_.attention_inputs.decode_ngram_input_host.slice(
+        inputs.engram_inputs.decode_ngram_input_host =
+            capture_mem_hold_.py_model_inputs_.engram_inputs.decode_ngram_input_host.slice(
                 0, 0, batch_size * max_ngram_size_);
     }
 
@@ -622,6 +622,11 @@ void CudaGraphRunner::prepareCaptureInputs(PyModelInputs& inputs, int batch_size
         capture_mem_hold_.py_model_inputs_.attention_inputs.kv_cache_layer_to_group;
     inputs.bert_embedding_inputs        = capture_mem_hold_.py_model_inputs_.bert_embedding_inputs;
     inputs.attention_inputs.is_s_padded = true;
+
+    if (capture_mem_hold_.py_model_inputs_.engram_inputs.hash_input_ids_d.defined()) {
+        inputs.engram_inputs.hash_input_ids_host = capture_mem_hold_.py_model_inputs_.engram_inputs.hash_input_ids_host;
+        inputs.engram_inputs.hash_input_ids_d    = capture_mem_hold_.py_model_inputs_.engram_inputs.hash_input_ids_d;
+    }
 }
 
 CaptureMemoryHold CudaGraphRunner::createCaptureMemoryHold(PyModelInputs& inputs, int tokens_count) {

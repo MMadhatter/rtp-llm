@@ -41,6 +41,7 @@ public:
     int64_t              kernel_size       = 4;
     int64_t              seed              = 0;
     int64_t              engram_hc_mult    = 1;
+    bool                 use_gpu_embedding = true;
 
     bool hasEngram() const {
         return !layer_index.empty();

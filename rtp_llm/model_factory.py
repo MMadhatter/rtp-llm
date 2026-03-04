@@ -77,6 +77,10 @@ class ModelFactory:
         model_config.model_name = model_name
         engine_config.runtime_config.model_name = model_name
 
+        model_config.engram_config.use_gpu_embedding = (
+            engine_config.model_specific_config.use_engram_gpu_embedding
+        )
+
         model = model_cls.from_config(
             model_config=model_config,
             parallelism_config=engine_config.parallelism_config,

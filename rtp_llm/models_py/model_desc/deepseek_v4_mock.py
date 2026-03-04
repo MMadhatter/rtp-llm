@@ -172,25 +172,18 @@ class Engram(nn.Module):
         layer_id,
         quant_config: Optional[object] = None,
         hw_kernel_config: Optional["HWKernelConfig"] = None,
+        max_batch_size: int = 0,
     ):
         super().__init__()
         self.layer_id = layer_id
         self.config = config
-        self.hash_mapping = NgramHashMapping(
-            engram_vocab_size=self.config.engram_config.vocab_size,
-            max_ngram_size=self.config.engram_config.max_ngram_size,
-            n_embed_per_ngram=self.config.engram_config.n_embed_per_ngram,
-            n_head_per_ngram=self.config.engram_config.n_head_per_ngram,
-            layer_ids=[layer_id],
-            tokenizer_name_or_path=config.ckpt_path,
-            pad_id=self.config.engram_config.pad_id,
-            seed=self.config.engram_config.seed,
-        )
         self.eps = 1e-6
         self.multi_head_embedding = MultiHeadEmbedding(
             config=config,
             parallelism_config=parallelism_config,
             weight=weights[W.engram_multihead_embedding],
+            layer_id=layer_id,
+            max_batch_size=max_batch_size,
         )
 
         self.short_conv = ShortConv(
@@ -222,28 +215,10 @@ class Engram(nn.Module):
             eps=config.layernorm_eps,
         )
 
-    def prepare(self, attention_inputs: PyAttentionInputs, input_ids: torch.Tensor):
-        # mock ngram hash input_ids lookup
-        # TODO: 修改hash function支持B*S在一个维度并做对应的padding
-
-        num_tokens = input_ids.shape[0]
-        num_heads = len(self.config.engram_config.vocab_size)
-        # mock ngram hash input_ids lookup for cuda graph capture
-        if attention_inputs.is_cuda_graph:
-            return torch.ones(1, num_tokens, num_heads, dtype=torch.long, device="cuda")
-
-        if attention_inputs.is_prefill:
-            input_ids_cpu = input_ids.to("cpu").unsqueeze(0)
-        else:
-            input_ids_cpu = attention_inputs.decode_ngram_input_host.unsqueeze(0)
-
-        input_ids_cpu = input_ids_cpu[:, 0 : input_ids.shape[0]]
-        hash_input_ids = torch.from_numpy(
-            self.hash_mapping.hash(input_ids_cpu)[self.layer_id]
-        )
-        # mock ngram hash input_ids lookup for decode graph replay
-        # return hash_input_ids.to("cuda")
-        return torch.ones(1, num_tokens, num_heads, dtype=torch.long, device="cuda")
+    def start_async_embedding(self, engram_inputs: "EngramInputs"):
+        """Start async CPU embedding + H2D. No-op for GPU embedding."""
+        if engram_inputs.hash_input_ids_host.defined():
+            self.multi_head_embedding.start_async(engram_inputs.hash_input_ids_host)
 
     def forward(
         self,
@@ -430,6 +405,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 parallelism_config=parallelism_config,
                 weights=weights,
                 layer_id=layer_idx,
+                max_batch_size=max_generate_batch_size,
             )
 
         self.input_layernorm = RMSNorm(
@@ -450,7 +426,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         fmha_impl: FMHAImplBase,
         attn_inputs: PyAttentionInputs,
-        hash_input_ids: Optional[torch.Tensor] = None,
+        engram_inputs: Optional["EngramInputs"] = None,
         kv_cache: Optional[KVCache] = None,
         engram_layer_cache: Optional[KVCache] = None,
         engram_cache_layer_idx: Optional[int] = None,
@@ -458,7 +434,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.engram is not None:
             assert engram_layer_cache is not None
             assert engram_cache_layer_idx is not None
-            # TODO: 查询和与hidden_states的cross attention拆开两部分
+            hash_input_ids = engram_inputs.hash_input_ids_d
             hidden_states = hidden_states + self.engram(
                 hash_input_ids,
                 attn_inputs,
@@ -542,11 +518,60 @@ class DeepseekV4Model(GptModelBase):
         self.norm = RMSNorm(
             weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
         )
-        self.engram_layer_set = set(model_config.engram_config.layer_index)
-        self.engram_extra_cache_idx = {
-            layer_id: self.layer_num + idx
-            for idx, layer_id in enumerate(model_config.engram_config.layer_index)
-        }
+
+        self.hash_mapping = None
+        self.engram_layer_set = None
+        self.engram_extra_cache_idx = None
+
+        self.use_gpu_embedding = model_config.engram_config.use_gpu_embedding
+
+        if model_config.engram_config.layer_index:
+            self.engram_layer_set = set(model_config.engram_config.layer_index)
+            self.engram_extra_cache_idx = {
+                layer_id: self.layer_num + idx
+                for idx, layer_id in enumerate(model_config.engram_config.layer_index)
+            }
+            self.hash_mapping = NgramHashMapping(
+                engram_vocab_size=model_config.engram_config.vocab_size,
+                max_ngram_size=model_config.engram_config.max_ngram_size,
+                n_embed_per_ngram=model_config.engram_config.n_embed_per_ngram,
+                n_head_per_ngram=model_config.engram_config.n_head_per_ngram,
+                layer_ids=model_config.engram_config.layer_index,
+                tokenizer_name_or_path=model_config.ckpt_path,
+                pad_id=model_config.engram_config.pad_id,
+                seed=model_config.engram_config.seed,
+            )
+
+    def _start_async_engram_embedding(self, engram_inputs: "EngramInputs"):
+        for layer_id in self.engram_layer_set:
+            self.layers[layer_id].engram.start_async_embedding(engram_inputs)
+
+    def wait_async_engram_embedding(self):
+        """Wait for all engram layers' async CPU embedding + H2D to complete.
+        Called from C++ before CUDA graph replay."""
+        from rtp_llm.models_py.modules.base.common.multi_head_embedding import (
+            CpuMultiHeadEmbedding,
+        )
+
+        for layer_id in self.engram_layer_set:
+            emb = self.layers[layer_id].engram.multi_head_embedding
+            if isinstance(emb, CpuMultiHeadEmbedding) and emb._async_future is not None:
+                emb.wait_async()
+
+    def prepare_engram_hash(self, inputs: PyModelInputs):
+        num_tokens = inputs.input_ids.shape[0]
+        if inputs.attention_inputs.is_prefill:
+            input_ids_cpu = inputs.input_ids.to("cpu").unsqueeze(0)
+        else:
+            input_ids_cpu = inputs.engram_inputs.decode_ngram_input_host.unsqueeze(0)
+
+        input_ids_cpu = input_ids_cpu[:, 0:num_tokens]
+        layer_id = self.config.engram_config.layer_index[0]
+        hash_input_ids_host = torch.from_numpy(
+            self.hash_mapping.hash(input_ids_cpu)[layer_id]
+        )
+        hash_input_ids_d = hash_input_ids_host.to("cuda")
+        return hash_input_ids_host, hash_input_ids_d
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         input_ids: torch.Tensor = inputs.input_ids
@@ -557,12 +582,13 @@ class DeepseekV4Model(GptModelBase):
                 inputs
             )  # pyright: ignore[reportUnreachable]
 
-        if len(self.config.engram_config.layer_index) > 0:
-            hash_input_ids = self.layers[
-                self.config.engram_config.layer_index[0]
-            ].engram.prepare(inputs.attention_inputs, input_ids)
-        else:
-            hash_input_ids = None
+        if (
+            not inputs.engram_inputs.hash_input_ids_d.defined()
+            and self.hash_mapping is not None
+        ):
+            host, device = self.prepare_engram_hash(inputs)
+            inputs.engram_inputs.hash_input_ids_host = host
+            inputs.engram_inputs.hash_input_ids_d = device
 
         for i, decoder_layer in enumerate(self.layers[: self.layer_num]):
             if i == 0:
@@ -587,7 +613,7 @@ class DeepseekV4Model(GptModelBase):
                 hidden_states,
                 fmha_impl,
                 inputs.attention_inputs,
-                hash_input_ids,
+                inputs.engram_inputs,
                 kv_cache=_layer_kv_cache,
                 engram_layer_cache=engram_layer_cache,
                 engram_cache_layer_idx=_engram_cache_layer_idx,
