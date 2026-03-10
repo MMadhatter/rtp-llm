@@ -162,6 +162,7 @@ class PyAttentionInputs:
     input_lengths: torch.Tensor
     is_cuda_graph: bool
     is_prefill: bool
+    prefill_with_prefix: bool
     is_s_padded: bool
     kv_cache_block_id_device: torch.Tensor
     kv_cache_block_id_device_by_group: list[torch.Tensor]

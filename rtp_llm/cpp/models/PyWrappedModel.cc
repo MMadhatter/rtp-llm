@@ -64,6 +64,10 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     size_t decode_batch_size  = py_attn_inputs.sequence_lengths.size(0);
     py_attn_inputs.dtype      = dataTypeToTorchType(description_.data_type);
     py_attn_inputs.is_prefill = !decode_batch_size;
+
+    if (py_attn_inputs.prefix_lengths.defined() && py_attn_inputs.prefix_lengths.numel() > 0) {
+        py_attn_inputs.prefill_with_prefix = py_attn_inputs.prefix_lengths.sum().item<int>() > 0;
+    }
     RTP_LLM_CHECK_WITH_INFO(
         context_batch_size + decode_batch_size == batch_size,
         "batch size check failed context_batch_size[%ld] decode_batch_size[%ld] total_batch_size[%ld]",
@@ -329,13 +333,13 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         torch::Tensor input_hiddens =
             inputs.last_hidden_states ? Buffer2torchTensor(inputs.last_hidden_states, false) : torch::empty({0});
 
-        auto                   attention_inputs      = buildPyAttentionInputs(inputs);
-        auto                   bert_embedding_inputs = buildBertEmbeddingInputs(inputs);
+        auto attention_inputs      = buildPyAttentionInputs(inputs);
+        auto bert_embedding_inputs = buildBertEmbeddingInputs(inputs);
 
         if (device_props_.enable_prefill_cp) {
             attention_inputs.context_parallel_info = cp_params;
         }
- 
+
         BufferPtr              kv_cache_block_id_device;
         std::vector<BufferPtr> kv_cache_block_id_device_by_group;
         if (!inputs.warmup && inputs.pd_separation) {

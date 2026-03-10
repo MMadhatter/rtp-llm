@@ -102,6 +102,8 @@ public:
     torch::Tensor qo_indptr;
     torch::Tensor batch_reuse_info_vec;
     torch::Tensor slot_mapping;
+
+    bool prefill_with_prefix = false;
 };
 void registerPyFlashInferMlaParams(pybind11::module& m);
 

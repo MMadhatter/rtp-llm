@@ -436,6 +436,17 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
         page_num += (seq_len + seq_size_per_block - 1) / seq_size_per_block;
     }
 
+    // Determine whether there is any prefix cache hit
+    prefill_with_prefix = false;
+    if (prefix_lengths_ptr) {
+        for (int i = 0; i < batch_size; i++) {
+            if (prefix_lengths_ptr[i] > 0) {
+                prefill_with_prefix = true;
+                break;
+            }
+        }
+    }
+
     // Ensure tensors are allocated with sufficient size
     ensureTensorSize(batch_size, input_token_num, page_num, reuse_page_num, batch_reuse_info_size, forbid_realloc);
 
@@ -566,7 +577,9 @@ void registerPyFlashInferMlaParams(pybind11::module& m) {
                       &FlashInferMlaAttnParams::batch_reuse_info_vec_d,
                       "Batch reuse info vector on DEVICE")
         // slot_mapping output
-        .def_readonly("slot_mapping", &FlashInferMlaAttnParams::slot_mapping, "Slot mapping for KV cache");
+        .def_readonly("slot_mapping", &FlashInferMlaAttnParams::slot_mapping, "Slot mapping for KV cache")
+        .def_readonly(
+            "prefill_with_prefix", &FlashInferMlaAttnParams::prefill_with_prefix, "True when prefix cache is hit");
     m.def(
         "fill_mla_params",
         [](torch::Tensor t_prefill_lengths,

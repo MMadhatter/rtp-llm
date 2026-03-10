@@ -1,4 +1,63 @@
 import torch
+from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+
+def plan_prefix_paged_attention(
+    wrapper: BatchPrefillWithPagedKVCacheWrapper,
+    qo_indptr: torch.Tensor,
+    prefix_lengths: torch.Tensor,
+    params,
+    *,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    device,
+) -> None:
+    """Plan paged attention for the prefix portion of KV cache.
+
+    All prefix positions precede every new-token position, so causal=False.
+    This is shared by all CP implementations that need prefix cache support.
+    """
+    batch_size = params.kvlen_h.shape[0]
+    prefix_lens = prefix_lengths.cpu().to(torch.int32)
+    assert (prefix_lens % page_size == 0).all(), (
+        f"prefix lengths must be multiples of page_size({page_size}), "
+        f"got {prefix_lens}"
+    )
+
+    prefix_pages = prefix_lens // page_size
+    page_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
+    page_indptr[1:] = prefix_pages.cumsum(0)
+
+    full_page_starts = params.decode_page_indptr_h[:batch_size].to(torch.int32)
+    all_page_indices = params.page_indice_d
+
+    total_pages = page_indptr[-1].item()
+    if total_pages > 0:
+        expanded_starts = torch.repeat_interleave(full_page_starts, prefix_pages)
+        local_offsets = torch.arange(
+            total_pages, dtype=torch.int32
+        ) - torch.repeat_interleave(page_indptr[:batch_size], prefix_pages)
+        gather_idx = (expanded_starts + local_offsets).long().to(device)
+        prefix_page_indices = all_page_indices[gather_idx]
+    else:
+        prefix_page_indices = torch.tensor([], dtype=torch.int32, device=device)
+
+    last_page_len = torch.full([batch_size], page_size, dtype=torch.int32)
+
+    wrapper.plan(
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=page_indptr.to(device),
+        paged_kv_indices=prefix_page_indices,
+        paged_kv_last_page_len=last_page_len.to(device),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        causal=False,
+        q_data_type=torch.bfloat16,
+    )
 
 
 # generate kv_indices for zigzag load balance with partial q and full kv

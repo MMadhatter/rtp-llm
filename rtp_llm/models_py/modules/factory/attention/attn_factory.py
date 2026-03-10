@@ -6,7 +6,13 @@ from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import (
     FMHAImplBase,
     MlaImplBase,
 )
-from rtp_llm.ops import AttentionConfigs, FMHAConfig, KvCacheDataType, FMHAType, ParallelismConfig
+from rtp_llm.ops import (
+    AttentionConfigs,
+    FMHAConfig,
+    FMHAType,
+    KvCacheDataType,
+    ParallelismConfig,
+)
 from rtp_llm.ops.compute_ops import PyAttentionInputs
 from rtp_llm.utils.model_weight import W
 
@@ -140,7 +146,6 @@ def get_fmha_impl(
         # Check if implementation supports parallelism config
         if not impl.support_parallelism_config(parallelism_config):
             continue
-
         try:
             instance = impl(attn_configs, attn_inputs, parallelism_config)
             if not is_cuda_graph or instance.support_cuda_graph():

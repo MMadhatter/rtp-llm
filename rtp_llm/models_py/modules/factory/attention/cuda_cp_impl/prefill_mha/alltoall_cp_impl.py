@@ -2,7 +2,10 @@ import logging
 from typing import Optional
 
 import torch
-from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
+from flashinfer import (
+    BatchPrefillWithPagedKVCacheWrapper,
+    BatchPrefillWithRaggedKVCacheWrapper,
+)
 from flashinfer.cascade import merge_state
 from flashinfer.page import append_paged_kv_cache
 
@@ -11,6 +14,7 @@ from rtp_llm.models_py.distributed.user_buffers import get_user_buffers_communic
 from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_mha.cp_utils import (
     generate_half_kv_indices,
     generate_half_q_indices,
+    plan_prefix_paged_attention,
 )
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
     get_py_flashinfer_workspace_buffer,
@@ -63,6 +67,8 @@ class PCPAll2AllAttnOp:
         self.prefill_cp_rank = parallelism_config.tp_rank
         self.prefill_cp_size = parallelism_config.tp_size
 
+        self.seq_size_per_block = attn_configs.tokens_per_block
+
         self.communication_stream = torch.cuda.Stream(device=self.device)
         self.comm_events = [torch.cuda.Event() for _ in range(self.prefill_cp_size)]
         self.math_events = [torch.cuda.Event() for _ in range(self.prefill_cp_size)]
@@ -80,6 +86,11 @@ class PCPAll2AllAttnOp:
             )
             for name in wrapper_names
         }
+        self.prefix_paged_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            self.workspace_buffer,
+            kv_layout=kv_layout,
+            backend=backend,
+        )
         self.ub_communicator = get_user_buffers_communicator()
 
     def support(self, attention_inputs: PyAttentionInputs) -> bool:
@@ -131,7 +142,7 @@ class PCPAll2AllAttnOp:
         self.half_q_idx = torch.tensor(half_q_indices, device=self.device)
         self.half_kv_idx = torch.tensor(half_kv_indices, device=self.device)
 
-        return fill_mla_params(
+        params = fill_mla_params(
             self.attn_inputs.prefix_lengths,
             self.attn_inputs.sequence_lengths,
             self.attn_inputs.input_lengths,
@@ -139,13 +150,27 @@ class PCPAll2AllAttnOp:
             self.attn_configs.tokens_per_block,
         )
 
+        if params.prefill_with_prefix:
+            plan_prefix_paged_attention(
+                self.prefix_paged_wrapper,
+                cu_seqlens,
+                attention_inputs.prefix_lengths,
+                params,
+                num_qo_heads=self.num_qo_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                page_size=self.seq_size_per_block,
+                device=self.device,
+            )
+
+        return params
+
     def forward(
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
         params: ParamsBase = None,
     ) -> torch.Tensor:
-        # reshape qkv to q, k, v
         qkv = qkv.reshape(qkv.shape[0], -1)
         q, k, v = torch.split(
             qkv,
@@ -160,7 +185,6 @@ class PCPAll2AllAttnOp:
         k = k.contiguous()
         v = v.contiguous()
 
-        # init kv buffer
         kv_buffer = torch.cat([k, v], dim=0)
         remote_kv_buffer = torch.empty_like(kv_buffer)
         self.communication_stream.wait_stream(torch.cuda.current_stream())
@@ -199,7 +223,6 @@ class PCPAll2AllAttnOp:
                         self.ub_communicator.send(kv_buffer, dst=next_rank_id)
                         self.ub_communicator.recv(remote_kv_buffer, src=prev_rank_id)
                     else:
-                        # Fall back to standard collective communication
                         if self.prefill_cp_rank < next_rank_id:
                             send(kv_buffer, dst=next_rank_id, group=Group.TP)
                             recv(remote_kv_buffer, src=prev_rank_id, group=Group.TP)
@@ -226,12 +249,27 @@ class PCPAll2AllAttnOp:
                     kv_last_page_len=params.paged_kv_last_page_len_d,
                     kv_layout="HND",
                 )
+
+                q_reshaped = q.reshape(-1, self.num_qo_heads, self.head_dim)
                 merged_out, merged_lse = self.prefill_wrappers["causal"].run(
-                    q.reshape(-1, self.num_qo_heads, self.head_dim),
+                    q_reshaped,
                     k,
                     v,
                     return_lse=True,
                 )
+
+                if params.prefill_with_prefix:
+                    prefix_out, prefix_lse = self.prefix_paged_wrapper.run(
+                        q_reshaped,
+                        kv_cache_tensor,
+                        return_lse=True,
+                    )
+                    merged_out, merged_lse = merge_state(
+                        v_a=merged_out,
+                        s_a=merged_lse,
+                        v_b=prefix_out,
+                        s_b=prefix_lse,
+                    )
             else:
                 torch.cuda.current_stream().wait_event(self.comm_events[round_id - 1])
                 self.comm_events[round_id - 1].synchronize()
@@ -258,7 +296,6 @@ class PCPAll2AllAttnOp:
                     kv_layout="HND",
                 )
                 if round_id > self.prefill_cp_rank:
-                    # half q and full kv
                     q_split = (
                         torch.index_select(q, 0, self.half_q_idx)
                         .contiguous()
@@ -283,7 +320,6 @@ class PCPAll2AllAttnOp:
                         s_b=lse_buffer,
                     )
                 else:
-                    # half kv and full q
                     k_split = torch.index_select(
                         remote_k, 0, self.half_kv_idx
                     ).contiguous()

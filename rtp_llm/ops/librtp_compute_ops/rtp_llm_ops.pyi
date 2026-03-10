@@ -131,6 +131,11 @@ class FlashInferMlaAttnParams(librtp_compute_ops.ParamsBase):
         """
         Slot mapping for KV cache
         """
+    @property
+    def prefill_with_prefix(self) -> bool:
+        """
+        True when prefix cache is hit
+        """
 class FlashInferPrefillOp:
     def __init__(self, attn_configs: libth_transformer_config.AttentionConfigs) -> None:
         ...
