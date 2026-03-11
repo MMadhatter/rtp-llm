@@ -73,7 +73,7 @@ void invokeFusedQKVBiasTransposeHelper(const torch::Tensor&              qkv,
         qkv.data_ptr(),
         qkv_fp8_output,
         position_ids,  // position_ids
-        nullptr,  // qkv_bias
+        nullptr,       // qkv_bias
         padding_offset,
         params->cu_seqlens.data_ptr<int>(),
         rope_cache.used,
@@ -125,11 +125,19 @@ TRTAttnPtr FusedRopeKVCachePrefillOpBase::prepare(torch_ext::PyAttentionInputs a
     attn_params->prefix_lengths            = attn_inputs.prefix_lengths;
     attn_params->kv_block_array.cache_type = attn_configs_.kv_cache_dtype;
     attn_params->padding_offset            = attn_inputs.padding_offset;
-    
+
     if (attn_inputs.context_parallel_info.has_value()
-    && attn_inputs.context_parallel_info->prefill_shuffle_indices.defined()) {
-    attn_params->cp_position_ids = attn_inputs.context_parallel_info->prefill_shuffle_indices;
+        && attn_inputs.context_parallel_info->prefill_shuffle_indices.defined()) {
+        auto cp_pos = attn_inputs.context_parallel_info->prefill_shuffle_indices;
+        if (attn_params->max_prefix_length > 0) {
+            auto device = cp_pos.device();
+            auto per_token_prefix =
+                at::repeat_interleave(attn_inputs.prefix_lengths.to(device), attn_inputs.input_lengths.to(device));
+            cp_pos = cp_pos + per_token_prefix;
+        }
+        attn_params->cp_position_ids = cp_pos;
     }
+
     return attn_params;
 }
 
