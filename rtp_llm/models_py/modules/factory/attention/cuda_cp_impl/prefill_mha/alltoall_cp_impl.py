@@ -245,7 +245,7 @@ class PCPAll2AllAttnOp:
                     positions=self.all_shuffle_indices[self.prefill_cp_rank],
                     paged_kv_cache=kv_cache_tensor,
                     kv_indices=params.page_indice_d,
-                    kv_indptr=params.prefill_ragged_kv_len_indptr_d,
+                    kv_indptr=params.decode_page_indptr_d,
                     kv_last_page_len=params.paged_kv_last_page_len_d,
                     kv_layout="HND",
                 )
@@ -291,7 +291,7 @@ class PCPAll2AllAttnOp:
                     positions=self.all_shuffle_indices[src_rank],
                     paged_kv_cache=kv_cache_tensor,
                     kv_indices=params.page_indice_d,
-                    kv_indptr=params.prefill_ragged_kv_len_indptr_d,
+                    kv_indptr=params.decode_page_indptr_d,
                     kv_last_page_len=params.paged_kv_last_page_len_d,
                     kv_layout="HND",
                 )

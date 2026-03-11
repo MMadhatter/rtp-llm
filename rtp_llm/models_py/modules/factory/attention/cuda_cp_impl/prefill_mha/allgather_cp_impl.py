@@ -203,7 +203,7 @@ class PCPAllGatherAttnOp:
             positions=params.positions_d,
             paged_kv_cache=kv_cache_tensor,
             kv_indices=params.page_indice_d,
-            kv_indptr=params.prefill_ragged_kv_len_indptr_d,
+            kv_indptr=params.decode_page_indptr_d,
             kv_last_page_len=params.paged_kv_last_page_len_d,
             kv_layout="HND",
         )
@@ -215,7 +215,6 @@ class PCPAllGatherAttnOp:
         k1 = torch.index_select(all_keys, 0, self.kv1_idx).contiguous()
         v0 = torch.index_select(all_values, 0, self.kv0_idx).contiguous()
         v1 = torch.index_select(all_values, 0, self.kv1_idx).contiguous()
-
         if params.prefill_with_prefix:
             prefix_out, prefix_lse = self.prefill_wrappers["paged"]["prefix"].run(
                 q_reshaped, kv_cache_tensor, return_lse=True
@@ -240,7 +239,7 @@ class PCPAllGatherAttnOp:
                 s_b=lse1,
             )
         else:
-            out0 = self.prefill_wrappers["ragged"]["part0"].run(q0, k0, v0)
-            out1 = self.prefill_wrappers["ragged"]["part1"].run(q1, k1, v1)
-
-        return torch.cat([out0, out1], dim=0)
+            output = torch.empty_like(q_reshaped)
+            output[self.q0_idx] = self.prefill_wrappers["part0"].run(q0, k0, v0)
+            output[self.q1_idx] = self.prefill_wrappers["part1"].run(q1, k1, v1)
+            return output
