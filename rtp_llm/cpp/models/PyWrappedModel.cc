@@ -229,6 +229,11 @@ std::optional<PyCacheStoreInputs> PyWrappedModel::prepareWriteCacheParams(const 
                                               inputs.warmup,
                                               description_.attention_conf.use_mla
                                                   && device_->mla_ops_type != rtp_llm::MlaOpsType::MHA};
+        const auto&        cp_cfg = device_->initParamsRef().parallelism_config.prefill_cp_config;
+        if (cp_cfg.kv_cache_sharded && device_props_.tp_size > 1) {
+            cache_store_inputs.cp_slot_mapper = std::make_shared<rtp_llm::CPSlotMapper>(
+                device_props_.tp_rank, device_props_.tp_size, inputs.seq_size_per_block);
+        }
         params = cache_store_inputs;
     }
     return params;
@@ -329,13 +334,13 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         torch::Tensor input_hiddens =
             inputs.last_hidden_states ? Buffer2torchTensor(inputs.last_hidden_states, false) : torch::empty({0});
 
-        auto                   attention_inputs      = buildPyAttentionInputs(inputs);
-        auto                   bert_embedding_inputs = buildBertEmbeddingInputs(inputs);
+        auto attention_inputs      = buildPyAttentionInputs(inputs);
+        auto bert_embedding_inputs = buildBertEmbeddingInputs(inputs);
 
         if (device_props_.enable_prefill_cp) {
             attention_inputs.context_parallel_info = cp_params;
         }
- 
+
         BufferPtr              kv_cache_block_id_device;
         std::vector<BufferPtr> kv_cache_block_id_device_by_group;
         if (!inputs.warmup && inputs.pd_separation) {

@@ -42,7 +42,8 @@ void WriteCacheStoreOp(const torch::Tensor&                         input_length
                                 cache_store_inputs.model_id,
                                 cache_store_inputs.decode_entrance,
                                 cache_store_inputs.warmup,
-                                kv_cache.value().layer_id};
+                                kv_cache.value().layer_id,
+                                cache_store_inputs.cp_slot_mapper};
 
         KvCacheInfo kv_cache_info;
         // kv_cache_buffer uses kv block base address (compatible with existing cache store writer which writes "k_").
