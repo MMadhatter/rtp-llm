@@ -93,6 +93,11 @@ class Indexer(nn.Module):
             is_neox_style=self.is_neox_style,
         )
 
+    def _is_cp_prefill(self) -> bool:
+        """Check if any form of CP is enabled (zigzag or round-robin)."""
+        cp = self.parallelism_config.prefill_cp_config
+        return cp.is_enabled() or cp.is_prefill_enabled()
+
     # TODO: fuse kernel here
     def _get_logits_head_gate(
         self, x: torch.Tensor, q_scale: torch.Tensor
@@ -117,7 +122,7 @@ class Indexer(nn.Module):
         k = self.k_norm(k)
 
         # Apply RoPE and Hadamard transform using IndexerOp
-        if self.parallelism_config.prefill_cp_config.is_enabled():
+        if self._is_cp_prefill():
             query, key = self.indexer_op.apply_rope_and_rotate_q_k_cp(
                 q, k, flashmla_params.positions_d
             )
@@ -163,7 +168,7 @@ class Indexer(nn.Module):
 
         if (
             attention_inputs.is_prefill
-            and self.parallelism_config.prefill_cp_config.is_enabled()
+            and self._is_cp_prefill()
         ):
             assert cp_params is not None, "cp_params is required for prefill CP"
             # Use indices from cp_params (packed by SparseMlaCpImpl.create_params)
@@ -184,7 +189,7 @@ class Indexer(nn.Module):
         # Quantize query and key using IndexerOp
         if (
             attention_inputs.is_prefill
-            and self.parallelism_config.prefill_cp_config.is_enabled()
+            and self._is_cp_prefill()
         ):
             q_fp8, q_scale = self.indexer_op.quant_q_k_cp(
                 query,
@@ -192,6 +197,7 @@ class Indexer(nn.Module):
                 kv_cache,
                 fmha_params.slot_mapping,
                 attention_inputs,
+                kv_cache_sharded=getattr(cp_params, 'kv_cache_sharded', False),
             )
         else:
             q_fp8, q_scale = self.indexer_op.quant_q_k(
@@ -207,7 +213,7 @@ class Indexer(nn.Module):
                 q_fp8, weights, kv_cache, fmha_params, attention_inputs
             )
         else:
-            if self.parallelism_config.prefill_cp_config.is_enabled():
+            if self._is_cp_prefill():
                 topk_result = self.indexer_op._get_topk_ragged_cp(
                     q_fp8,
                     weights,
