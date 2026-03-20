@@ -1,6 +1,6 @@
 import argparse
 
-from rtp_llm.ops import CPRotateMethod
+from rtp_llm.ops import CPRotateMethod, CPProcessorType
 
 
 def str2bool(v):
