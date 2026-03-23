@@ -5,7 +5,7 @@ from torch import nn
 
 from rtp_llm.models_py.modules import IndexerOp, LayerNorm
 from rtp_llm.models_py.modules.factory import LinearFactory
-from rtp_llm.ops import AttentionConfigs, HWKernelConfig, ParallelismConfig
+from rtp_llm.ops import AttentionConfigs, CPProcessorType, HWKernelConfig, ParallelismConfig
 from rtp_llm.ops.compute_ops import KVCache, rtp_llm_ops
 from rtp_llm.utils.model_weight import W
 
@@ -45,6 +45,12 @@ class Indexer(nn.Module):
         self.indexer_size = self.index_head_dim / 2 + self.index_head_dim / 128 * 2
         self.is_neox_style = attn_config.rope_config.indexer_is_neox_style
         self.parallelism_config = parallelism_config
+
+        cp = parallelism_config.prefill_cp_config
+        self._is_cp = cp.is_enabled() or cp.is_prefill_enabled()
+        self._is_roundrobin = (
+            self._is_cp and cp.processor_type == CPProcessorType.ROUND_ROBIN
+        )
 
         self.wq_b = LinearFactory.create_linear_from_weights(
             weights,
@@ -95,8 +101,7 @@ class Indexer(nn.Module):
 
     def _is_cp_prefill(self) -> bool:
         """Check if any form of CP is enabled (zigzag or round-robin)."""
-        cp = self.parallelism_config.prefill_cp_config
-        return cp.is_enabled() or cp.is_prefill_enabled()
+        return self._is_cp
 
     # TODO: fuse kernel here
     def _get_logits_head_gate(
@@ -121,8 +126,8 @@ class Indexer(nn.Module):
         k = self.wk(x)
         k = self.k_norm(k)
 
-        # Apply RoPE and Hadamard transform using IndexerOp
-        if self._is_cp_prefill():
+        # Apply RoPE and Hadamard transform
+        if self._is_cp:
             query, key = self.indexer_op.apply_rope_and_rotate_q_k_cp(
                 q, k, flashmla_params.positions_d
             )
@@ -130,7 +135,6 @@ class Indexer(nn.Module):
             query, key = self.indexer_op.apply_rope_and_rotate_q_k(
                 q, k, flashmla_params.positions_d
             )
-
         return query, key
 
     def _get_k_bf16(
@@ -138,14 +142,61 @@ class Indexer(nn.Module):
         x: torch.Tensor,
         flashmla_params: Any,
     ):
-        # Compute only key, skip query
         k = self.wk(x)
         k = self.k_norm(k)
-
-        # Apply RoPE and Hadamard transform using IndexerOp
         key = self.indexer_op.apply_rope_and_rotate_k(k, flashmla_params.positions_d)
-
         return key
+
+    # ---- CP helpers ----
+
+    def _setup_cp_params(self, cp_params: Any) -> None:
+        """Copy CP indices from cp_params into indexer_op state."""
+        op = self.indexer_op
+        op.q0_idx = cp_params.q0_idx
+        op.q1_idx = cp_params.q1_idx
+        op.q0_idx_global = cp_params.q0_idx_global
+        op.q1_idx_global = cp_params.q1_idx_global
+        op.kv_restore_unpad_indices = cp_params.kv_restore_unpad_indices
+        op.total_global_ids = cp_params.total_global_ids
+        op.total_local_ids = cp_params.total_local_ids
+        op.cu_kv_seqlens_global = cp_params.cu_kv_seqlens_global
+
+    def _quant_q_k_cp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        kv_cache: KVCache,
+        slot_mapping: torch.Tensor,
+        attention_inputs: Any,
+        cp_params: Any,
+    ):
+        """CP quant: zigzag uses full cache, round-robin uses sharded cache + workspace."""
+        kv_cache_sharded = self._is_roundrobin and getattr(
+            cp_params, 'kv_cache_sharded', False
+        )
+        return self.indexer_op.quant_q_k_cp(
+            query, key, kv_cache, slot_mapping, attention_inputs,
+            kv_cache_sharded=kv_cache_sharded,
+        )
+
+    def _get_topk_cp(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache: KVCache,
+        fmha_params: Any,
+        attention_inputs: Any,
+    ):
+        """CP topk: zigzag reads from full cache, round-robin reads from workspace."""
+        if self._is_roundrobin:
+            return self.indexer_op._get_topk_ragged_cp_roundrobin(
+                q_fp8, weights, fmha_params,
+            )
+        return self.indexer_op._get_topk_ragged_cp_zigzag(
+            q_fp8, weights, kv_cache, fmha_params, attention_inputs,
+        )
+
+    # ---- forward ----
 
     def forward(
         self,
@@ -159,45 +210,23 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         # fast path: only compute and store k cache, skip all q and weights ops
         if use_fast_path:
-            # Compute and apply transformations to key
             key = self._get_k_bf16(hidden_states, fmha_params)
-
-            # Use IndexerOp to quantize and cache key
             self.indexer_op.quant_k_only(key, kv_cache, fmha_params.slot_mapping)
             return None
 
-        if (
-            attention_inputs.is_prefill
-            and self._is_cp_prefill()
-        ):
+        is_cp_prefill = attention_inputs.is_prefill and self._is_cp
+        if is_cp_prefill:
             assert cp_params is not None, "cp_params is required for prefill CP"
-            # Use indices from cp_params (packed by SparseMlaCpImpl.create_params)
-            self.indexer_op.q0_idx = cp_params.q0_idx
-            self.indexer_op.q1_idx = cp_params.q1_idx
-            self.indexer_op.q0_idx_global = cp_params.q0_idx_global
-            self.indexer_op.q1_idx_global = cp_params.q1_idx_global
-            self.indexer_op.kv_restore_unpad_indices = (
-                cp_params.kv_restore_unpad_indices
-            )
-            self.indexer_op.total_global_ids = cp_params.total_global_ids
-            self.indexer_op.total_local_ids = cp_params.total_local_ids
-            self.indexer_op.cu_kv_seqlens_global = cp_params.cu_kv_seqlens_global
+            self._setup_cp_params(cp_params)
 
         # Compute query and key with RoPE and rotation
         query, key = self._get_q_k_bf16(q_lora, hidden_states, fmha_params)
 
-        # Quantize query and key using IndexerOp
-        if (
-            attention_inputs.is_prefill
-            and self._is_cp_prefill()
-        ):
-            q_fp8, q_scale = self.indexer_op.quant_q_k_cp(
-                query,
-                key,
-                kv_cache,
-                fmha_params.slot_mapping,
-                attention_inputs,
-                kv_cache_sharded=getattr(cp_params, 'kv_cache_sharded', False),
+        # Quantize query and key
+        if is_cp_prefill:
+            q_fp8, q_scale = self._quant_q_k_cp(
+                query, key, kv_cache, fmha_params.slot_mapping,
+                attention_inputs, cp_params,
             )
         else:
             q_fp8, q_scale = self.indexer_op.quant_q_k(
@@ -207,25 +236,15 @@ class Indexer(nn.Module):
         # Compute weights for attention
         weights = self._get_logits_head_gate(hidden_states, q_scale)
 
-        # Compute TopK using IndexerOp
+        # Compute TopK
         if not attention_inputs.is_prefill:
-            topk_result = self.indexer_op._get_topk_paged(
+            return self.indexer_op._get_topk_paged(
                 q_fp8, weights, kv_cache, fmha_params, attention_inputs
             )
-        else:
-            if self._is_cp_prefill():
-                topk_result = self.indexer_op._get_topk_ragged_cp(
-                    q_fp8,
-                    weights,
-                    kv_cache,
-                    fmha_params,
-                    attention_inputs,
-                    cp_rank=self.parallelism_config.tp_rank,
-                    cp_size=self.parallelism_config.tp_size,
-                )
-            else:
-                topk_result = self.indexer_op._get_topk_ragged(
-                    q_fp8, weights, kv_cache, fmha_params, attention_inputs
-                )
-
-        return topk_result
+        if is_cp_prefill:
+            return self._get_topk_cp(
+                q_fp8, weights, kv_cache, fmha_params, attention_inputs
+            )
+        return self.indexer_op._get_topk_ragged(
+            q_fp8, weights, kv_cache, fmha_params, attention_inputs
+        )

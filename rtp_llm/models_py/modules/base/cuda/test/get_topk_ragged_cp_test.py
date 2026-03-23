@@ -1,5 +1,5 @@
 """
-Unit test for IndexerOp._get_topk_ragged_cp.
+Unit test for IndexerOp CP topk methods (_get_topk_ragged_cp_zigzag / _roundrobin).
 
 Tests the CP path for computing TopK indices in prefill with context parallel:
 single rank with one chunk so that generate_q_indices yields valid indices
@@ -39,7 +39,7 @@ def _check_cuda_deep_gemm():
 
 
 CUDA_DEEPGEMM_OK = _check_cuda_deep_gemm()
-SKIP_REASON = "CUDA and deep_gemm required for IndexerOp._get_topk_ragged_cp"
+SKIP_REASON = "CUDA and deep_gemm required for IndexerOp CP topk tests"
 
 
 def _setup_indexer_op_cp(
@@ -80,7 +80,7 @@ class FmhaParams:
 
 
 class GetTopkRaggedCPTest(TestCase):
-    """Test IndexerOp._get_topk_ragged_cp with single rank and one chunk."""
+    """Test IndexerOp._get_topk_ragged_cp_zigzag with single rank and one chunk."""
 
     def setUp(self):
         if not CUDA_DEEPGEMM_OK:
@@ -164,14 +164,12 @@ class GetTopkRaggedCPTest(TestCase):
         fmha_params.expanded_seq_lens = expanded_seq_lens
         fmha_params.topk_indices_offset = topk_indices_offset
 
-        topk = op._get_topk_ragged_cp(
+        topk = op._get_topk_ragged_cp_zigzag(
             q_fp8,
             weights,
             kv_cache,
             fmha_params,
             attn_inputs,
-            cp_rank,
-            cp_size,
         )
 
         self.assertIsInstance(topk, torch.Tensor)
@@ -189,7 +187,7 @@ class GetTopkRaggedCPTest(TestCase):
         """
         Single CP rank, 8 new tokens, 128 prefix tokens (reuse cache).
 
-        Verifies that _get_topk_ragged_cp correctly allocates buffers using
+        Verifies that _get_topk_ragged_cp_zigzag correctly allocates buffers using
         cu_kv_seqlens_global[-1] = prefix_len + new_tokens, rather than
         the old kv_restore_unpad_indices.shape[0] = new_tokens only.
 
@@ -279,14 +277,12 @@ class GetTopkRaggedCPTest(TestCase):
         fmha_params.expanded_seq_lens = expanded_seq_lens
         fmha_params.topk_indices_offset = topk_indices_offset
 
-        topk = op._get_topk_ragged_cp(
+        topk = op._get_topk_ragged_cp_zigzag(
             q_fp8,
             weights,
             kv_cache,
             fmha_params,
             attn_inputs,
-            cp_rank,
-            cp_size,
         )
 
         self.assertIsInstance(topk, torch.Tensor)
@@ -312,8 +308,8 @@ class GetTopkRaggedCPTest(TestCase):
             "With prefix_len=128, topk should reference some prefix positions",
         )
 
-    def test_workspace_buffer_reuse(self):
-        """Verify that workspace buffers are reused across calls."""
+    def test_zigzag_multiple_calls(self):
+        """Verify that zigzag topk works correctly across multiple calls."""
         index_n_heads = 32
         index_head_dim = 128
         index_topk = 2048
@@ -379,37 +375,17 @@ class GetTopkRaggedCPTest(TestCase):
             total_tokens, dtype=torch.int32, device=device
         )
 
-        self.assertIsNone(op._workspace_k_fp8)
-
-        op._get_topk_ragged_cp(
-            q_fp8,
-            weights,
-            kv_cache,
-            fmha_params,
-            attn_inputs,
-            cp_rank,
-            cp_size,
+        topk1 = op._get_topk_ragged_cp_zigzag(
+            q_fp8, weights, kv_cache, fmha_params, attn_inputs,
         )
+        self.assertIsNotNone(topk1)
 
-        self.assertIsNotNone(op._workspace_k_fp8)
-        buf1_ptr = op._workspace_k_fp8.data_ptr()
-
-        # Second call should reuse the same buffer
-        op._get_topk_ragged_cp(
-            q_fp8,
-            weights,
-            kv_cache,
-            fmha_params,
-            attn_inputs,
-            cp_rank,
-            cp_size,
+        # Second call should also succeed
+        topk2 = op._get_topk_ragged_cp_zigzag(
+            q_fp8, weights, kv_cache, fmha_params, attn_inputs,
         )
-
-        self.assertEqual(
-            op._workspace_k_fp8.data_ptr(),
-            buf1_ptr,
-            "Workspace buffer should be reused across calls",
-        )
+        self.assertIsNotNone(topk2)
+        self.assertEqual(topk1.shape, topk2.shape)
 
 
 if __name__ == "__main__":

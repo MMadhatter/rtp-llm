@@ -1,5 +1,5 @@
 """
-Unit tests for SparseMlaFp8CPOp (Context Parallel prefill for Sparse MLA FP8).
+Unit tests for ZigZagSparseMlaFp8CPOp (Context Parallel prefill for Sparse MLA FP8).
 
 Tests the CP path with tp_size=1 (single rank): all_gather is identity,
 so output should match non-CP SparseMlaFp8Op on the same inputs.
@@ -69,7 +69,7 @@ def _make_block_table(
 
 @skipIf(not CUDA_FLASHMLA_OK, SKIP_REASON)
 class SparseMlaFp8CPOpTest(TestCase):
-    """Test SparseMlaFp8CPOp with single rank (tp_size=1)."""
+    """Test ZigZagSparseMlaFp8CPOp with single rank (tp_size=1)."""
 
     @classmethod
     def setUpClass(cls):
@@ -92,7 +92,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         Run both CP op and non-CP op on same inputs and check output shape and equality.
         """
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl import (
-            SparseMlaFp8CPOp,
+            ZigZagSparseMlaFp8CPOp,
         )
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
             SparseMlaFp8Op,
@@ -197,7 +197,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         kv_cache = KVCache()
         kv_cache.kv_cache_base = kv_cache_base
 
-        cp_op = SparseMlaFp8CPOp(
+        cp_op = ZigZagSparseMlaFp8CPOp(
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
@@ -262,7 +262,7 @@ class SparseMlaFp8CPOpTest(TestCase):
     def test_cp_op_forward_output_shape(self):
         """CP op forward returns correct shape [total_q_len, num_heads, kv_lora_rank]."""
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl import (
-            SparseMlaFp8CPOp,
+            ZigZagSparseMlaFp8CPOp,
         )
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.mla_kv_cache_write_op import (
             MlaKVCacheWriteOp,
@@ -354,7 +354,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         kv_cache = KVCache()
         kv_cache.kv_cache_base = kv_cache_base
 
-        cp_op = SparseMlaFp8CPOp(
+        cp_op = ZigZagSparseMlaFp8CPOp(
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
@@ -404,7 +404,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         (new tokens only).
         """
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl import (
-            SparseMlaFp8CPOp,
+            ZigZagSparseMlaFp8CPOp,
         )
         from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
             SparseMlaFp8Op,
@@ -512,7 +512,7 @@ class SparseMlaFp8CPOpTest(TestCase):
         kv_cache = KVCache()
         kv_cache.kv_cache_base = kv_cache_base
 
-        cp_op = SparseMlaFp8CPOp(
+        cp_op = ZigZagSparseMlaFp8CPOp(
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
