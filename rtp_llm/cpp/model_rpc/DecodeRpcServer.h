@@ -55,9 +55,9 @@ public:
         int64_t                          timeout_ms;
         int                              partition_count;
         int                              partition_id;
-        int32_t                          prefill_cp_size;
 
         grpc::ServerContext* server_context;
+        int32_t                          prefill_cp_size;
     };
 
 private:
