@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <numeric>
 #include <cuda_runtime.h>
+
+#include <iostream>
 using namespace torch_ext;
 
 namespace rtp_llm {
@@ -475,6 +477,31 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
         auto          batch_indice_ptr = batch_indice_h.data_ptr<int32_t>();
         auto          positions_ptr    = positions_h.data_ptr<int32_t>();
 
+        // DEBUG: dump positions, batch_indice, and CP params
+        {
+            std::cout << "[FlashInferMlaParams::fillParams] input_token_num=" << input_token_num
+                      << " cp_rank=" << cp_rank << " cp_size=" << cp_size << " kv_cache_sharded=" << kv_cache_sharded
+                      << " seq_size_per_block=" << seq_size_per_block << " max_blocks=" << max_blocks << std::endl;
+            std::cout << "  positions:";
+            for (int64_t i = 0; i < positions_h.numel(); ++i) {
+                std::cout << positions_ptr[i] << " ";
+            }
+            std::cout << std::endl;
+            std::cout << "  batch_indice:";
+            for (int64_t i = 0; i < batch_indice_h.numel(); ++i) {
+                std::cout << batch_indice_ptr[i] << " ";
+            }
+            std::cout << std::endl;
+            // Also dump block_table for batch 0
+            if (max_blocks > 0) {
+                std::cout << "  block_table[batch=0]: ";
+                for (int64_t j = 0; j < t_kv_cache_block_id_host.numel(); ++j) {
+                    std::cout << block_table_ptr[j] << " ";
+                }
+                std::cout << std::endl;
+            }
+        }
+
         slot_mapping_h_       = buf_h_i64_.slice(0, 0, input_token_num).reshape({input_token_num});
         auto slot_mapping_ptr = slot_mapping_h_.data_ptr<int64_t>();
 
@@ -486,6 +513,7 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
             const int32_t position = positions_ptr[i];
 
             if (cp_sharded) {
+                std::cout << "cp slotmapping use cp_sharded" << std::endl;
                 const int32_t target_rank = (position % virtual_block_size) % cp_size;
                 if (target_rank != cp_rank) {
                     slot_mapping_ptr[i] = -1;

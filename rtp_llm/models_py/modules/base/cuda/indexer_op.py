@@ -104,9 +104,7 @@ class IndexerOp(nn.Module):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.is_neox_style = is_neox_style
-        self.kv_len = (
-            None  # set in quant_q_k_cp (total KV length) for CP topk methods
-        )
+        self.kv_len = None  # set in quant_q_k_cp (total KV length) for CP topk methods
         self.q0_idx = None
         self.q1_idx = None
         self.q0_idx_global = None
@@ -117,6 +115,7 @@ class IndexerOp(nn.Module):
         self.cu_kv_seqlens_global = None
         self._indexer_workspace = None
         self._indexer_workspace_block_table = None
+        self._ws_slot_mapping = None
 
     def apply_rope_and_rotate_q_k(
         self,
@@ -181,39 +180,11 @@ class IndexerOp(nn.Module):
         k_pe = k[:, :pe_dim]
 
         if self.cos_sin_cache is not None and self.total_local_ids.size(0) > 0:
-            # total_local_ids index into local q/k (this rank's chunk)
-            n_local = q_pe.size(0)
-            if self.total_local_ids.numel() > 0:
-                max_lid = self.total_local_ids.max().item()
-                if max_lid >= n_local:
-                    raise ValueError(
-                        f"total_local_ids out of range for q/k: "
-                        f"max(total_local_ids)={max_lid}, q.size(0)={n_local}. "
-                        "Check CP plan() local chunk vs actual input size."
-                    )
-            if self.total_global_ids.numel() > 0:
-                max_gid = self.total_global_ids.max().item()
-                if max_gid >= positions.size(0):
-                    raise ValueError(
-                        f"total_global_ids out of range for positions: "
-                        f"max(total_global_ids)={max_gid}, positions.size(0)={positions.size(0)}. "
-                        "Likely padded-to-unpadded coordinate conversion is missing in plan()."
-                    )
             q_pe_local = q_pe[self.total_local_ids]  # element wise
             k_pe_local = k_pe[self.total_local_ids]  # element wise
             k_rope = k_pe_local.unsqueeze(1)
-            pos_ids_q0_global = positions[self.total_global_ids]  # element wise
-            # To isolate async CUDA errors from earlier kernels, uncomment: torch.cuda.synchronize()
-            # RoPE kernel may device-assert if pos_ids exceed cos_sin_cache length
-            max_cache_pos = self.cos_sin_cache.shape[0]
-            if pos_ids_q0_global.numel() > 0:
-                pos_max = pos_ids_q0_global.max().item()
-                if pos_max >= max_cache_pos:
-                    raise ValueError(
-                        f"RoPE pos_ids out of range: max(pos_ids)={pos_max} >= "
-                        f"cos_sin_cache.shape[0]={max_cache_pos}. "
-                        "Check max_position_embeddings vs actual sequence length."
-                    )
+            pos_ids_q0_global = positions  # element wise
+
             rope._apply_rope_pos_ids_cos_sin_cache(
                 q=q_pe_local,
                 k=k_rope,
@@ -398,6 +369,14 @@ class IndexerOp(nn.Module):
         )
 
         if kv_cache_sharded:
+            # slot_mapping and block_table are pre-computed in _setup_cp_params.
+            assert (
+                self._ws_slot_mapping is not None
+            ), "ws_slot_mapping must be pre-computed via _setup_cp_params before quant_q_k_cp"
+            assert (
+                self._indexer_workspace_block_table is not None
+            ), "indexer_workspace_block_table must be pre-computed via _setup_cp_params before quant_q_k_cp"
+
             # Build temporary indexer workspace: write full restored_key into a
             # contiguous paged tensor so _get_topk_ragged_cp_roundrobin can read complete K.
             total_kv = restored_key.size(0)
@@ -405,47 +384,21 @@ class IndexerOp(nn.Module):
             cache_stride = kv_cache.kv_scale_base.size(2)
             total_pages = (total_kv + cache_block_size - 1) // cache_block_size
 
-            workspace = torch.zeros(
-                total_pages, cache_block_size, cache_stride,
+            workspace = torch.empty(
+                total_pages,
+                cache_block_size,
+                cache_stride,
                 dtype=kv_cache.kv_scale_base.dtype,
                 device=restored_key.device,
-            )
-            workspace_slot_mapping = torch.arange(
-                total_kv, dtype=torch.int64, device=restored_key.device,
             )
             rtp_llm_ops.indexer_k_quant_and_cache(
                 restored_key,
                 workspace,
-                workspace_slot_mapping,
+                self._ws_slot_mapping,
                 self.block_size,
                 self.scale_fmt,
             )
-
-            # Build workspace block_table from cu_kv_seqlens_global
-            cu_kv = self.cu_kv_seqlens_global.cpu()
-            batch_size = cu_kv.size(0) - 1
-            max_pages_per_req = 0
-            page_starts = []
-            page_counts = []
-            for i in range(batch_size):
-                start_token = cu_kv[i].item()
-                end_token = cu_kv[i + 1].item()
-                start_page = start_token // cache_block_size
-                n_pages = (end_token + cache_block_size - 1) // cache_block_size - start_page
-                page_starts.append(start_page)
-                page_counts.append(n_pages)
-                max_pages_per_req = max(max_pages_per_req, n_pages)
-
-            workspace_block_table = torch.zeros(
-                batch_size, max_pages_per_req,
-                dtype=torch.int32, device=restored_key.device,
-            )
-            for i in range(batch_size):
-                for j in range(page_counts[i]):
-                    workspace_block_table[i, j] = page_starts[i] + j
-
             self._indexer_workspace = workspace
-            self._indexer_workspace_block_table = workspace_block_table
         else:
             self._indexer_workspace = None
             self._indexer_workspace_block_table = None
@@ -652,7 +605,11 @@ class IndexerOp(nn.Module):
             device=device,
         )
         rtp_llm_ops.cp_gather_indexer_k_quant_cache(
-            cache_tensor, k_fp8, k_scale, block_table, self.cu_kv_seqlens_global,
+            cache_tensor,
+            k_fp8,
+            k_scale,
+            block_table,
+            self.cu_kv_seqlens_global,
         )
         return k_fp8, k_scale
 
@@ -709,7 +666,12 @@ class IndexerOp(nn.Module):
         topk_off = fmha_params.topk_indices_offset[self.total_global_ids]
 
         logits = deep_gemm.fp8_mqa_logits(
-            q0, kv_fp8, weights_sq0, ks, ke, clean_logits=False,
+            q0,
+            kv_fp8,
+            weights_sq0,
+            ks,
+            ke,
+            clean_logits=False,
         )
         return fast_topk_transform_ragged_fused(
             score=logits,

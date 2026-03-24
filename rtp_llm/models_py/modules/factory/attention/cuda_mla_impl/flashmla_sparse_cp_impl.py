@@ -13,7 +13,11 @@ try:
     if torch.version.cuda:
         major, minor = map(int, torch.version.cuda.split(".")[:2])
         if (major, minor) >= (12, 9):
-            from flash_mla import flash_mla_sparse_fwd, flash_mla_with_kvcache, get_mla_metadata
+            from flash_mla import (
+                flash_mla_sparse_fwd,
+                flash_mla_with_kvcache,
+                get_mla_metadata,
+            )
 
             _FLASH_MLA_AVAILABLE = True
 except (ImportError, AttributeError, ValueError) as e:
@@ -27,18 +31,22 @@ from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_mha.cp_uti
     generate_kv_indices,
     generate_q_indices,
 )
-from rtp_llm.ops import AttentionConfigs, CPProcessorType, FMHAConfig, FMHAType, ParallelismConfig, compute_ops
-from rtp_llm.ops.compute_ops import (
-    KVCache,
-    PyAttentionInputs,
-    rtp_llm_ops,
+from rtp_llm.ops import (
+    AttentionConfigs,
+    CPProcessorType,
+    FMHAConfig,
+    FMHAType,
+    ParallelismConfig,
+    compute_ops,
 )
+from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs, rtp_llm_ops
 
 from .flashmla_sparse_impl import (
     SparseMlaFp8DecodeParams,
     SparseMlaFp8Op,
     SparseMlaImpl,
 )
+
 
 class ZigZagSparseMlaFp8CPOp(SparseMlaFp8Op):
     """
@@ -81,6 +89,7 @@ class ZigZagSparseMlaFp8CPOp(SparseMlaFp8Op):
         self.prefill_cp_size = parallelism_config.tp_size
         self.device = torch.cuda.current_device()
         self.kv_restore_unpad_indices = None
+        self.kv_cache_sharded = False
 
         self.q0_idx = None
         self.q1_idx = None
@@ -228,7 +237,7 @@ class ZigZagSparseMlaFp8CPOp(SparseMlaFp8Op):
         )
         global_indices_3d = global_indices_2d.unsqueeze(1).expand(
             num_tokens, h_kv, topk
-        )        
+        )
         return global_indices_3d
 
     def forward(
@@ -267,7 +276,10 @@ class ZigZagSparseMlaFp8CPOp(SparseMlaFp8Op):
         restored_k_pe = gathered_k_pe[self.kv_restore_unpad_indices]
 
         self.kv_cache_write_op.forward(
-            restored_ckv, restored_k_pe, kv_cache, self.mla_params,
+            restored_ckv,
+            restored_k_pe,
+            kv_cache,
+            self.mla_params,
         )
 
         # TODO: write cache for each rank
@@ -286,7 +298,7 @@ class ZigZagSparseMlaFp8CPOp(SparseMlaFp8Op):
         ).view(torch.uint8)
         if kv_cache_flat.ndim == 3:
             kv_cache_flat = kv_cache_flat.unsqueeze(-2)
-        
+
         if layer_id == 0:
             meta = self._fp8_kernel_metadata_q0
             if meta is not None:
@@ -375,6 +387,7 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
         self.q1_idx_global = None
         self.kv_cache_write_op = None
         self.write_cache_store_impl = None
+        self._ws_fp8 = None
 
     def plan(
         self, mla_params: rtp_llm_ops.FlashInferMlaAttnParams, block_table: torch.Tensor
@@ -403,25 +416,22 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
         C = self.prefill_cp_size
         local_tokens = sum(chunk_lengths_list)
 
-        # Round-robin: rank R owns tokens at local positions [0, chunk_len) per stream.
-        # Their global (unpadded) positions are R + j*C within each stream.
-        # Pad tokens sit at the tail of each stream and don't affect causal attention,
-        # so we include all local tokens and clamp pad positions to the last valid token.
+        actual_input_lengths_list = list(cp_info.prefill_actual_input_lengths_cpu)
+        # Round-robin: rank R owns local token j whose global position is
+        # offset + j * C + R within each batch stream (no padding considered).
         _empty = torch.empty(0, device=self.device, dtype=torch.long)
-        self.total_local_ids = torch.arange(local_tokens, device=self.device, dtype=torch.long)
+        self.total_local_ids = torch.arange(
+            local_tokens, device=self.device, dtype=torch.long
+        )
 
-        # Compute global (unpadded) position for each local token.
-        # actual_seq_len per stream = chunk_length * cp_size - padding_length
         global_pieces: list[torch.Tensor] = []
-        unpadded_offset = 0
+        global_offset = 0
         for s, cl in enumerate(chunk_lengths_list):
-            actual_seq_len = cl * C - int(padding_lengths_list[s])
+            seq_len = int(actual_input_lengths_list[s])
             js = torch.arange(cl, device=self.device, dtype=torch.long)
-            global_pos = js * C + R + unpadded_offset
-            # Clamp pad tokens to last valid position (they won't affect causal attention)
-            global_pos = torch.clamp(global_pos, max=unpadded_offset + actual_seq_len - 1)
+            global_pos = torch.clamp(js * C + R, max=seq_len - 1) + global_offset
             global_pieces.append(global_pos)
-            unpadded_offset += actual_seq_len
+            global_offset += seq_len
 
         self.total_global_ids = torch.cat(global_pieces) if global_pieces else _empty
 
@@ -452,26 +462,11 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
             "kv_cache_sharded (round-robin) with prefix cache is not yet supported. "
             f"Got prefix_lengths sum = {prefix_lengths.sum().item()}"
         )
-        cu_kv = self.cu_kv_seqlens_global.cpu()
-        batch_size = cu_kv.size(0) - 1
-        if batch_size > 0:
-            starts = cu_kv[:-1]
-            ends = cu_kv[1:]
-            start_pages = starts // page_size
-            end_pages = (ends + page_size - 1) // page_size
-            pages_per_req = (end_pages - start_pages).int()
-            max_pages = int(pages_per_req.max().item())
-            col_idx = torch.arange(max_pages, dtype=torch.int32)
-            self._ws_block_table = (
-                start_pages.unsqueeze(1).int() + col_idx.unsqueeze(0)
-            ).to(self.device)
-            mask = col_idx.unsqueeze(0) >= pages_per_req.unsqueeze(1)
-            self._ws_block_table[mask] = 0
-        else:
-            self._ws_block_table = torch.zeros(0, 0, dtype=torch.int32, device=self.device)
-
-        # Workspace FP8 tensor allocated lazily on first forward
-        self._ws_fp8 = None
+        self._ws_block_table = common.build_contiguous_block_table(
+            self.cu_kv_seqlens_global,
+            page_size,
+            self.device,
+        )
 
         # get_mla_metadata for flash_mla kernel scheduling
         n_q = local_tokens
@@ -484,13 +479,16 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
                 num_heads_k=1,
                 is_fp8_kvcache=True,
             )
-            self._fp8_kernel_metadata_q0 = SparseMlaFp8DecodeParams(tile_sched, num_splits)
+            self._fp8_kernel_metadata_q0 = SparseMlaFp8DecodeParams(
+                tile_sched, num_splits
+            )
         else:
             self._fp8_kernel_metadata_q0 = None
 
-
     def _convert_topk_indices_to_workspace(
-        self, topk_indices: torch.Tensor, workspace_block_table: torch.Tensor,
+        self,
+        topk_indices: torch.Tensor,
+        workspace_block_table: torch.Tensor,
     ) -> torch.Tensor:
         if topk_indices.dim() == 2:
             num_tokens, topk = topk_indices.shape
@@ -506,6 +504,7 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
         from rtp_llm.models_py.triton_kernels.sparse_mla.block_index_to_global import (
             triton_convert_req_index_to_global_index,
         )
+
         global_indices_2d = triton_convert_req_index_to_global_index(
             req_id=req_id,
             block_table=workspace_block_table,
@@ -538,7 +537,10 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
 
         # Step 2: Write sharded cache (slot_mapping has -1 for non-owned tokens)
         self.kv_cache_write_op.forward(
-            restored_ckv, restored_k_pe, kv_cache, self.mla_params,
+            restored_ckv,
+            restored_k_pe,
+            kv_cache,
+            self.mla_params,
         )
         common.apply_write_cache_store(
             self.write_cache_store_impl, self.attn_inputs, kv_cache
@@ -548,25 +550,28 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
             return None
 
         # Step 3: Build temporary FP8 workspace from all-gathered KV
-        if self._ws_fp8 is None:
-            kv_dim_bytes = kv_cache.kv_cache_base.size(-1)
-            self._ws_fp8 = torch.zeros(
-                self._ws_total_pages, self.token_per_block, kv_dim_bytes,
-                dtype=kv_cache.kv_cache_base.dtype,
-                device=self.device,
-            )
-        else:
-            self._ws_fp8.zero_()
-
+        kv_dim_bytes = kv_cache.kv_cache_base.size(-1)
+        self._ws_fp8 = torch.empty(
+            self._ws_total_pages,
+            self.token_per_block,
+            kv_dim_bytes,
+            dtype=kv_cache.kv_cache_base.dtype,
+            device=self.device,
+        )
         scale = torch.tensor(1.0, dtype=torch.float32, device=self.device)
         compute_ops.concat_and_cache_mla(
-            restored_ckv, restored_k_pe, self._ws_fp8, self._ws_slot_mapping,
-            self.kv_cache_write_op.kv_cache_type, scale,
+            restored_ckv,
+            restored_k_pe,
+            self._ws_fp8,
+            self._ws_slot_mapping,
+            self.kv_cache_write_op.kv_cache_type,
+            scale,
         )
 
         # Step 4: Attention — all local q tokens attend to full global KV workspace
         workspace_topk = self._convert_topk_indices_to_workspace(
-            topk, self._ws_block_table,
+            topk,
+            self._ws_block_table,
         )
 
         kv_cache_flat = self._ws_fp8.view(torch.uint8)
@@ -657,20 +662,59 @@ class SparseMlaCpImpl(SparseMlaImpl):
         return FMHAType.CP_SPARSE_FLASHMLA
 
     def create_params(self, attn_inputs: PyAttentionInputs):
-        """Create FMHA parameters and pack CP indices into cp_params."""      
+        """Create FMHA parameters and pack CP indices into cp_params."""
         self.fmha_params = rtp_llm_ops.SparseMlaParams()
         self.rope_params = self.fmha_params
         self.prepare(attn_inputs)
+
+    def prepare(self, attn_inputs: PyAttentionInputs, forbid_realloc: bool = False):
+        """Override prepare to pass CP rank/size/kv_cache_sharded to fill_params."""
+        assert (
+            self.fmha_params is not None
+        ), "fmha_params should be initialized in __init__"
+
+        pc = self._cp_parallelism_config
+        self.fmha_params.fill_params(
+            attn_inputs,
+            self.seq_size_per_block,
+            forbid_realloc,
+            cp_rank=pc.tp_rank,
+            cp_size=pc.tp_size,
+            kv_cache_sharded=pc.prefill_cp_config.kv_cache_sharded,
+        )
+        self.fmha_impl.plan(self.fmha_params, attn_inputs.kv_cache_block_id_device)
+
+        # Build shared workspace block_table & slot_mapping (per-request, not per-layer)
+        impl = self.fmha_impl
+        ws_block_table = None
+        ws_slot_mapping = None
+        if getattr(impl, "kv_cache_sharded", False):
+            ws_slot_mapping = torch.arange(
+                impl._ws_total_kv,
+                dtype=torch.int64,
+                device=impl.device,
+            )
+            ws_block_table = common.build_contiguous_block_table(
+                impl.cu_kv_seqlens_global,
+                impl.token_per_block,
+                impl.device,
+            )
+            # Also set on fmha_impl so MLA forward can use them directly
+            impl._ws_slot_mapping = ws_slot_mapping
+            impl._ws_block_table = ws_block_table
+
         self.cp_params = SimpleNamespace(
-            kv_restore_unpad_indices=self.fmha_impl.kv_restore_unpad_indices,
-            q0_idx=self.fmha_impl.q0_idx,
-            q1_idx=self.fmha_impl.q1_idx,
-            q0_idx_global=self.fmha_impl.q0_idx_global,
-            q1_idx_global=self.fmha_impl.q1_idx_global,
-            total_global_ids=self.fmha_impl.total_global_ids,
-            total_local_ids=self.fmha_impl.total_local_ids,
-            cu_kv_seqlens_global=self.fmha_impl.cu_kv_seqlens_global,
-            kv_cache_sharded=self.fmha_impl.kv_cache_sharded,
+            kv_restore_unpad_indices=impl.kv_restore_unpad_indices,
+            q0_idx=impl.q0_idx,
+            q1_idx=impl.q1_idx,
+            q0_idx_global=impl.q0_idx_global,
+            q1_idx_global=impl.q1_idx_global,
+            total_global_ids=impl.total_global_ids,
+            total_local_ids=impl.total_local_ids,
+            cu_kv_seqlens_global=impl.cu_kv_seqlens_global,
+            kv_cache_sharded=impl.kv_cache_sharded,
+            ws_block_table=ws_block_table,
+            ws_slot_mapping=ws_slot_mapping,
         )
 
     @classmethod

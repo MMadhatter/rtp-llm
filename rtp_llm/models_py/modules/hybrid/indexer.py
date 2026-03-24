@@ -5,7 +5,12 @@ from torch import nn
 
 from rtp_llm.models_py.modules import IndexerOp, LayerNorm
 from rtp_llm.models_py.modules.factory import LinearFactory
-from rtp_llm.ops import AttentionConfigs, CPProcessorType, HWKernelConfig, ParallelismConfig
+from rtp_llm.ops import (
+    AttentionConfigs,
+    CPProcessorType,
+    HWKernelConfig,
+    ParallelismConfig,
+)
 from rtp_llm.ops.compute_ops import KVCache, rtp_llm_ops
 from rtp_llm.utils.model_weight import W
 
@@ -118,6 +123,7 @@ class Indexer(nn.Module):
         q_lora: torch.Tensor,
         x: torch.Tensor,
         flashmla_params: Any,
+        attention_inputs: Any,
     ):
         # Linear projections
         q = self.wq_b(q_lora)
@@ -129,7 +135,9 @@ class Indexer(nn.Module):
         # Apply RoPE and Hadamard transform
         if self._is_cp:
             query, key = self.indexer_op.apply_rope_and_rotate_q_k_cp(
-                q, k, flashmla_params.positions_d
+                q,
+                k,
+                attention_inputs.context_parallel_info.prefill_shuffle_indices,
             )
         else:
             query, key = self.indexer_op.apply_rope_and_rotate_q_k(
@@ -161,6 +169,17 @@ class Indexer(nn.Module):
         op.total_local_ids = cp_params.total_local_ids
         op.cu_kv_seqlens_global = cp_params.cu_kv_seqlens_global
 
+        # Pre-compute workspace metadata for round-robin (reuse MLA block_table)
+        kv_cache_sharded = self._is_roundrobin and getattr(
+            cp_params, "kv_cache_sharded", False
+        )
+        if kv_cache_sharded:
+            op._ws_slot_mapping = cp_params.ws_slot_mapping
+            op._indexer_workspace_block_table = cp_params.ws_block_table
+        else:
+            op._ws_slot_mapping = None
+            op._indexer_workspace_block_table = None
+
     def _quant_q_k_cp(
         self,
         query: torch.Tensor,
@@ -172,10 +191,14 @@ class Indexer(nn.Module):
     ):
         """CP quant: zigzag uses full cache, round-robin uses sharded cache + workspace."""
         kv_cache_sharded = self._is_roundrobin and getattr(
-            cp_params, 'kv_cache_sharded', False
+            cp_params, "kv_cache_sharded", False
         )
         return self.indexer_op.quant_q_k_cp(
-            query, key, kv_cache, slot_mapping, attention_inputs,
+            query,
+            key,
+            kv_cache,
+            slot_mapping,
+            attention_inputs,
             kv_cache_sharded=kv_cache_sharded,
         )
 
@@ -190,10 +213,16 @@ class Indexer(nn.Module):
         """CP topk: zigzag reads from full cache, round-robin reads from workspace."""
         if self._is_roundrobin:
             return self.indexer_op._get_topk_ragged_cp_roundrobin(
-                q_fp8, weights, fmha_params,
+                q_fp8,
+                weights,
+                fmha_params,
             )
         return self.indexer_op._get_topk_ragged_cp_zigzag(
-            q_fp8, weights, kv_cache, fmha_params, attention_inputs,
+            q_fp8,
+            weights,
+            kv_cache,
+            fmha_params,
+            attention_inputs,
         )
 
     # ---- forward ----
@@ -220,13 +249,19 @@ class Indexer(nn.Module):
             self._setup_cp_params(cp_params)
 
         # Compute query and key with RoPE and rotation
-        query, key = self._get_q_k_bf16(q_lora, hidden_states, fmha_params)
+        query, key = self._get_q_k_bf16(
+            q_lora, hidden_states, fmha_params, attention_inputs
+        )
 
         # Quantize query and key
         if is_cp_prefill:
             q_fp8, q_scale = self._quant_q_k_cp(
-                query, key, kv_cache, fmha_params.slot_mapping,
-                attention_inputs, cp_params,
+                query,
+                key,
+                kv_cache,
+                fmha_params.slot_mapping,
+                attention_inputs,
+                cp_params,
             )
         else:
             q_fp8, q_scale = self.indexer_op.quant_q_k(
