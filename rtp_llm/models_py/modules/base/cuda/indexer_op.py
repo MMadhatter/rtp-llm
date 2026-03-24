@@ -116,6 +116,10 @@ class IndexerOp(nn.Module):
         self._indexer_workspace = None
         self._indexer_workspace_block_table = None
         self._ws_slot_mapping = None
+        self._cu_local_kv_seqlens = None
+        self._total_local_kv = None
+        self._kv_allgather_restore_indices = None
+        self._has_prefix_cache = False
 
     def apply_rope_and_rotate_q_k(
         self,
@@ -399,6 +403,11 @@ class IndexerOp(nn.Module):
                 self.scale_fmt,
             )
             self._indexer_workspace = workspace
+
+            # For round-robin with prefix cache, kv_len must include prefix tokens.
+            # cu_kv_seqlens_global[-1] gives the total full KV length (prefix + new).
+            if self.cu_kv_seqlens_global is not None:
+                self.kv_len = int(self.cu_kv_seqlens_global[-1].item())
         else:
             self._indexer_workspace = None
             self._indexer_workspace_block_table = None
@@ -711,20 +720,65 @@ class IndexerOp(nn.Module):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         fmha_params: Any,
+        kv_cache: Any = None,
+        attention_inputs: Any = None,
     ) -> Optional[torch.Tensor]:
-        """Round-robin CP topk: read full K from the temporary workspace."""
+        """Round-robin CP topk: read from workspace (no prefix) or gather from sharded cache (prefix).
+
+        Without prefix cache: read full K from the temporary workspace built by quant_q_k_cp.
+        With prefix cache: gather owned K tokens from sharded cache via all-gather,
+        then restore to global order for topk computation.
+        """
         total_kv_tokens = self.kv_len
         assert total_kv_tokens is not None and total_kv_tokens > 0
-        assert self._indexer_workspace is not None, (
-            "Workspace must be built by quant_q_k_cp(kv_cache_sharded=True) "
-            "before calling _get_topk_ragged_cp_roundrobin"
-        )
 
-        k_fp8, k_scale = self._gather_kv_fp8(
-            total_kv_tokens,
-            self._indexer_workspace,
-            self._indexer_workspace_block_table,
-            q_fp8.device,
-        )
+        if not getattr(self, "_has_prefix_cache", False):
+            # No prefix cache: read from workspace (original path)
+            assert self._indexer_workspace is not None, (
+                "Workspace must be built by quant_q_k_cp(kv_cache_sharded=True) "
+                "before calling _get_topk_ragged_cp_roundrobin"
+            )
+            k_fp8, k_scale = self._gather_kv_fp8(
+                total_kv_tokens,
+                self._indexer_workspace,
+                self._indexer_workspace_block_table,
+                q_fp8.device,
+            )
+        else:
+            # Prefix cache: gather from sharded cache via all-gather
+            assert kv_cache is not None, (
+                "kv_cache is required for round-robin CP topk with prefix cache support"
+            )
+            assert attention_inputs is not None
+
+            local_kv_len = self._total_local_kv
+            k_fp8_local = torch.empty(
+                (local_kv_len, self.index_head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=q_fp8.device,
+            )
+            k_scale_local = torch.empty(
+                (local_kv_len, self.index_head_dim // self.block_size * 4),
+                dtype=torch.uint8,
+                device=q_fp8.device,
+            )
+            rtp_llm_ops.cp_gather_indexer_k_quant_cache(
+                kv_cache.kv_scale_base,
+                k_fp8_local,
+                k_scale_local,
+                attention_inputs.kv_cache_block_id_device,
+                self._cu_local_kv_seqlens,
+            )
+
+            # All-gather across CP ranks to get all ranks' local K
+            k_fp8_all = all_gather(k_fp8_local.contiguous(), group=Group.TP)
+            k_scale_all = all_gather(k_scale_local.contiguous(), group=Group.TP)
+
+            # Restore to global order using precomputed indices
+            k_fp8_all = k_fp8_all.reshape(-1, self.index_head_dim)
+            k_scale_all = k_scale_all.reshape(-1, k_scale_local.shape[-1])
+            k_fp8 = k_fp8_all[self._kv_allgather_restore_indices]
+            k_scale = k_scale_all[self._kv_allgather_restore_indices]
+
         kv_fp8 = (k_fp8, k_scale.view(torch.float32))
         return self._run_cp_logits_topk(q_fp8, weights, kv_fp8, fmha_params)

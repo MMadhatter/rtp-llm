@@ -176,9 +176,17 @@ class Indexer(nn.Module):
         if kv_cache_sharded:
             op._ws_slot_mapping = cp_params.ws_slot_mapping
             op._indexer_workspace_block_table = cp_params.ws_block_table
+            op._cu_local_kv_seqlens = cp_params.cu_local_kv_seqlens
+            op._total_local_kv = cp_params.total_local_kv
+            op._kv_allgather_restore_indices = cp_params.kv_allgather_restore_indices
+            op._has_prefix_cache = getattr(cp_params, "has_prefix_cache", False)
         else:
             op._ws_slot_mapping = None
             op._indexer_workspace_block_table = None
+            op._cu_local_kv_seqlens = None
+            op._total_local_kv = None
+            op._kv_allgather_restore_indices = None
+            op._has_prefix_cache = False
 
     def _quant_q_k_cp(
         self,
@@ -210,12 +218,14 @@ class Indexer(nn.Module):
         fmha_params: Any,
         attention_inputs: Any,
     ):
-        """CP topk: zigzag reads from full cache, round-robin reads from workspace."""
+        """CP topk: zigzag reads from full cache, round-robin reads from workspace or gathers from sharded cache."""
         if self._is_roundrobin:
             return self.indexer_op._get_topk_ragged_cp_roundrobin(
                 q_fp8,
                 weights,
                 fmha_params,
+                kv_cache=kv_cache,
+                attention_inputs=attention_inputs,
             )
         return self.indexer_op._get_topk_ragged_cp_zigzag(
             q_fp8,
