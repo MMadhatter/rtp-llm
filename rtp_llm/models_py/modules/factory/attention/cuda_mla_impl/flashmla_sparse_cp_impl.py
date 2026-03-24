@@ -503,7 +503,9 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
             cu_new_kv_cpu[1:] = torch.cumsum(new_kv_lengths, dim=0)
             cu_new_kv = cu_new_kv_cpu.to(self.device)
             self._ws_block_table = common.build_contiguous_block_table(
-                cu_new_kv, page_size, self.device,
+                cu_new_kv,
+                page_size,
+                self.device,
             )
 
             # Sharded cu_kv_seqlens: each rank's local token capacity per request.
@@ -534,7 +536,9 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
                 flat_idx = ranks * self._total_local_kv + cu_s + local_idx
                 restore_pieces.append(flat_idx)
             if restore_pieces:
-                self._kv_allgather_restore_indices = torch.cat(restore_pieces).to(self.device)
+                self._kv_allgather_restore_indices = torch.cat(restore_pieces).to(
+                    self.device
+                )
             else:
                 self._kv_allgather_restore_indices = torch.empty(
                     0, dtype=torch.long, device=self.device
@@ -725,7 +729,9 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
         if self.has_prefix_cache:
             return self._forward_prefix_cache(q, topk, kv_cache, layer_id)
         else:
-            return self._forward_workspace(q, restored_ckv, restored_k_pe, topk, kv_cache, layer_id)
+            return self._forward_workspace(
+                q, restored_ckv, restored_k_pe, topk, kv_cache, layer_id
+            )
 
     def _forward_workspace(
         self,
@@ -841,7 +847,9 @@ class RoundRobinSparseMlaFp8CPOp(SparseMlaFp8Op):
             softmax_scale=self.scale,
         )
         local_out = local_out.squeeze(0)
-        local_lse = local_lse.squeeze(0).float()
+        local_lse = (
+            local_lse.squeeze(0).float().transpose(0, 1)
+        )  # [num_heads, total_q] -> [total_q, num_heads]
 
         # Step 6: Merge attention states across all CP ranks.
         merged_out = self._merge_attention_across_ranks(local_out, local_lse)

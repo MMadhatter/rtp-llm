@@ -220,6 +220,7 @@ class SparseMlaFp8CPOpTest(TestCase):
 
         topk0 = torch.index_select(topk_indices, 0, cp_op.q0_idx).contiguous()
         topk1 = torch.index_select(topk_indices, 0, cp_op.q1_idx).contiguous()
+        topk_cat = torch.cat([topk0, topk1], dim=0)
         with patch(
             "rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl.all_gather",
             side_effect=_identity_all_gather,
@@ -228,8 +229,7 @@ class SparseMlaFp8CPOpTest(TestCase):
                 q,
                 compressed_kv,
                 k_pe,
-                topk0,
-                topk1,
+                topk_cat,
                 batch_indice_d,
                 kv_cache,
                 layer_id=0,
@@ -253,7 +253,6 @@ class SparseMlaFp8CPOpTest(TestCase):
         non_cp_op.plan(mla_params, block_table_device)
         out_non_cp = non_cp_op.forward(q, kv_cache_flat, topk_indices, layer_id=0)
         torch.cuda.synchronize()
-
         self.assertTrue(
             torch.allclose(out_cp, out_non_cp, atol=1e-2, rtol=1e-2),
             "CP output should match non-CP when tp_size=1 (all_gather identity)",
@@ -375,6 +374,7 @@ class SparseMlaFp8CPOpTest(TestCase):
 
         topk0 = torch.index_select(topk_indices, 0, cp_op.q0_idx).contiguous()
         topk1 = torch.index_select(topk_indices, 0, cp_op.q1_idx).contiguous()
+        topk_cat = torch.cat([topk0, topk1], dim=0)
         with patch(
             "rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl.all_gather",
             side_effect=_identity_all_gather,
@@ -383,8 +383,7 @@ class SparseMlaFp8CPOpTest(TestCase):
                 q,
                 compressed_kv,
                 k_pe,
-                topk0,
-                topk1,
+                topk_cat,
                 batch_indice_d,
                 kv_cache,
                 layer_id=0,
@@ -506,9 +505,20 @@ class SparseMlaFp8CPOpTest(TestCase):
         batch_indice_d = torch.zeros(new_tokens, dtype=torch.int32, device=device)
 
         num_blocks = block_table_host.shape[1]
-        kv_cache_base = torch.randn(
-            num_blocks, page_size, fp8_bytes_per_token, device=device
-        ).to(torch.uint8)
+        kv_cache_base = (
+            (
+                torch.randn(
+                    num_blocks,
+                    page_size,
+                    fp8_bytes_per_token,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                * 0.1
+            )
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+        )
         kv_cache = KVCache()
         kv_cache.kv_cache_base = kv_cache_base
 
