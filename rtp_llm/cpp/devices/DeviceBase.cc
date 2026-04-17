@@ -13,6 +13,8 @@
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/ErrorCodeUtil.h"
 
+#include <iostream>
+
 using namespace std;
 using namespace rtp_llm;
 
@@ -239,16 +241,44 @@ void DeviceBase::writeCacheStore(const CacheStoreInputs& cache_store_inputs,
             continue;
         }
 
+        // Map local block index → cache key index.
+        // Normal: identity (block i uses cache_keys[i]).
+        // CP sharded: page-level RR, block i uses cache_keys[i * cp_size + cp_rank].
+        const bool cp_sharded  = param.cp_slot_mapper && param.cp_slot_mapper->isSharded();
+        const int  cp_rank     = cp_sharded ? param.cp_slot_mapper->cpRank() : 0;
+        const int  cp_size_val = cp_sharded ? param.cp_slot_mapper->cpSize() : 1;
+
+        auto toKeyIndex = [cp_rank, cp_size_val](int block_idx) { return block_idx * cp_size_val + cp_rank; };
+
+        // Determine iteration range.
+        int num_blocks = total_blocks;
+        int start      = 0;
+        if (cp_sharded) {
+            int prefix_len = param.prefix_lengths_host->data<int>()[batch_id];
+            int input_len  = param.input_lengths_host->data<int>()[param.decoder_batch_size + batch_id];
+            num_blocks     = param.cp_slot_mapper->localBlockCount(prefix_len + input_len);
+        }
+        if (group_type == CacheGroupType::LINEAR) {
+            start = num_blocks - 1;  // LINEAR only writes the last block
+        }
+
+        // Total cache keys available — guard against trailing unused blocks in CP mode.
+        const size_t ck_stride =
+            param.max_cache_keys_per_batch > 0 ? param.max_cache_keys_per_batch : max_blocks_per_batch;
+        const int total_cache_keys = static_cast<int>(ck_stride);
+
         auto addBlock = [&](int index, CacheGroupType group_type) {
+            int key_index = toKeyIndex(index);
+            if (key_index >= total_cache_keys) {
+                return;  // trailing unused block in CP mode
+            }
             RTP_LLM_CHECK_WITH_INFO(index >= 0 && index < static_cast<int>(max_blocks_per_batch),
                                     "invalid block index=%d (max_blocks_per_batch=%zu)",
                                     index,
                                     max_blocks_per_batch);
             auto block_id = *(offset_addr + (param.decoder_batch_size + batch_id) * max_blocks_per_batch + index);
-            std::string cache_key;
-
-            cache_key =
-                makeCacheKey(param.model_id, param.cache_keys[batch_id * max_blocks_per_batch + index], param.layer_id);
+            auto cache_key =
+                makeCacheKey(param.model_id, param.cache_keys[batch_id * ck_stride + key_index], param.layer_id);
 
             void*                 kv_addr = (void*)((int8_t*)kv_cache_data + block_id * param.kv_block_stride_bytes);
             std::shared_ptr<void> kv_block_addr(kv_addr, [](void* p) {});
@@ -284,12 +314,8 @@ void DeviceBase::writeCacheStore(const CacheStoreInputs& cache_store_inputs,
             }
         };
 
-        if (group_type == CacheGroupType::LINEAR) {
-            addBlock(total_blocks - 1, group_type);
-        } else {
-            for (int index = 0; index < total_blocks; ++index) {
-                addBlock(index, group_type);
-            }
+        for (int i = start; i < num_blocks; ++i) {
+            addBlock(i, group_type);
         }
 
         auto storeCallback = [layer_id = param.layer_id, request_id](bool success, CacheStoreErrorCode ec) {

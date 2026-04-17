@@ -306,6 +306,7 @@ rtp_llm::AttentionCommonInputs GptModel::prepareAttentionInputs(const GptModelIn
         cache_store_inputs.request_id                   = inputs.request_id;
         cache_store_inputs.request_pd_separation        = inputs.request_pd_separation;
         cache_store_inputs.cache_keys                   = transVectorToString(cache_keys_vec);
+        cache_store_inputs.max_cache_keys_per_batch     = inputs.cache_keys ? inputs.cache_keys->shape()[1] : 0;
         cache_store_inputs.tokens_per_block             = inputs.seq_size_per_block;
         cache_store_inputs.kv_block_stride_bytes        = inputs.kv_block_stride_bytes;
         cache_store_inputs.kv_scale_stride_bytes        = inputs.kv_scale_stride_bytes;
@@ -313,7 +314,11 @@ rtp_llm::AttentionCommonInputs GptModel::prepareAttentionInputs(const GptModelIn
         cache_store_inputs.model_id                     = model_id_;
         cache_store_inputs.decode_entrance              = inputs.decode_entrance;
         cache_store_inputs.warmup                       = inputs.warmup;
-        attention_inputs.cache_store_inputs             = cache_store_inputs;
+        if (device_props_.cp_kv_cache_sharded && device_props_.tp_size > 1) {
+            cache_store_inputs.cp_slot_mapper =
+                std::make_shared<CPSlotMapper>(device_props_.tp_rank, device_props_.tp_size, inputs.seq_size_per_block);
+        }
+        attention_inputs.cache_store_inputs = cache_store_inputs;
     }
 
     if (context_batch_size && prep_output.need_mask) {
@@ -1878,6 +1883,8 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
     shape_hints_ptr[GptModelInputIndex::gptModelRequestLength] =
         inputs.request_id.get() ? inputs.request_id->size() : 0;
     shape_hints_ptr[GptModelInputIndex::isFakeStream] = inputs.is_fake_stream;
+    shape_hints_ptr[GptModelInputIndex::maxCacheKeysPerBatch] =
+        inputs.cache_keys.get() ? inputs.cache_keys->shape()[1] : 0;
     device->broadcast({{shape_hints}, 0});
     device->syncCommunication(false);
     device->syncAndCheck();
@@ -1950,8 +1957,13 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
                      kv_cache_group_num, (size_t)shape_hints_ptr[GptModelInputIndex::inputLengths], max_blocks},
                  rtp_llm::AllocationType::HOST});
             if (inputs.pd_separation) {
-                inputs.cache_keys = device->allocateBuffer(
-                    {rtp_llm::DataType::TYPE_INT64, {context_batch_size, max_blocks}, rtp_llm::AllocationType::HOST});
+                auto max_cache_keys = (size_t)shape_hints_ptr[GptModelInputIndex::maxCacheKeysPerBatch];
+                if (max_cache_keys == 0) {
+                    max_cache_keys = max_blocks;
+                }
+                inputs.cache_keys = device->allocateBuffer({rtp_llm::DataType::TYPE_INT64,
+                                                            {context_batch_size, max_cache_keys},
+                                                            rtp_llm::AllocationType::HOST});
             }
         }
 

@@ -52,7 +52,9 @@ absl::StatusOr<GptModelInputs> NormalBatchStreamProcessor::gatherModelInput(cons
         model_input.kv_cache_layer_to_group = CACHED_HOST_BUF(TYPE_INT32, {num_layers_});
         model_input.kv_cache_group_types    = CACHED_HOST_BUF(TYPE_INT32, {static_cast<size_t>(kv_cache_group_nums_)});
         model_input.kv_cache_update_mapping = CACHED_HOST_BUF(TYPE_INT32, {total_block_copy_num, 2});
-        model_input.cache_keys              = CACHED_HOST_BUF(TYPE_INT64, {total_context_batch_size, max_blocks_num});
+        const size_t max_cache_keys_num =
+            stream_groups.maxCacheKeysNum() > 0 ? stream_groups.maxCacheKeysNum() : max_blocks_num;
+        model_input.cache_keys = CACHED_HOST_BUF(TYPE_INT64, {total_context_batch_size, max_cache_keys_num});
     }
     model_input.request_id            = CACHED_HOST_BUF(TYPE_INT64, {total_context_batch_size});
     model_input.request_pd_separation = CACHED_HOST_BUF(TYPE_BOOL, {total_context_batch_size});

@@ -173,9 +173,11 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     }
 
     if (params.device->getDeviceProperties().enable_prefill_cp) {
-        // TODO(serina.wzq): support other planner types
-        context_parallel_processor_ = ContextParallelProcessorFactory::create(ProcessorType::ZIG_ZAG);
-        RTP_LLM_LOG_INFO("Context parallel processor initialized with ZIG_ZAG strategy.");
+        auto cp_type                = params.device->getDeviceProperties().cp_processor_type;
+        int  page_size              = static_cast<int>(params.description.attention_conf.tokens_per_block);
+        context_parallel_processor_ = ContextParallelProcessorFactory::create(cp_type, page_size);
+        RTP_LLM_LOG_INFO(
+            "Context parallel processor initialized with type %d, page_size %d.", static_cast<int>(cp_type), page_size);
     }
 
     RTP_LLM_LOG_INFO("PyWrappedModel initialized done.");

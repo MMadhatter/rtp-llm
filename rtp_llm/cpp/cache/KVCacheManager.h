@@ -97,6 +97,14 @@ public:
     // for every single rank
     bool executeFunction(const FunctionRequestPB& request, FunctionResponsePB& response);
 
+    std::shared_ptr<CPSlotMapper> cpSlotMapper() const {
+        return cp_slot_mapper_;
+    }
+
+    BlockPoolPtr getBlockPool() const {
+        return allocator_ ? allocator_->getBlockPool() : nullptr;
+    }
+
 private:
     void initConnectorCoordinator();
     void allocateAndSync();
@@ -112,6 +120,8 @@ private:
     const ParallelismConfig            parallelism_config_;
     const RuntimeConfig                runtime_config_;
     const SpeculativeExecutionConfig   sp_config_;
+
+    std::shared_ptr<CPSlotMapper> cp_slot_mapper_;
 
     std::atomic<bool> stop_{false};
     std::thread       metrics_reporter_thread_;

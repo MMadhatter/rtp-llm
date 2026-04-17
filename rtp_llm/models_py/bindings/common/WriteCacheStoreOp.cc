@@ -28,27 +28,27 @@ void runWriteCacheStore(DeviceBase*        device,
             torchTensor2Buffer(cache_store_inputs.kv_cache_group_types) :
             nullptr;
 
-    CacheStoreInputs inputs{torchTensor2Buffer(input_lengths),
-                            torchTensor2Buffer(prefix_lengths),
-                            torchTensor2Buffer(kv_cache_block_id_host),
-                            layer_to_group_buf,
-                            group_types_buf,
-                            cache_store_inputs.context_batch_size,
-                            cache_store_inputs.decoder_batch_size,
-                            // (size_t)(attn_inputs.input_lengths.size(0) - attn_inputs.sequence_lengths.size(0)),
-                            // (size_t)attn_inputs.sequence_lengths.size(0),
-                            torchTensor2Buffer(cache_store_inputs.request_id),
-                            torchTensor2Buffer(cache_store_inputs.request_pd_separation),
-                            cache_store_inputs.cache_keys,
-                            cache_store_inputs.tokens_per_block,
-                            cache_store_inputs.kv_block_stride_bytes,
-                            cache_store_inputs.kv_scale_stride_bytes,
-                            cache_store_inputs.pd_separation,
-                            cache_store_inputs.model_id,
-                            cache_store_inputs.decode_entrance,
-                            cache_store_inputs.warmup,
-                            kv_cache.layer_id,
-                            std::move(pre_created_event)};
+    CacheStoreInputs inputs;
+    inputs.input_lengths_host           = torchTensor2Buffer(input_lengths);
+    inputs.prefix_lengths_host          = torchTensor2Buffer(prefix_lengths);
+    inputs.host_kv_cache_offset         = torchTensor2Buffer(kv_cache_block_id_host);
+    inputs.kv_cache_layer_to_group_host = layer_to_group_buf;
+    inputs.kv_cache_group_types_host    = group_types_buf;
+    inputs.context_batch_size           = cache_store_inputs.context_batch_size;
+    inputs.decoder_batch_size           = cache_store_inputs.decoder_batch_size;
+    inputs.request_id                   = torchTensor2Buffer(cache_store_inputs.request_id);
+    inputs.request_pd_separation        = torchTensor2Buffer(cache_store_inputs.request_pd_separation);
+    inputs.cache_keys                   = cache_store_inputs.cache_keys;
+    inputs.tokens_per_block             = cache_store_inputs.tokens_per_block;
+    inputs.kv_block_stride_bytes        = cache_store_inputs.kv_block_stride_bytes;
+    inputs.kv_scale_stride_bytes        = cache_store_inputs.kv_scale_stride_bytes;
+    inputs.pd_separation                = cache_store_inputs.pd_separation;
+    inputs.model_id                     = cache_store_inputs.model_id;
+    inputs.decode_entrance              = cache_store_inputs.decode_entrance;
+    inputs.warmup                       = cache_store_inputs.warmup;
+    inputs.layer_id                     = kv_cache.layer_id;
+    inputs.pre_created_event            = std::move(pre_created_event);
+    inputs.cp_slot_mapper               = cache_store_inputs.cp_slot_mapper;
 
     KvCacheInfo kv_cache_info;
     // kv_cache_buffer uses kv block base address (compatible with existing cache store writer which writes "k_").

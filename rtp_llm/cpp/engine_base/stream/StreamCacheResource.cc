@@ -295,10 +295,21 @@ bool StreamCacheResource::reuseCache() const {
 }
 
 bool StreamCacheResource::enableRemoteCache() const {
+    // TODO(CP): memory/remote connector only runs on rank0, but each CP rank holds
+    // different KV data.  Disable until connector supports per-rank store/load.
+    auto mapper = resource_context_.cache_manager->cpSlotMapper();
+    if (mapper && mapper->isSharded()) {
+        return false;
+    }
     return resource_context_.enable_remote_cache && stream_->enableRemoteCache();
 }
 
 bool StreamCacheResource::enableMemoryCache() const {
+    // TODO(CP): same as enableRemoteCache — disabled under CP sharding.
+    auto mapper = resource_context_.cache_manager->cpSlotMapper();
+    if (mapper && mapper->isSharded()) {
+        return false;
+    }
     return resource_context_.enable_memory_cache && stream_->enableMemoryCache();
 }
 
@@ -337,10 +348,11 @@ void StreamCacheResource::waitLoadCacheDone(const std::shared_ptr<AsyncContext>&
         RTP_LLM_LOG_WARNING("load cache success but cast context failed, stream: [%ld]", stream_->streamId());
         return;
     }
-    const int total_reuse_len  = read_context->resource()->reuseBlockNum() * seqSizePerBlock();
-    const int memory_reuse_len = read_context->resource()->memoryReuseBlockNum() * seqSizePerBlock();
-    const int remote_reuse_len = read_context->resource()->remoteReuseBlockNum() * seqSizePerBlock();
-    const int device_reuse_len = read_context->resource()->deviceReuseBlockNum() * seqSizePerBlock();
+    const int tokens_per_key   = tokensPerCacheKey();
+    const int total_reuse_len  = read_context->resource()->reuseBlockNum() * tokens_per_key;
+    const int memory_reuse_len = read_context->resource()->memoryReuseBlockNum() * tokens_per_key;
+    const int remote_reuse_len = read_context->resource()->remoteReuseBlockNum() * tokens_per_key;
+    const int device_reuse_len = read_context->resource()->deviceReuseBlockNum() * tokens_per_key;
     stream_->setInitialReuseLength(total_reuse_len);
     stream_->setReuseLength(total_reuse_len);
     stream_->setLocalReuseLength(device_reuse_len + memory_reuse_len);
