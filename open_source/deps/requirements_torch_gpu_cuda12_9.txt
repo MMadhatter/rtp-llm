@@ -23,4 +23,9 @@ mysql-connector-python
 tensorrt==10.3.0
 tensorrt-cu12-bindings==10.3.0
 tabulate==0.9.0
-tilelang==0.1.6
+# DeepSeek-V4 (PR-C): tilelang 0.1.8 introduces the kernels that the V4
+# fused mHC / compressor / paged_mqa_metadata paths consume. SGLang PR
+# #23600 pins the same version; vLLM PR #40760 ships compatible kernels.
+# Fall back to 0.1.6 only if you've manually verified that V4-Flash boots
+# without the V4 fused kernels (HCA python ref will run, perf will tank).
+tilelang==0.1.8
