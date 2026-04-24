@@ -207,6 +207,19 @@ py_test(
 )
 
 py_test(
+    name = "deepseekv4_detector_test",
+    srcs = [
+        "deepseekv4_detector_test.py",
+    ],
+    data = [],
+    deps = [
+        "//rtp_llm:testlib"
+    ],
+    imports = [],
+    exec_properties = {'gpu':'H20'},
+)
+
+py_test(
     name = "glm4_moe_detector_test",
     srcs = [
         "glm4_moe_detector_test.py",
