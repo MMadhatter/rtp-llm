@@ -138,6 +138,9 @@ class ModelConfig(CppModelConfig):
         "embedding_size",
         "moe_normalize_expert_scale",
         "scoring_func",
+        # DeepSeek-V4 specific fields
+        "moe_hash_routing_layers",
+        "swiglu_limit",
         "has_positional_encoding",
         "has_pre_decoder_layernorm",
         "has_post_decoder_layernorm",

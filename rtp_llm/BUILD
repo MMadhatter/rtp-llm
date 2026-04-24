@@ -180,6 +180,17 @@ py_library(
 )
 
 py_library(
+    name = "transformers_utils",
+    srcs = glob([
+        "transformers_utils/**/*.py",
+    ]),
+    deps = [
+        ":transformers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "_ft_pickler",
     srcs = ["_ft_pickler.py"],
 )

@@ -194,6 +194,19 @@ py_test(
 )
 
 py_test(
+    name = "deepseek_v4_infra_test",
+    srcs = [
+        "deepseek_v4_infra_test.py",
+    ],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm:transformers_utils",
+    ],
+    imports = [],
+    exec_properties = {'gpu':'H20'},
+)
+
+py_test(
     name = "glm4_moe_detector_test",
     srcs = [
         "glm4_moe_detector_test.py",
