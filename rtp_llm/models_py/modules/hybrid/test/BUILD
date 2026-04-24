@@ -125,6 +125,18 @@ py_test (
 )
 
 py_test (
+   name = "csa_attention_test",
+   srcs = ["csa_attention_test.py"],
+   deps = [
+       "//rtp_llm/models_py:models",
+       "//rtp_llm:testlib",
+   ],
+   env = test_envs,
+   tags = ["open_skip", "H20"],
+   exec_properties = {'gpu':'H20'},
+)
+
+py_test (
    name = "cache_topology_test",
    srcs = ["cache_topology_test.py"],
    deps = [
