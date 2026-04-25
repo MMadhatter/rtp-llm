@@ -50,9 +50,11 @@ def precompute_rope_cache(
     if rope_dim % 2 != 0:
         raise ValueError(f"rope_dim must be even, got {rope_dim}")
     half = rope_dim // 2
-    inv_freq = 1.0 / (base ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, half, device=device, dtype=torch.float32) / half)
+    )
     pos = torch.arange(max_pos, device=device, dtype=torch.float32)
-    freqs = torch.outer(pos, inv_freq)            # (max_pos, half)
+    freqs = torch.outer(pos, inv_freq)  # (max_pos, half)
     return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
 
@@ -94,7 +96,7 @@ def apply_partial_rope(
 
     # cos/sin currently (L, rope_dim/2); duplicate to (L, rope_dim) by [c c | s s]
     # so a (rope_dim,) elementwise rotation matches `_rotate_half` form.
-    cos_full = torch.cat([cos, cos], dim=-1)      # (L, rope_dim)
+    cos_full = torch.cat([cos, cos], dim=-1)  # (L, rope_dim)
     sin_full = torch.cat([sin, sin], dim=-1)
     if inverse:
         sin_full = -sin_full
@@ -114,15 +116,19 @@ def apply_partial_rope(
 # MQA + sink + SWA-bypass core attention.
 # ---------------------------------------------------------------------------
 def mqa_attention_with_sink(
-    Q: torch.Tensor,                      # (B, T_q, H, D)
-    K_compressed: torch.Tensor,           # (B, T_kc, D)        — single KV head
-    V_compressed: torch.Tensor,           # (B, T_kc, D)
-    K_window: Optional[torch.Tensor],     # (B, T_q, n_win, D)  — per-query SWA tail
-    V_window: Optional[torch.Tensor],     # (B, T_q, n_win, D)
-    sink_logits: torch.Tensor,            # (H,)                — per-head sink in softmax denom
+    Q: torch.Tensor,  # (B, T_q, H, D)
+    K_compressed: torch.Tensor,  # (B, T_kc, D)        — single KV head
+    V_compressed: torch.Tensor,  # (B, T_kc, D)
+    K_window: Optional[torch.Tensor],  # (B, T_q, n_win, D)  — per-query SWA tail
+    V_window: Optional[torch.Tensor],  # (B, T_q, n_win, D)
+    sink_logits: torch.Tensor,  # (H,)                — per-head sink in softmax denom
     *,
-    causal_compressed_mask: Optional[torch.Tensor] = None,  # (B, T_q, T_kc) bool, True = mask out
-    swa_valid_mask: Optional[torch.Tensor] = None,          # (B, T_q, n_win) bool, True = mask out
+    causal_compressed_mask: Optional[
+        torch.Tensor
+    ] = None,  # (B, T_q, T_kc) bool, True = mask out
+    swa_valid_mask: Optional[
+        torch.Tensor
+    ] = None,  # (B, T_q, n_win) bool, True = mask out
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Single-step reference for V4's MQA core.
@@ -132,18 +138,20 @@ def mqa_attention_with_sink(
     """
     B, T_q, H, D = Q.shape
     if scale is None:
-        scale = 1.0 / (D ** 0.5)
+        scale = 1.0 / (D**0.5)
 
     # --- Compressed-KV branch -----------------------------------------------
     # K shape (B, T_kc, D) -> (B, 1, T_kc, D), Q (B, T_q, H, D) -> (B, H, T_q, D)
-    Q_h = Q.transpose(1, 2)                             # (B, H, T_q, D)
-    K_c = K_compressed.unsqueeze(1)                     # (B, 1, T_kc, D)
-    V_c = V_compressed.unsqueeze(1)                     # (B, 1, T_kc, D)
+    Q_h = Q.transpose(1, 2)  # (B, H, T_q, D)
+    K_c = K_compressed.unsqueeze(1)  # (B, 1, T_kc, D)
+    V_c = V_compressed.unsqueeze(1)  # (B, 1, T_kc, D)
     # Logits over compressed keys: (B, H, T_q, T_kc)
     logits_c = torch.einsum("bhqd,bnkd->bhqk", Q_h, K_c) * scale
     if causal_compressed_mask is not None:
         # mask: (B, T_q, T_kc) -> (B, 1, T_q, T_kc)
-        logits_c = logits_c.masked_fill(causal_compressed_mask.unsqueeze(1), float("-inf"))
+        logits_c = logits_c.masked_fill(
+            causal_compressed_mask.unsqueeze(1), float("-inf")
+        )
 
     # --- SWA-window branch (per-query own slice of last n_win raw KV) -------
     if K_window is not None:
@@ -153,7 +161,7 @@ def mqa_attention_with_sink(
             # (B, T_q, n_win) -> broadcast to (B, T_q, 1, n_win)
             logits_w = logits_w.masked_fill(swa_valid_mask.unsqueeze(2), float("-inf"))
         # Reorder to (B, H, T_q, n_win) so we can concat along the keys dim.
-        logits_w = logits_w.permute(0, 2, 1, 3)         # (B, H, T_q, n_win)
+        logits_w = logits_w.permute(0, 2, 1, 3)  # (B, H, T_q, n_win)
         logits = torch.cat([logits_c, logits_w], dim=-1)
     else:
         logits = logits_c
@@ -167,7 +175,7 @@ def mqa_attention_with_sink(
     # Drop the sink column from the weights when computing the output.
     n_compressed = K_compressed.shape[1]
     n_window = K_window.shape[2] if K_window is not None else 0
-    w_c = weights[..., :n_compressed]                   # (B, H, T_q, T_kc)
+    w_c = weights[..., :n_compressed]  # (B, H, T_q, T_kc)
     w_w = weights[..., n_compressed : n_compressed + n_window]  # (B, H, T_q, n_win)
     # weights[..., -1] is the sink (discarded as a value contribution).
 
@@ -180,7 +188,7 @@ def mqa_attention_with_sink(
         out = out_c + out_w
     else:
         out = out_c
-    return out.transpose(1, 2).contiguous()             # (B, T_q, H, D)
+    return out.transpose(1, 2).contiguous()  # (B, T_q, H, D)
 
 
 # ---------------------------------------------------------------------------
@@ -229,12 +237,12 @@ class GroupedOutputProjection(nn.Module):
         f = {"device": device, "dtype": dtype}
         # Per-group weights stacked along an extra leading dim so the whole
         # projection is one batched matmul.
-        self.W_a = nn.Parameter(torch.empty(
-            o_groups, self.g_heads * head_dim, o_lora_rank, **f
-        ))
-        self.W_b = nn.Parameter(torch.empty(
-            o_groups, o_lora_rank, self.out_per_group, **f
-        ))
+        self.W_a = nn.Parameter(
+            torch.empty(o_groups, self.g_heads * head_dim, o_lora_rank, **f)
+        )
+        self.W_b = nn.Parameter(
+            torch.empty(o_groups, o_lora_rank, self.out_per_group, **f)
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -289,7 +297,7 @@ class HcaAttention(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.n_win = n_win
         self.rope_base = rope_base
-        self.scale = 1.0 / (head_dim ** 0.5)
+        self.scale = 1.0 / (head_dim**0.5)
 
         f = {"device": device, "dtype": dtype}
 
@@ -331,8 +339,7 @@ class HcaAttention(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        for p in (self.W_DQ, self.W_UQ, self.W_KV, self.W_Z,
-                  self.W_V, self.W_VZ):
+        for p in (self.W_DQ, self.W_UQ, self.W_KV, self.W_Z, self.W_V, self.W_VZ):
             nn.init.normal_(p, std=0.02)
         nn.init.zeros_(self.bias_pos)
         nn.init.zeros_(self.bias_v_pos)
@@ -349,9 +356,11 @@ class HcaAttention(nn.Module):
 
     def forward(
         self,
-        H: torch.Tensor,                       # (B, T, hidden_size)
-        positions: torch.Tensor,               # (T,) — absolute token positions for queries
-        compressed_positions: Optional[torch.Tensor] = None,  # (T_kc,) for compressed KV
+        H: torch.Tensor,  # (B, T, hidden_size)
+        positions: torch.Tensor,  # (T,) — absolute token positions for queries
+        compressed_positions: Optional[
+            torch.Tensor
+        ] = None,  # (T_kc,) for compressed KV
         causal_compressed_mask: Optional[torch.Tensor] = None,
         swa_valid_mask: Optional[torch.Tensor] = None,
         rms_eps: float = 1e-6,
@@ -366,8 +375,8 @@ class HcaAttention(nn.Module):
         B, T, _ = H.shape
 
         # --- Q projection (LoRA) --------------------------------------------
-        c_Q = H @ self.W_DQ                                # (B, T, q_lora_rank)
-        q = c_Q @ self.W_UQ                                # (B, T, n_h * head_dim)
+        c_Q = H @ self.W_DQ  # (B, T, q_lora_rank)
+        q = c_Q @ self.W_UQ  # (B, T, n_h * head_dim)
         Q = q.view(B, T, self.num_heads, self.head_dim)
 
         # --- KV compression -------------------------------------------------
@@ -392,7 +401,15 @@ class HcaAttention(nn.Module):
         cos_k = self.rope_cos[compressed_positions]
         sin_k = self.rope_sin[compressed_positions]
 
-        Q = apply_partial_rope(Q, cos_q, sin_q, self.rope_head_dim)
+        # apply_partial_rope assumes (..., L, head_dim) so the seq axis sits
+        # right before the head_dim axis. Q is (B, T, H, head_dim) → bring T
+        # adjacent to head_dim by permuting to (B, H, T, head_dim).
+        Q = apply_partial_rope(
+            Q.transpose(1, 2),
+            cos_q,
+            sin_q,
+            self.rope_head_dim,
+        ).transpose(1, 2)
         # K_comp shape (B, T_kc, head_dim): treat as single (...,L,D)
         K_comp = apply_partial_rope(K_comp, cos_k, sin_k, self.rope_head_dim)
 
@@ -409,8 +426,11 @@ class HcaAttention(nn.Module):
 
         # --- Core MQA + sink ------------------------------------------------
         attn_out = mqa_attention_with_sink(
-            Q, K_comp, V_comp,
-            K_window, V_window,
+            Q,
+            K_comp,
+            V_comp,
+            K_window,
+            V_window,
             self.sink_logits,
             causal_compressed_mask=causal_compressed_mask,
             swa_valid_mask=swa_valid_mask,
@@ -418,15 +438,23 @@ class HcaAttention(nn.Module):
         )  # (B, T, H, D)
 
         # --- Inverse partial RoPE on output (V4 trick) ---------------------
+        # attn_out is (B, T, H, D); same transpose trick as Q.
         attn_out = apply_partial_rope(
-            attn_out, cos_q, sin_q, self.rope_head_dim, inverse=True,
-        )
+            attn_out.transpose(1, 2),
+            cos_q,
+            sin_q,
+            self.rope_head_dim,
+            inverse=True,
+        ).transpose(1, 2)
 
         # --- Grouped output projection -------------------------------------
         return self.o_proj(attn_out)
 
     def _build_swa_views(
-        self, H: torch.Tensor, B: int, T: int,
+        self,
+        H: torch.Tensor,
+        B: int,
+        T: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Materialise per-query windows ``K_window, V_window`` of shape
         ``(B, T, n_win, head_dim)`` plus a ``(B, T, n_win)`` validity mask.
@@ -438,18 +466,18 @@ class HcaAttention(nn.Module):
           mask                — True == invalid / pad
         """
         # Project raw H to a single MQA KV head for the window read.
-        K_raw = H @ self.W_KV                    # (B, T, head_dim)
+        K_raw = H @ self.W_KV  # (B, T, head_dim)
         V_raw = H @ self.W_V
 
         n_win = self.n_win
         # Build (T, n_win) index map: window for query t is positions
         # max(0, t - n_win + 1) .. t. Out-of-range positions clamp to 0
         # and are masked.
-        t_idx = torch.arange(T, device=H.device).unsqueeze(-1)         # (T, 1)
-        offsets = torch.arange(n_win, device=H.device).unsqueeze(0)    # (1, n_win)
-        gather_idx = t_idx - (n_win - 1) + offsets                     # (T, n_win)
+        t_idx = torch.arange(T, device=H.device).unsqueeze(-1)  # (T, 1)
+        offsets = torch.arange(n_win, device=H.device).unsqueeze(0)  # (1, n_win)
+        gather_idx = t_idx - (n_win - 1) + offsets  # (T, n_win)
         valid = gather_idx >= 0
-        invalid_mask = ~valid                                          # (T, n_win)
+        invalid_mask = ~valid  # (T, n_win)
         gather_idx = gather_idx.clamp_min(0)
 
         # Index along T dim of K_raw / V_raw: result (B, T, n_win, D).

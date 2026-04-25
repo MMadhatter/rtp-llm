@@ -34,7 +34,6 @@ from rtp_llm.utils.model_weight import (
     zeros,
 )
 
-
 # scoring_func enum: 0 = softmax, 1 = sigmoid, 2 = sqrt(softplus) (DeepSeek-V4)
 _SCORING_FUNC_MAP = {
     "softmax": 0,
@@ -66,18 +65,22 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
         return []
 
     def _get_weight_info(self):
-        layer_weights: List[List[AtomicWeight]] = [
-            [] for _ in range(self._num_layers)
-        ]
+        # DeepSeek-V4 ckpt key conventions (different from V2/V3):
+        #   embed.weight   — token embedding (not model.embed_tokens.weight)
+        #   norm.weight    — final RMSNorm  (not model.norm.weight)
+        #   head.weight    — lm_head        (not lm_head.weight)
+        #   hc_head_*      — head-side mHC params (loaded by the python model,
+        #                    not part of the global ModelWeights surface)
+        layer_weights: List[List[AtomicWeight]] = [[] for _ in range(self._num_layers)]
         weights = [
             AtomicWeight(
                 W.embedding,
-                [CkptWeightInfo("model.embed_tokens.weight", identity)],
+                [CkptWeightInfo("embed.weight", identity)],
                 identity,
             ),
             AtomicWeight(
                 W.final_ln_gamma,
-                [CkptWeightInfo("model.norm.weight", identity)],
+                [CkptWeightInfo("norm.weight", identity)],
                 identity,
             ),
             AtomicWeight(
@@ -86,7 +89,7 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                 functools.partial(zeros, shape=[self._hidden_size]),
             ),
             AtomicWeight(
-                W.lm_head, [CkptWeightInfo("lm_head.weight", identity)], identity
+                W.lm_head, [CkptWeightInfo("head.weight", identity)], identity
             ),
         ]
         return ModelWeightInfo(layer_weights=layer_weights, weights=weights)
@@ -127,9 +130,9 @@ class DeepSeekV4MtpWeight(DeepSeekV4Weight):
                 identity,
             ),
         ]
-        assert self._num_layers == 1, (
-            f"DeepSeekV4MtpWeight expects exactly 1 MTP layer, got {self._num_layers}"
-        )
+        assert (
+            self._num_layers == 1
+        ), f"DeepSeekV4MtpWeight expects exactly 1 MTP layer, got {self._num_layers}"
         for layer in range(self._num_layers):
             # Per-layer attention plan still empty (filled by PR-E). The MTP
             # auxiliary tensors below are the *only* per-layer weights we need
@@ -243,9 +246,7 @@ class DeepSeekV4(DeepSeekV2):
         config.hidden_size = int(config_json["hidden_size"])
         config.vocab_size = int(config_json["vocab_size"])
         config.layernorm_eps = float(config_json.get("rms_norm_eps", 1e-6))
-        config.tie_word_embeddings = bool(
-            config_json.get("tie_word_embeddings", False)
-        )
+        config.tie_word_embeddings = bool(config_json.get("tie_word_embeddings", False))
         config.config_dtype = config_json.get("torch_dtype", None)
 
         # ---------- attention block ----------
@@ -380,6 +381,4 @@ class DeepSeekV4Mtp(DeepSeekV4):
 
 
 register_model("deepseek_v4", DeepSeekV4, ["DeepseekV4ForCausalLM"])
-register_model(
-    "deepseek_v4_mtp", DeepSeekV4Mtp, ["DeepseekV4ForCausalLMNextN"]
-)
+register_model("deepseek_v4_mtp", DeepSeekV4Mtp, ["DeepseekV4ForCausalLMNextN"])

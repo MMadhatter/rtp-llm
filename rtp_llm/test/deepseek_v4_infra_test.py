@@ -25,14 +25,13 @@ from unittest import TestCase, main
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.model_factory_register import ModelDict
 from rtp_llm.models.deepseek_v4 import (
+    _SCORING_FUNC_MAP,
     DeepSeekV4,
     DeepSeekV4Mtp,
     DeepSeekV4MtpWeight,
     DeepSeekV4Weight,
-    _SCORING_FUNC_MAP,
 )
 from rtp_llm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
-
 
 # Authoritative DeepSeek-V4-Flash-Base config (as published on HF).
 # Kept inline so the test does not depend on network or external checkpoints.
@@ -91,9 +90,50 @@ FLASH_BASE_CONFIG = {
     # Flash: first 2 layers SWA-only (0), then alternating CSA(4) / HCA(128),
     # trailing 0 is the MTP placeholder. Total length = num_hidden_layers + 1 = 44.
     "compress_ratios": [
-        0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
-        4, 128, 4, 128, 4, 128, 4, 0,
+        0,
+        0,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        128,
+        4,
+        0,
     ],
 }
 
@@ -166,7 +206,7 @@ class DeepSeekV4FromHfTest(TestCase):
         self.assertEqual(rope.base, 10000)
         self.assertAlmostEqual(rope.scale, 16.0)
         self.assertEqual(rope.max_pos, 65536)
-        self.assertAlmostEqual(rope.factor1, 1.0)   # beta_slow
+        self.assertAlmostEqual(rope.factor1, 1.0)  # beta_slow
         self.assertAlmostEqual(rope.factor2, 32.0)  # beta_fast
 
     # ----- V4-specific attention extensions -----
@@ -237,9 +277,7 @@ class DeepSeekV4FromHfTest(TestCase):
 
     def test_moe_layer_index_covers_all_layers(self):
         # V4 has no first_k_dense_replace — every block is MoE.
-        self.assertEqual(
-            list(self.config.moe_layer_index), list(range(43))
-        )
+        self.assertEqual(list(self.config.moe_layer_index), list(range(43)))
 
     # ----- error handling -----
     def test_unknown_scoring_func_raises(self):
@@ -364,16 +402,18 @@ class DeepSeekV4MtpWeightTest(TestCase):
         return w
 
     def test_layer_plan_has_mtp_aux_tensors(self):
+        from rtp_llm.utils.model_weight import W
+
         w = self._make_stub_mtp_weight()
         info = w._get_weight_info()
         self.assertEqual(len(info.layer_weights), 1)
         names = {a.name for a in info.layer_weights[0]}
         # Per V3 MTP convention, all five auxiliary tensors must show up.
-        self.assertIn("multi_tokens_predict_final_layernorm.gamma", names)
-        self.assertIn("multi_tokens_predict_final_layernorm.beta", names)
-        self.assertIn("multi_tokens_predict_enorm", names)
-        self.assertIn("multi_tokens_predict_hnorm", names)
-        self.assertIn("multi_tokens_predict_eh_proj", names)
+        self.assertIn(W.multi_tokens_predict_final_ln_gamma, names)
+        self.assertIn(W.multi_tokens_predict_final_ln_beta, names)
+        self.assertIn(W.multi_tokens_predict_enorm, names)
+        self.assertIn(W.multi_tokens_predict_hnorm, names)
+        self.assertIn(W.multi_tokens_predict_eh_proj, names)
 
     def test_global_weights_use_mtp_layer0_keys(self):
         w = self._make_stub_mtp_weight()
@@ -382,13 +422,9 @@ class DeepSeekV4MtpWeightTest(TestCase):
         glob_atoms = {a.name: a for a in info.weights}
         self.assertIn("embedding", glob_atoms)
         self.assertIn("lm_head", glob_atoms)
-        emb_keys = [
-            ckpt.name for ckpt in glob_atoms["embedding"].weights
-        ]
+        emb_keys = [ckpt.name for ckpt in glob_atoms["embedding"].weights]
         self.assertEqual(emb_keys, ["model.layers.0.embed_tokens.weight"])
-        head_keys = [
-            ckpt.name for ckpt in glob_atoms["lm_head"].weights
-        ]
+        head_keys = [ckpt.name for ckpt in glob_atoms["lm_head"].weights]
         self.assertEqual(head_keys, ["model.layers.0.shared_head.head.weight"])
 
     def test_rejects_more_than_one_mtp_layer(self):
@@ -399,11 +435,12 @@ class DeepSeekV4MtpWeightTest(TestCase):
             w._get_weight_info()
 
     def test_eh_proj_uses_transpose_processor(self):
+        from rtp_llm.utils.model_weight import W
+
         w = self._make_stub_mtp_weight()
         info = w._get_weight_info()
         eh_atom = next(
-            a for a in info.layer_weights[0]
-            if a.name == "multi_tokens_predict_eh_proj"
+            a for a in info.layer_weights[0] if a.name == W.multi_tokens_predict_eh_proj
         )
         # transpose, identity, etc. are picklable callables — compare by name.
         self.assertEqual(eh_atom.process_fun.__name__, "transpose")
@@ -438,12 +475,9 @@ class DeepseekV4HfConfigTest(TestCase):
         self.assertEqual(d["hc_mult"], 4)
 
     def test_registered_in_config_mapping_names(self):
-        from transformers.models.auto.configuration_auto import (
-            CONFIG_MAPPING_NAMES,
-        )
-        self.assertEqual(
-            CONFIG_MAPPING_NAMES.get("deepseek_v4"), "DeepseekV4Config"
-        )
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+        self.assertEqual(CONFIG_MAPPING_NAMES.get("deepseek_v4"), "DeepseekV4Config")
 
 
 if __name__ == "__main__":

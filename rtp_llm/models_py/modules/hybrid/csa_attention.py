@@ -60,9 +60,9 @@ class CsaLightningIndexer(nn.Module):
         self.top_k = top_k
 
         f = {"device": device, "dtype": dtype}
-        self.W_IUQ = nn.Parameter(torch.empty(
-            q_lora_rank, num_indexer_heads * indexer_head_dim, **f
-        ))
+        self.W_IUQ = nn.Parameter(
+            torch.empty(q_lora_rank, num_indexer_heads * indexer_head_dim, **f)
+        )
         # One scalar weight per indexer head.
         self.w_heads = nn.Parameter(torch.empty(num_indexer_heads, **f))
         self.reset_parameters()
@@ -73,8 +73,8 @@ class CsaLightningIndexer(nn.Module):
 
     def forward(
         self,
-        c_Q: torch.Tensor,                # (B, T_q, q_lora_rank)
-        K_IComp: torch.Tensor,            # (B, T_kc, indexer_head_dim)
+        c_Q: torch.Tensor,  # (B, T_q, q_lora_rank)
+        K_IComp: torch.Tensor,  # (B, T_kc, indexer_head_dim)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(topk_idx, topk_scores)`` of shape ``(B, T_q, k_eff)``.
 
@@ -95,7 +95,7 @@ class CsaLightningIndexer(nn.Module):
         raw = torch.einsum("bqhd,bkd->bqhk", Q_idx, K_IComp)
         # ReLU then per-head weighted sum.
         relu = torch.relu(raw)
-        scores = torch.einsum("bqhk,h->bqk", relu, self.w_heads)   # (B, T_q, T_kc)
+        scores = torch.einsum("bqhk,h->bqk", relu, self.w_heads)  # (B, T_q, T_kc)
 
         topk_scores, topk_idx = scores.topk(k_eff, dim=-1)
         return topk_idx, topk_scores
@@ -103,9 +103,9 @@ class CsaLightningIndexer(nn.Module):
 
 # ---------------------------------------------------------------------------
 def _gather_topk_kv(
-    K_compressed: torch.Tensor,   # (B, T_kc, D)
-    V_compressed: torch.Tensor,   # (B, T_kc, D)
-    topk_idx: torch.Tensor,       # (B, T_q, k_eff)
+    K_compressed: torch.Tensor,  # (B, T_kc, D)
+    V_compressed: torch.Tensor,  # (B, T_kc, D)
+    topk_idx: torch.Tensor,  # (B, T_q, k_eff)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Gather a per-query subset of the compressed K/V streams.
 
@@ -123,12 +123,12 @@ def _gather_topk_kv(
 
 
 def sparse_mqa_with_sink(
-    Q: torch.Tensor,                      # (B, T_q, H, D)
-    K_sparse: torch.Tensor,               # (B, T_q, k_eff, D)
-    V_sparse: torch.Tensor,               # (B, T_q, k_eff, D)
-    K_window: Optional[torch.Tensor],     # (B, T_q, n_win, D)
-    V_window: Optional[torch.Tensor],     # (B, T_q, n_win, D)
-    sink_logits: torch.Tensor,            # (H,)
+    Q: torch.Tensor,  # (B, T_q, H, D)
+    K_sparse: torch.Tensor,  # (B, T_q, k_eff, D)
+    V_sparse: torch.Tensor,  # (B, T_q, k_eff, D)
+    K_window: Optional[torch.Tensor],  # (B, T_q, n_win, D)
+    V_window: Optional[torch.Tensor],  # (B, T_q, n_win, D)
+    sink_logits: torch.Tensor,  # (H,)
     *,
     swa_valid_mask: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
@@ -139,7 +139,7 @@ def sparse_mqa_with_sink(
     """
     B, T_q, H, D = Q.shape
     if scale is None:
-        scale = 1.0 / (D ** 0.5)
+        scale = 1.0 / (D**0.5)
 
     # Sparse-KV logits: (B, T_q, H, k_eff)
     logits_s = torch.einsum("bqhd,bqkd->bqhk", Q, K_sparse) * scale
@@ -203,7 +203,7 @@ class CsaAttention(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.n_win = n_win
         self.rope_base = rope_base
-        self.scale = 1.0 / (head_dim ** 0.5)
+        self.scale = 1.0 / (head_dim**0.5)
 
         f = {"device": device, "dtype": dtype}
 
@@ -252,24 +252,47 @@ class CsaAttention(nn.Module):
             num_indexer_heads=num_indexer_heads,
             indexer_head_dim=indexer_head_dim,
             top_k=top_k,
-            dtype=dtype, device=device,
+            dtype=dtype,
+            device=device,
         )
 
         self.o_proj = GroupedOutputProjection(
-            num_heads=num_heads, head_dim=head_dim, hidden_size=hidden_size,
-            o_groups=o_groups, o_lora_rank=o_lora_rank,
-            dtype=dtype, device=device,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            hidden_size=hidden_size,
+            o_groups=o_groups,
+            o_lora_rank=o_lora_rank,
+            dtype=dtype,
+            device=device,
         )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        for p in (self.W_DQ, self.W_UQ,
-                  self.W_K_a, self.W_K_b, self.W_KZ_a, self.W_KZ_b,
-                  self.W_V_a, self.W_V_b, self.W_VZ_a, self.W_VZ_b,
-                  self.W_IK_a, self.W_IK_b, self.W_IKZ_a, self.W_IKZ_b):
+        for p in (
+            self.W_DQ,
+            self.W_UQ,
+            self.W_K_a,
+            self.W_K_b,
+            self.W_KZ_a,
+            self.W_KZ_b,
+            self.W_V_a,
+            self.W_V_b,
+            self.W_VZ_a,
+            self.W_VZ_b,
+            self.W_IK_a,
+            self.W_IK_b,
+            self.W_IKZ_a,
+            self.W_IKZ_b,
+        ):
             nn.init.normal_(p, std=0.02)
-        for b in (self.bias_K_a, self.bias_K_b, self.bias_V_a, self.bias_V_b,
-                  self.bias_IK_a, self.bias_IK_b):
+        for b in (
+            self.bias_K_a,
+            self.bias_K_b,
+            self.bias_V_a,
+            self.bias_V_b,
+            self.bias_IK_a,
+            self.bias_IK_b,
+        ):
             nn.init.zeros_(b)
         nn.init.zeros_(self.sink_logits)
         nn.init.ones_(self.q_norm_weight)
@@ -282,8 +305,8 @@ class CsaAttention(nn.Module):
 
     def forward(
         self,
-        H: torch.Tensor,                       # (B, T, hidden_size)
-        positions: torch.Tensor,               # (T,)
+        H: torch.Tensor,  # (B, T, hidden_size)
+        positions: torch.Tensor,  # (T,)
         compressed_positions: Optional[torch.Tensor] = None,
         swa_valid_mask: Optional[torch.Tensor] = None,
         rms_eps: float = 1e-6,
@@ -291,21 +314,39 @@ class CsaAttention(nn.Module):
         B, T, _ = H.shape
 
         # --- Q LoRA ----------------------------------------------------------
-        c_Q = H @ self.W_DQ                                 # (B, T, q_lora_rank)
+        c_Q = H @ self.W_DQ  # (B, T, q_lora_rank)
         Q = (c_Q @ self.W_UQ).view(B, T, self.num_heads, self.head_dim)
 
         # --- CSA-compressed K, V, indexer-K ---------------------------------
         K_comp = csa_compress(
-            H, self.W_K_a, self.W_K_b, self.W_KZ_a, self.W_KZ_b,
-            self.bias_K_a, self.bias_K_b, self.m,
+            H,
+            self.W_K_a,
+            self.W_K_b,
+            self.W_KZ_a,
+            self.W_KZ_b,
+            self.bias_K_a,
+            self.bias_K_b,
+            self.m,
         )
         V_comp = csa_compress(
-            H, self.W_V_a, self.W_V_b, self.W_VZ_a, self.W_VZ_b,
-            self.bias_V_a, self.bias_V_b, self.m,
+            H,
+            self.W_V_a,
+            self.W_V_b,
+            self.W_VZ_a,
+            self.W_VZ_b,
+            self.bias_V_a,
+            self.bias_V_b,
+            self.m,
         )
         K_IComp = csa_compress(
-            H, self.W_IK_a, self.W_IK_b, self.W_IKZ_a, self.W_IKZ_b,
-            self.bias_IK_a, self.bias_IK_b, self.m,
+            H,
+            self.W_IK_a,
+            self.W_IK_b,
+            self.W_IKZ_a,
+            self.W_IKZ_b,
+            self.bias_IK_a,
+            self.bias_IK_b,
+            self.m,
         )
         T_kc = K_comp.shape[-2]
 
@@ -322,16 +363,23 @@ class CsaAttention(nn.Module):
         sin_q = self.rope_sin[positions]
         cos_k = self.rope_cos[compressed_positions]
         sin_k = self.rope_sin[compressed_positions]
-        Q = apply_partial_rope(Q, cos_q, sin_q, self.rope_head_dim)
+        # apply_partial_rope assumes (..., L, head_dim); Q is (B, T, H, D) so
+        # transpose T adjacent to head_dim before/after rotating.
+        Q = apply_partial_rope(
+            Q.transpose(1, 2),
+            cos_q,
+            sin_q,
+            self.rope_head_dim,
+        ).transpose(1, 2)
         K_comp = apply_partial_rope(K_comp, cos_k, sin_k, self.rope_head_dim)
 
         # --- Lightning indexer top-k selection ------------------------------
-        topk_idx, _ = self.indexer(c_Q, K_IComp)            # (B, T, k_eff)
+        topk_idx, _ = self.indexer(c_Q, K_IComp)  # (B, T, k_eff)
         K_sparse, V_sparse = _gather_topk_kv(K_comp, V_comp, topk_idx)
 
         # --- SWA window (raw H projected to a single MQA head) --------------
         if self.n_win > 0:
-            K_raw = H @ self.W_K_a                          # use 'a' projection arbitrarily
+            K_raw = H @ self.W_K_a  # use 'a' projection arbitrarily
             V_raw = H @ self.W_V_a
             K_window, V_window, mask = self._build_swa_views(K_raw, V_raw, B, T)
             if swa_valid_mask is None:
@@ -341,20 +389,35 @@ class CsaAttention(nn.Module):
 
         # --- Sparse MQA core ------------------------------------------------
         attn_out = sparse_mqa_with_sink(
-            Q, K_sparse, V_sparse, K_window, V_window, self.sink_logits,
-            swa_valid_mask=swa_valid_mask, scale=self.scale,
-        )                                                    # (B, T, H, D)
+            Q,
+            K_sparse,
+            V_sparse,
+            K_window,
+            V_window,
+            self.sink_logits,
+            swa_valid_mask=swa_valid_mask,
+            scale=self.scale,
+        )  # (B, T, H, D)
 
         # --- Inverse partial RoPE on output ---------------------------------
+        # attn_out is (B, T, H, D); same transpose trick as Q.
         attn_out = apply_partial_rope(
-            attn_out, cos_q, sin_q, self.rope_head_dim, inverse=True,
-        )
+            attn_out.transpose(1, 2),
+            cos_q,
+            sin_q,
+            self.rope_head_dim,
+            inverse=True,
+        ).transpose(1, 2)
 
         # --- Grouped output projection --------------------------------------
         return self.o_proj(attn_out)
 
     def _build_swa_views(
-        self, K_raw: torch.Tensor, V_raw: torch.Tensor, B: int, T: int,
+        self,
+        K_raw: torch.Tensor,
+        V_raw: torch.Tensor,
+        B: int,
+        T: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n_win = self.n_win
         t_idx = torch.arange(T, device=K_raw.device).unsqueeze(-1)
@@ -362,7 +425,7 @@ class CsaAttention(nn.Module):
         gather_idx = t_idx - (n_win - 1) + offsets
         invalid = ~(gather_idx >= 0)
         gather_idx = gather_idx.clamp_min(0)
-        K_window = K_raw[:, gather_idx, :]                   # (B, T, n_win, D)
+        K_window = K_raw[:, gather_idx, :]  # (B, T, n_win, D)
         V_window = V_raw[:, gather_idx, :]
         invalid = invalid.unsqueeze(0).expand(B, -1, -1)
         return K_window, V_window, invalid
