@@ -207,6 +207,34 @@ py_test(
 )
 
 py_test(
+    name = "deepseek_v4_model_test",
+    srcs = [
+        "deepseek_v4_model_test.py",
+        "deepseek_v4_infra_test.py",  # _make_blank_v4_model_config helper
+    ],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:models",
+        "//rtp_llm:transformers_utils",
+    ],
+    imports = [],
+    exec_properties = {'gpu':'H20'},
+)
+
+py_test(
+    name = "deepseek_v4_selector_test",
+    srcs = [
+        "deepseek_v4_selector_test.py",
+    ],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:models",
+    ],
+    imports = [],
+    exec_properties = {'gpu':'H20'},
+)
+
+py_test(
     name = "deepseekv4_detector_test",
     srcs = [
         "deepseekv4_detector_test.py",

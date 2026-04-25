@@ -32,6 +32,7 @@ from rtp_llm.models.deepseek_v4 import (
     DeepSeekV4Weight,
 )
 from rtp_llm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+from rtp_llm.utils.model_weight import W
 
 # Authoritative DeepSeek-V4-Flash-Base config (as published on HF).
 # Kept inline so the test does not depend on network or external checkpoints.
@@ -324,64 +325,270 @@ class DeepSeekV4M0SkeletonTest(TestCase):
         self.assertEqual(config.num_layers, 0)
         self.assertEqual(config.vocab_size, 129280)
 
-    def test_create_python_model_raises_not_implemented(self):
-        """The production engine path needs the V4 weight loader (PR-F);
-        the layer composition reference itself is in deepseek_v4_layer.py.
-        Whichever shape the error takes, it must clearly be V4-specific."""
-        with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp, "config.json"), "w") as f:
-                json.dump(FLASH_BASE_CONFIG, f)
-            config = DeepSeekV4._create_config(tmp)
-        instance = DeepSeekV4.__new__(DeepSeekV4)  # bypass full __init__
-        instance.model_config = config
-        with self.assertRaises(NotImplementedError) as ctx:
-            instance._create_python_model()
-        msg = str(ctx.exception)
-        self.assertIn("DeepSeek-V4", msg)
-        # Must point readers at the reference layer module so they can wire
-        # up bring-up themselves without re-discovering it.
-        self.assertIn("deepseek_v4_layer.py", msg)
+    def test_create_python_model_resolves_to_v4_model(self):
+        """Engine path: ``_create_python_model`` must import the V4 model
+        class without raising. Full instantiation needs a real
+        ``ModelWeights`` / ``ParallelismConfig`` so it's exercised in
+        :mod:`deepseek_v4_model_test`; here we just verify the import is
+        clean and no NotImplementedError leaks through."""
+        from rtp_llm.models_py.model_desc.deepseek_v4 import DeepSeekV4Model
+
+        self.assertTrue(callable(DeepSeekV4Model))
 
     def test_does_not_support_cuda_graph_yet(self):
-        """CUDA-graph capture would hit unimplemented kernels; off until M2."""
+        """CUDA-graph capture would re-trace per-token Sinkhorn iterations;
+        off until the fused mHC kernel lands."""
         instance = DeepSeekV4.__new__(DeepSeekV4)
         self.assertFalse(instance.support_cuda_graph())
 
 
 class DeepSeekV4WeightStubTest(TestCase):
-    """Validate that the weight loader stub yields a consistent-shaped plan
-    so the loader can iterate without raising during dummy-weight bring-up."""
+    """Validate the V4 per-layer weight plan against the published Flash
+    ``model.safetensors.index.json`` key set: every emitted ckpt key must
+    actually exist in the checkpoint, and every required ckpt key must be
+    emitted somewhere in the plan."""
 
-    def _make_stub_weight(self, num_layers: int = 4):
+    def _make_stub_weight(
+        self,
+        num_layers: int = 43,
+        compress_ratios=None,
+        expert_num: int = 256,
+    ):
         """Bypass ModelDeployWeightInfo.__init__ — we only need the shape of
         the layer plan, not a real ParallelismConfig / KVCacheConfig wiring."""
+        if compress_ratios is None:
+            compress_ratios = list(FLASH_BASE_CONFIG["compress_ratios"])
+        config = _make_blank_v4_model_config()
+        DeepSeekV4._populate_from_hf_dict(config, FLASH_BASE_CONFIG)
+        # Override knobs so a single shared config can serve different test
+        # topologies (e.g. 4-layer mini-model in fast unit tests).
+        config.num_layers = num_layers
+        config.attn_config.layer_compress_ratios = compress_ratios[: num_layers + 1]
         w = DeepSeekV4Weight.__new__(DeepSeekV4Weight)
         w._num_layers = num_layers
         w._hidden_size = 4096
+        w._is_gated_activation = True
+        w._align_size = 0
+        w.expert_num_ = expert_num
+        w.model_config = config
         return w
 
-    def test_layer_plan_is_empty_per_layer(self):
-        w = self._make_stub_weight(num_layers=43)
-        info = w._get_weight_info()
-        # One empty list per transformer block.
-        self.assertEqual(len(info.layer_weights), 43)
-        for layer_id, plan in enumerate(info.layer_weights):
-            self.assertEqual(plan, [], f"layer {layer_id} should be a no-op")
+    def _names_of(self, atoms):
+        out = set()
+        for a in atoms:
+            sub = getattr(a, "sub_weights", None)
+            if sub:
+                # CompositeWeight.sub_weights is a dict {name: atom}; both
+                # iterating the dict and iterating a list need to work.
+                children = sub.values() if isinstance(sub, dict) else sub
+                out.update(self._names_of(children))
+            else:
+                out.add(a.name)
+        return out
+
+    def test_layer_plan_contains_attention_atoms(self):
+        w = self._make_stub_weight(num_layers=4)
+        plan = w._get_hf_layer_weight_info(0)  # SWA-only (compress=0)
+        names = self._names_of(plan)
+        # Always-present per-layer attention atoms.
+        for n in (
+            W.v4_attn_norm,
+            W.v4_ffn_norm,
+            W.v4_q_norm,
+            W.v4_kv_norm,
+            W.v4_attn_sink,
+            W.v4_wq_a,
+            W.v4_wq_b,
+            W.v4_wkv,
+            W.v4_wo_a,
+            W.v4_wo_b,
+            W.v4_hc_attn_base,
+            W.v4_hc_attn_fn,
+            W.v4_hc_attn_scale,
+            W.v4_hc_ffn_base,
+            W.v4_hc_ffn_fn,
+            W.v4_hc_ffn_scale,
+        ):
+            self.assertIn(n, names)
+
+    def test_swa_only_layer_omits_compressor_and_indexer(self):
+        w = self._make_stub_weight(num_layers=4)
+        plan = w._get_hf_layer_weight_info(0)  # compress_ratios[0] == 0
+        names = self._names_of(plan)
+        for n in (
+            W.v4_compressor_ape,
+            W.v4_compressor_norm,
+            W.v4_compressor_wgate,
+            W.v4_compressor_wkv,
+            W.v4_indexer_compressor_ape,
+            W.v4_indexer_weights_proj,
+            W.v4_indexer_wq_b,
+        ):
+            self.assertNotIn(n, names, f"layer 0 (SWA) should not emit {n}")
+
+    def test_csa_layer_emits_compressor_and_indexer(self):
+        w = self._make_stub_weight(num_layers=4)
+        plan = w._get_hf_layer_weight_info(2)  # compress_ratios[2] == 4 (CSA)
+        names = self._names_of(plan)
+        for n in (
+            W.v4_compressor_ape,
+            W.v4_compressor_norm,
+            W.v4_compressor_wgate,
+            W.v4_compressor_wkv,
+            W.v4_indexer_compressor_ape,
+            W.v4_indexer_compressor_norm,
+            W.v4_indexer_compressor_wgate,
+            W.v4_indexer_compressor_wkv,
+            W.v4_indexer_weights_proj,
+            W.v4_indexer_wq_b,
+            W.v4_indexer_wq_b_s,
+        ):
+            self.assertIn(n, names, f"layer 2 (CSA) must emit {n}")
+
+    def test_hca_layer_emits_compressor_only(self):
+        w = self._make_stub_weight(num_layers=4)
+        plan = w._get_hf_layer_weight_info(3)  # compress_ratios[3] == 128 (HCA)
+        names = self._names_of(plan)
+        for n in (
+            W.v4_compressor_ape,
+            W.v4_compressor_norm,
+            W.v4_compressor_wgate,
+            W.v4_compressor_wkv,
+        ):
+            self.assertIn(n, names, f"layer 3 (HCA) must emit {n}")
+        for n in (
+            W.v4_indexer_compressor_ape,
+            W.v4_indexer_weights_proj,
+            W.v4_indexer_wq_b,
+        ):
+            self.assertNotIn(n, names, f"layer 3 (HCA) must not emit {n}")
+
+    def test_layer_plan_emits_moe_blocks(self):
+        w = self._make_stub_weight(num_layers=4)
+        # Layer 0 is hash-routed (Flash sets num_hash_layers=3).
+        plan_hash = w._get_hf_layer_weight_info(0)
+        names_hash = self._names_of(plan_hash)
+        self.assertIn(W.v4_moe_gate_w, names_hash)
+        self.assertIn(W.v4_moe_gate_tid2eid, names_hash)
+        self.assertNotIn(W.v4_moe_gate_b, names_hash)
+        # Layer 3 uses learned routing → emits bias, no tid2eid.
+        plan_learn = w._get_hf_layer_weight_info(3)
+        names_learn = self._names_of(plan_learn)
+        self.assertIn(W.v4_moe_gate_w, names_learn)
+        self.assertIn(W.v4_moe_gate_b, names_learn)
+        self.assertNotIn(W.v4_moe_gate_tid2eid, names_learn)
+        # Shared expert (always-on) + routed experts must show up on every
+        # layer regardless of routing strategy.
+        for n in (
+            W.v4_shared_w1,
+            W.v4_shared_w1_s,
+            W.v4_shared_w2,
+            W.v4_shared_w2_s,
+            W.v4_shared_w3,
+            W.v4_shared_w3_s,
+            W.v4_experts_w1,
+            W.v4_experts_w1_s,
+            W.v4_experts_w2,
+            W.v4_experts_w2_s,
+            W.v4_experts_w3,
+            W.v4_experts_w3_s,
+        ):
+            self.assertIn(n, names_hash)
+            self.assertIn(n, names_learn)
 
     def test_global_weights_present(self):
         w = self._make_stub_weight()
         info = w._get_weight_info()
         names = {atom.name for atom in info.weights}
         # Embedding / final-norm / lm_head are the minimum a HF ckpt provides.
-        self.assertIn("embedding", names)
-        self.assertIn("final_layernorm.gamma", names)
-        self.assertIn("final_layernorm.beta", names)
-        self.assertIn("lm_head", names)
+        self.assertIn(W.embedding, names)
+        self.assertIn(W.final_ln_gamma, names)
+        self.assertIn(W.final_ln_beta, names)
+        self.assertIn(W.lm_head, names)
+        # Head-side mHC reduction (paper §2.5) lives in the global surface.
+        self.assertIn(W.v4_hc_head_base, names)
+        self.assertIn(W.v4_hc_head_fn, names)
+        self.assertIn(W.v4_hc_head_scale, names)
 
-    def test_get_hf_layer_weight_info_is_noop(self):
+    def test_global_weights_use_v4_naming(self):
+        """V4 ships embeddings under bare keys (``embed.weight`` / ``norm`` /
+        ``head``); reject any plan that still uses V3's ``model.embed_tokens``
+        prefix, since loading would silently miss the actual data."""
         w = self._make_stub_weight()
-        for layer_id in range(3):
-            self.assertEqual(w._get_hf_layer_weight_info(layer_id), [])
+        info = w._get_weight_info()
+        glob_atoms = {a.name: a for a in info.weights}
+        emb_keys = [ck.name for ck in glob_atoms[W.embedding].weights]
+        head_keys = [ck.name for ck in glob_atoms[W.lm_head].weights]
+        norm_keys = [ck.name for ck in glob_atoms[W.final_ln_gamma].weights]
+        self.assertEqual(emb_keys, ["embed.weight"])
+        self.assertEqual(head_keys, ["head.weight"])
+        self.assertEqual(norm_keys, ["norm.weight"])
+
+    def test_layer_plan_includes_quant_scales(self):
+        """V4 ships FP8 weights with ue8m0 ``.scale`` siblings. The loader
+        must emit *both* atoms so the per-tensor scale is preserved — leaving
+        scales out would silently dequantize garbage."""
+        w = self._make_stub_weight(num_layers=4)
+        plan = w._get_hf_layer_weight_info(2)  # CSA: maximally featureful
+        names = self._names_of(plan)
+        # FP8 + scale pairs: every wq_*/wkv/wo_* / shared / experts atom must
+        # come with its matching ``_s`` scale atom.
+        pairs = [
+            (W.v4_wq_a, W.v4_wq_a_s),
+            (W.v4_wq_b, W.v4_wq_b_s),
+            (W.v4_wkv, W.v4_wkv_s),
+            (W.v4_wo_a, W.v4_wo_a_s),
+            (W.v4_wo_b, W.v4_wo_b_s),
+            (W.v4_indexer_wq_b, W.v4_indexer_wq_b_s),
+            (W.v4_shared_w1, W.v4_shared_w1_s),
+            (W.v4_shared_w2, W.v4_shared_w2_s),
+            (W.v4_shared_w3, W.v4_shared_w3_s),
+            (W.v4_experts_w1, W.v4_experts_w1_s),
+            (W.v4_experts_w2, W.v4_experts_w2_s),
+            (W.v4_experts_w3, W.v4_experts_w3_s),
+        ]
+        for w_name, s_name in pairs:
+            self.assertIn(w_name, names, f"missing weight atom {w_name}")
+            self.assertIn(s_name, names, f"missing scale atom {s_name}")
+
+    def test_ckpt_keys_match_published_flash_index(self):
+        """For each per-layer plan emitted, every CkptWeightInfo key must
+        formatable into a key that follows V4-Flash's index conventions
+        (i.e. starts with ``layers.{layer_id}.`` and ends with ``.weight``,
+        ``.scale``, ``.bias``, ``.tid2eid``, ``ape`` or one of the bare
+        ``hc_*`` suffixes)."""
+        import re
+
+        valid_suffixes = re.compile(
+            r"\.(weight|scale|bias|tid2eid|ape)$"
+            r"|^layers\.\d+\.hc_(attn|ffn)_(base|fn|scale)$"
+            r"|^layers\.\d+\.attn\.(attn_sink|compressor\.ape"
+            r"|indexer\.compressor\.ape)$"
+        )
+        w = self._make_stub_weight(num_layers=4)
+        for layer_id in range(4):
+            plan = w._get_hf_layer_weight_info(layer_id)
+            for atom in self._iter_atoms(plan):
+                for ck in atom.weights:
+                    name = ck.name.format(i=str(layer_id), expert_id="0")
+                    self.assertTrue(
+                        name.startswith(f"layers.{layer_id}.")
+                        or name.startswith("hc_head_"),
+                        f"{name!r} does not look like a V4 ckpt key",
+                    )
+                    self.assertTrue(
+                        valid_suffixes.search(name) is not None,
+                        f"{name!r} has an unrecognised suffix",
+                    )
+
+    def _iter_atoms(self, items):
+        for it in items:
+            sub = getattr(it, "sub_weights", None)
+            if sub:
+                children = sub.values() if isinstance(sub, dict) else sub
+                yield from self._iter_atoms(children)
+            else:
+                yield it
 
     def test_process_meta_does_not_inspect_keys(self):
         """V2 inspects weight keys for q_a_proj etc.; V4 must not — those keys
@@ -393,13 +600,36 @@ class DeepSeekV4WeightStubTest(TestCase):
 
 
 class DeepSeekV4MtpWeightTest(TestCase):
-    """V4 MTP loader — exposes V3-style enorm/hnorm/eh_proj/shared_head."""
+    """V4 MTP loader: full V4 SWA-only block under ``mtp.{i}.*`` keys plus
+    enorm / hnorm / e_proj / h_proj and a per-MTP head-side mHC reduction."""
 
     def _make_stub_mtp_weight(self):
+        config = _make_blank_v4_model_config()
+        DeepSeekV4._populate_from_hf_dict(config, FLASH_BASE_CONFIG)
+        config.num_layers = 1
+        # MTP slot is the trailing 0 entry of compress_ratios.
+        config.attn_config.layer_compress_ratios = [0]
         w = DeepSeekV4MtpWeight.__new__(DeepSeekV4MtpWeight)
         w._num_layers = 1
         w._hidden_size = 4096
+        w._is_gated_activation = True
+        w._align_size = 0
+        w.expert_num_ = 256
+        w.model_config = config
         return w
+
+    def _names_of(self, atoms):
+        out = set()
+        for a in atoms:
+            sub = getattr(a, "sub_weights", None)
+            if sub:
+                # CompositeWeight.sub_weights is a dict {name: atom}; both
+                # iterating the dict and iterating a list need to work.
+                children = sub.values() if isinstance(sub, dict) else sub
+                out.update(self._names_of(children))
+            else:
+                out.add(a.name)
+        return out
 
     def test_layer_plan_has_mtp_aux_tensors(self):
         from rtp_llm.utils.model_weight import W
@@ -407,43 +637,357 @@ class DeepSeekV4MtpWeightTest(TestCase):
         w = self._make_stub_mtp_weight()
         info = w._get_weight_info()
         self.assertEqual(len(info.layer_weights), 1)
-        names = {a.name for a in info.layer_weights[0]}
-        # Per V3 MTP convention, all five auxiliary tensors must show up.
+        names = self._names_of(info.layer_weights[0])
+        # V3-style enorm/hnorm/final-ln still live in the layer plan.
         self.assertIn(W.multi_tokens_predict_final_ln_gamma, names)
         self.assertIn(W.multi_tokens_predict_final_ln_beta, names)
         self.assertIn(W.multi_tokens_predict_enorm, names)
         self.assertIn(W.multi_tokens_predict_hnorm, names)
-        self.assertIn(W.multi_tokens_predict_eh_proj, names)
+        # V4-specific: split e_proj / h_proj instead of fused eh_proj, with
+        # ue8m0 scales.
+        self.assertIn(W.v4_mtp_e_proj, names)
+        self.assertIn(W.v4_mtp_e_proj_s, names)
+        self.assertIn(W.v4_mtp_h_proj, names)
+        self.assertIn(W.v4_mtp_h_proj_s, names)
+        # MTP-local head-side mHC reduction.
+        self.assertIn(W.v4_hc_head_base, names)
+        self.assertIn(W.v4_hc_head_fn, names)
+        self.assertIn(W.v4_hc_head_scale, names)
 
-    def test_global_weights_use_mtp_layer0_keys(self):
+    def test_layer_plan_includes_full_v4_attention(self):
+        """MTP rides on top of a V4 SWA-only attention block — all of the
+        usual per-layer V4 atoms (LoRA Q/KV/O, Q/K-norm, sink, MoE) must show
+        up under the ``mtp.{i}.*`` namespace."""
         w = self._make_stub_mtp_weight()
         info = w._get_weight_info()
-        # Embedding & lm_head live under model.layers.0.* in MTP ckpts.
+        names = self._names_of(info.layer_weights[0])
+        for n in (
+            W.v4_attn_norm,
+            W.v4_ffn_norm,
+            W.v4_q_norm,
+            W.v4_kv_norm,
+            W.v4_attn_sink,
+            W.v4_wq_a,
+            W.v4_wq_b,
+            W.v4_wkv,
+            W.v4_wo_a,
+            W.v4_wo_b,
+            W.v4_hc_attn_base,
+            W.v4_hc_ffn_base,
+            W.v4_moe_gate_w,
+            W.v4_shared_w1,
+            W.v4_experts_w1,
+        ):
+            self.assertIn(n, names, f"MTP plan missing {n}")
+        # MTP runs single-token spec-decode; it must NOT carry a compressor.
+        for n in (W.v4_compressor_ape, W.v4_indexer_compressor_ape):
+            self.assertNotIn(n, names, f"MTP must not emit {n}")
+
+    def test_layer_keys_use_mtp_prefix(self):
+        """Every per-layer ckpt key must be rebased onto ``mtp.{i}.*`` — the
+        V4-Flash MTP ckpt has no ``layers.{i}.*`` aliases for them."""
+        w = self._make_stub_mtp_weight()
+        info = w._get_weight_info()
+        for atom in info.layer_weights[0]:
+            for sub in getattr(atom, "sub_weights", None) or [atom]:
+                for ck in getattr(sub, "weights", []):
+                    if "{i}" in ck.name:
+                        self.assertTrue(
+                            ck.name.startswith("mtp.{i}."),
+                            f"{ck.name!r} not under mtp.* namespace",
+                        )
+
+    def test_global_weights_are_zero_placeholders(self):
+        """V4 MTP shares its embedding + lm_head with the base model. The
+        ckpt does not ship them, so the loader emits zero placeholders that
+        ``MtpExecutor`` will alias to the real tensors at runtime."""
+        w = self._make_stub_mtp_weight()
+        info = w._get_weight_info()
         glob_atoms = {a.name: a for a in info.weights}
-        self.assertIn("embedding", glob_atoms)
-        self.assertIn("lm_head", glob_atoms)
-        emb_keys = [ckpt.name for ckpt in glob_atoms["embedding"].weights]
-        self.assertEqual(emb_keys, ["model.layers.0.embed_tokens.weight"])
-        head_keys = [ckpt.name for ckpt in glob_atoms["lm_head"].weights]
-        self.assertEqual(head_keys, ["model.layers.0.shared_head.head.weight"])
+        self.assertIn(W.embedding, glob_atoms)
+        self.assertIn(W.lm_head, glob_atoms)
+        # Both atoms have no source ckpt key (zero-fill via process_fun).
+        self.assertEqual(glob_atoms[W.embedding].weights, [])
+        self.assertEqual(glob_atoms[W.lm_head].weights, [])
 
     def test_rejects_more_than_one_mtp_layer(self):
+        # We deliberately bypass the helper to set num_layers=2.
+        config = _make_blank_v4_model_config()
+        DeepSeekV4._populate_from_hf_dict(config, FLASH_BASE_CONFIG)
+        config.num_layers = 2
+        config.attn_config.layer_compress_ratios = [0, 0]
         w = DeepSeekV4MtpWeight.__new__(DeepSeekV4MtpWeight)
         w._num_layers = 2
         w._hidden_size = 4096
+        w._is_gated_activation = True
+        w._align_size = 0
+        w.expert_num_ = 256
+        w.model_config = config
         with self.assertRaises(AssertionError):
             w._get_weight_info()
 
-    def test_eh_proj_uses_transpose_processor(self):
-        from rtp_llm.utils.model_weight import W
 
-        w = self._make_stub_mtp_weight()
+class DeepSeekV4FlashCkptCoverageTest(TestCase):
+    """End-to-end loader coverage against the published V4-Flash key set.
+
+    The full ``model.safetensors.index.json`` for ``DeepSeek-V4-Flash`` lists
+    ~69k tensors (43 layers × ~250 keys + MTP + globals). Walking the real
+    file would require the snapshot to be present on disk, so this test bakes
+    in the *unique key patterns* with placeholders for layer index and expert
+    id and checks every pattern is reachable from the loader's plan.
+
+    If the loader misses a pattern, the model would silently load with random
+    weights for that tensor; if it emits a pattern not in this set, loading
+    against a real ckpt would fail with a missing-key error. Either drift is
+    a regression we want to catch in CI.
+    """
+
+    # Per-layer attention + always-present FFN atoms.
+    _PER_LAYER_ALWAYS = (
+        "layers.{i}.attn_norm.weight",
+        "layers.{i}.ffn_norm.weight",
+        "layers.{i}.attn.q_norm.weight",
+        "layers.{i}.attn.kv_norm.weight",
+        "layers.{i}.attn.attn_sink",
+        "layers.{i}.attn.wq_a.weight",
+        "layers.{i}.attn.wq_a.scale",
+        "layers.{i}.attn.wq_b.weight",
+        "layers.{i}.attn.wq_b.scale",
+        "layers.{i}.attn.wkv.weight",
+        "layers.{i}.attn.wkv.scale",
+        "layers.{i}.attn.wo_a.weight",
+        "layers.{i}.attn.wo_a.scale",
+        "layers.{i}.attn.wo_b.weight",
+        "layers.{i}.attn.wo_b.scale",
+        "layers.{i}.hc_attn_base",
+        "layers.{i}.hc_attn_fn",
+        "layers.{i}.hc_attn_scale",
+        "layers.{i}.hc_ffn_base",
+        "layers.{i}.hc_ffn_fn",
+        "layers.{i}.hc_ffn_scale",
+        # MoE — one per layer (all layers are MoE in V4).
+        "layers.{i}.ffn.gate.weight",
+        "layers.{i}.ffn.shared_experts.w1.weight",
+        "layers.{i}.ffn.shared_experts.w1.scale",
+        "layers.{i}.ffn.shared_experts.w2.weight",
+        "layers.{i}.ffn.shared_experts.w2.scale",
+        "layers.{i}.ffn.shared_experts.w3.weight",
+        "layers.{i}.ffn.shared_experts.w3.scale",
+        # Routed experts — stacked, but one logical key per ``(w_i, scale_i)``.
+        "layers.{i}.ffn.experts.{e}.w1.weight",
+        "layers.{i}.ffn.experts.{e}.w1.scale",
+        "layers.{i}.ffn.experts.{e}.w2.weight",
+        "layers.{i}.ffn.experts.{e}.w2.scale",
+        "layers.{i}.ffn.experts.{e}.w3.weight",
+        "layers.{i}.ffn.experts.{e}.w3.scale",
+    )
+
+    # Hash-routed layers (first num_hash_layers): tid2eid in place of bias.
+    _PER_LAYER_HASH_ROUTED = ("layers.{i}.ffn.gate.tid2eid",)
+    # Learned-routed layers: e_score_correction_bias.
+    _PER_LAYER_LEARNED_ROUTED = ("layers.{i}.ffn.gate.bias",)
+
+    _PER_LAYER_COMPRESSOR = (
+        "layers.{i}.attn.compressor.ape",
+        "layers.{i}.attn.compressor.norm.weight",
+        "layers.{i}.attn.compressor.wgate.weight",
+        "layers.{i}.attn.compressor.wkv.weight",
+    )
+
+    _PER_LAYER_INDEXER = (
+        "layers.{i}.attn.indexer.compressor.ape",
+        "layers.{i}.attn.indexer.compressor.norm.weight",
+        "layers.{i}.attn.indexer.compressor.wgate.weight",
+        "layers.{i}.attn.indexer.compressor.wkv.weight",
+        "layers.{i}.attn.indexer.weights_proj.weight",
+        "layers.{i}.attn.indexer.wq_b.weight",
+        "layers.{i}.attn.indexer.wq_b.scale",
+    )
+
+    _GLOBAL = (
+        "embed.weight",
+        "norm.weight",
+        "head.weight",
+        "hc_head_base",
+        "hc_head_fn",
+        "hc_head_scale",
+    )
+
+    def _emitted_keys(self, w, layer_id):
+        """Walk a layer plan, yield the exact ckpt key it expects."""
+        for atom in self._iter_atoms(w._get_hf_layer_weight_info(layer_id)):
+            for ck in atom.weights:
+                yield ck.name.format(i=str(layer_id), expert_id="0")
+
+    def _iter_atoms(self, items):
+        for it in items:
+            sub = getattr(it, "sub_weights", None)
+            if sub:
+                children = sub.values() if isinstance(sub, dict) else sub
+                yield from self._iter_atoms(children)
+            else:
+                yield it
+
+    def _make_full_flash_loader(self):
+        config = _make_blank_v4_model_config()
+        DeepSeekV4._populate_from_hf_dict(config, FLASH_BASE_CONFIG)
+        w = DeepSeekV4.get_weight_cls().__new__(DeepSeekV4.get_weight_cls())
+        w._num_layers = 43
+        w._hidden_size = 4096
+        w._is_gated_activation = True
+        w._align_size = 0
+        w.expert_num_ = 256
+        w.model_config = config
+        return w
+
+    def _routing_keys_for(self, layer_id: int):
+        """Return the gate-routing key set this layer should emit, given
+        Flash's ``num_hash_layers=3``."""
+        if layer_id < 3:
+            return self._PER_LAYER_HASH_ROUTED
+        return self._PER_LAYER_LEARNED_ROUTED
+
+    def test_swa_only_layers_match_flash_index(self):
+        """Layers 0 and 1 in V4-Flash are SWA-only — no compressor / indexer
+        keys in the published index. The loader must emit exactly the
+        always-present per-layer key set for them (plus the hash-routing
+        ``tid2eid`` since both lie in the first 3 MoE blocks)."""
+        w = self._make_full_flash_loader()
+        for layer_id in (0, 1):
+            emitted = set(self._emitted_keys(w, layer_id))
+            expected_always = {
+                p.format(i=str(layer_id), e="0")
+                for p in self._PER_LAYER_ALWAYS + self._routing_keys_for(layer_id)
+            }
+            self.assertTrue(
+                expected_always.issubset(emitted),
+                f"layer {layer_id}: missing {expected_always - emitted}",
+            )
+            for p in self._PER_LAYER_COMPRESSOR + self._PER_LAYER_INDEXER:
+                k = p.format(i=str(layer_id))
+                self.assertNotIn(k, emitted, f"layer {layer_id} should NOT emit {k}")
+
+    def test_csa_layers_match_flash_index(self):
+        """Even-indexed layers ≥2 in V4-Flash are CSA — they ship both the
+        token-level compressor and the lightning indexer branch."""
+        w = self._make_full_flash_loader()
+        for layer_id in (2, 4, 6, 42):
+            emitted = set(self._emitted_keys(w, layer_id))
+            for p in (
+                self._PER_LAYER_ALWAYS
+                + self._PER_LAYER_COMPRESSOR
+                + self._PER_LAYER_INDEXER
+                + self._routing_keys_for(layer_id)
+            ):
+                k = p.format(i=str(layer_id), e="0")
+                self.assertIn(
+                    k,
+                    emitted,
+                    f"layer {layer_id} (CSA): missing {k}",
+                )
+
+    def test_hca_layers_match_flash_index(self):
+        """Odd-indexed layers ≥3 in V4-Flash are HCA — compressor only,
+        no indexer."""
+        w = self._make_full_flash_loader()
+        for layer_id in (3, 5, 7, 41):
+            emitted = set(self._emitted_keys(w, layer_id))
+            for p in (
+                self._PER_LAYER_ALWAYS
+                + self._PER_LAYER_COMPRESSOR
+                + self._routing_keys_for(layer_id)
+            ):
+                k = p.format(i=str(layer_id), e="0")
+                self.assertIn(
+                    k,
+                    emitted,
+                    f"layer {layer_id} (HCA): missing {k}",
+                )
+            for p in self._PER_LAYER_INDEXER:
+                k = p.format(i=str(layer_id))
+                self.assertNotIn(k, emitted, f"layer {layer_id} (HCA): unexpected {k}")
+
+    def test_global_keys_match_flash_index(self):
+        w = self._make_full_flash_loader()
         info = w._get_weight_info()
-        eh_atom = next(
-            a for a in info.layer_weights[0] if a.name == W.multi_tokens_predict_eh_proj
+        emitted_global = set()
+        for atom in info.weights:
+            for ck in atom.weights:
+                emitted_global.add(ck.name)
+        for k in self._GLOBAL:
+            self.assertIn(k, emitted_global, f"missing global key {k}")
+
+    def test_against_real_flash_index_if_available(self):
+        """If the published V4-Flash snapshot is mounted, walk its real
+        ``model.safetensors.index.json`` and assert every emitted key shows
+        up in the index. Skips silently when the snapshot is not available
+        (CI workers without the model mount)."""
+        candidate_dirs = [
+            "/home/wangyin.yx/.cache/huggingface/hub/"
+            "models--deepseek-ai--DeepSeek-V4-Flash/snapshots/"
+            "6e763230a9d263eca2023f1d4a5ce1bfe126cf48",
+        ]
+        index_path = None
+        for d in candidate_dirs:
+            p = os.path.join(d, "model.safetensors.index.json")
+            if os.path.exists(p):
+                index_path = p
+                break
+        if index_path is None:
+            self.skipTest("V4-Flash snapshot not on this host")
+        with open(index_path) as f:
+            ckpt_keys = set(json.load(f)["weight_map"].keys())
+        w = self._make_full_flash_loader()
+
+        # Per-layer plan emits keys that are formatable into ckpt names.
+        info = w._get_weight_info()
+        missing = []
+        for layer_id, plan in enumerate(info.layer_weights):
+            if layer_id >= w._num_layers:
+                break
+            for atom in self._iter_atoms(plan):
+                for ck in atom.weights:
+                    name = ck.name.format(i=str(layer_id), expert_id="0")
+                    if name not in ckpt_keys:
+                        missing.append((layer_id, name))
+        # Globals.
+        for atom in info.weights:
+            for ck in atom.weights:
+                if ck.name and ck.name not in ckpt_keys:
+                    missing.append(("global", ck.name))
+        self.assertEqual(
+            missing,
+            [],
+            f"loader emits {len(missing)} keys not present in V4-Flash index "
+            f"(showing first 5: {missing[:5]})",
         )
-        # transpose, identity, etc. are picklable callables — compare by name.
-        self.assertEqual(eh_atom.process_fun.__name__, "transpose")
+
+    def test_loader_does_not_emit_v3_only_keys(self):
+        """V3 ckpt keys (``model.embed_tokens.weight``, ``q_a_proj`` etc.)
+        must never show up in a V4 plan — they would cause weight loading to
+        either fail (key missing) or, worse, silently load wrong data."""
+        w = self._make_full_flash_loader()
+        info = w._get_weight_info()
+        all_emitted = set()
+        for plan in info.layer_weights:
+            for atom in self._iter_atoms(plan):
+                for ck in atom.weights:
+                    all_emitted.add(ck.name)
+        for atom in info.weights:
+            for ck in atom.weights:
+                all_emitted.add(ck.name)
+        for v3_only in (
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+            "model.layers.{i}.self_attn.q_a_proj.weight",
+            "model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight",
+            "model.layers.{i}.self_attn.kv_b_proj.weight",
+            "model.layers.{i}.self_attn.q_a_layernorm.weight",
+            "model.layers.{i}.input_layernorm.weight",
+            "model.layers.{i}.post_attention_layernorm.weight",
+        ):
+            self.assertNotIn(v3_only, all_emitted, f"V3-only key leaked: {v3_only}")
 
 
 class DeepseekV4HfConfigTest(TestCase):

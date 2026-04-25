@@ -41,7 +41,9 @@ import torch.nn as nn
 
 from rtp_llm.models_py.modules.hybrid.hca_attention import HcaAttention
 from rtp_llm.models_py.modules.mhc import MhcLayer
+from rtp_llm.models_py.modules.moe.batched_experts import batched_experts_forward
 from rtp_llm.models_py.modules.moe.clamped_swiglu import clamped_swiglu_split
+from rtp_llm.models_py.modules.moe.deepgemm_megamoe import deepgemm_megamoe_or_batched
 from rtp_llm.models_py.modules.moe.hash_router import hash_route_topk
 from rtp_llm.models_py.modules.moe.v4_gating import noaux_tc_topk_v4
 
@@ -97,15 +99,15 @@ class DeepSeekV4MoE(nn.Module):
         f = {"device": device, "dtype": dtype}
         # Routed experts — stack along an extra leading dim so a single batched
         # matmul covers all of them. (Reference; production uses MegaMoE.)
-        self.W_gate = nn.Parameter(torch.empty(
-            num_routed_experts, hidden_size, moe_intermediate_size, **f
-        ))
-        self.W_up = nn.Parameter(torch.empty(
-            num_routed_experts, hidden_size, moe_intermediate_size, **f
-        ))
-        self.W_down = nn.Parameter(torch.empty(
-            num_routed_experts, moe_intermediate_size, hidden_size, **f
-        ))
+        self.W_gate = nn.Parameter(
+            torch.empty(num_routed_experts, hidden_size, moe_intermediate_size, **f)
+        )
+        self.W_up = nn.Parameter(
+            torch.empty(num_routed_experts, hidden_size, moe_intermediate_size, **f)
+        )
+        self.W_down = nn.Parameter(
+            torch.empty(num_routed_experts, moe_intermediate_size, hidden_size, **f)
+        )
 
         # Shared expert (always-on)
         shared_inter = moe_intermediate_size * n_shared_experts
@@ -121,11 +123,27 @@ class DeepSeekV4MoE(nn.Module):
             self.register_parameter("gate", None)
             self.register_parameter("e_score_bias", None)
 
+        # Optional FP8-packed expert weights for the DeepGEMM MegaMoE
+        # production path. Layout (per :func:`deepgemm_megamoe_forward`):
+        #   W_gate_up_fp8 : (E, 2*inter, hidden) e4m3
+        #   W_gate_up_sf  : per-block fp32 scale tensor
+        #   W_down_fp8    : (E, hidden, inter) e4m3
+        #   W_down_sf     : per-block fp32 scale tensor
+        # Loader populates these post-init when packing is wired (PR-F2).
+        # Until then the selector below falls back to the bf16 batched path.
+        self.fp8_expert_weights = None
+
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        for p in (self.W_gate, self.W_up, self.W_down,
-                  self.W_shared_gate, self.W_shared_up, self.W_shared_down):
+        for p in (
+            self.W_gate,
+            self.W_up,
+            self.W_down,
+            self.W_shared_gate,
+            self.W_shared_up,
+            self.W_shared_down,
+        ):
             nn.init.normal_(p, std=0.02)
         if self.gate is not None:
             nn.init.normal_(self.gate, std=0.02)
@@ -145,7 +163,9 @@ class DeepSeekV4MoE(nn.Module):
         return h @ self.W_shared_down
 
     def forward(
-        self, x: torch.Tensor, token_ids: Optional[torch.Tensor] = None,
+        self,
+        x: torch.Tensor,
+        token_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``x``: ``(B, T, hidden)``. Returns ``(B, T, hidden)``.
 
@@ -164,30 +184,37 @@ class DeepSeekV4MoE(nn.Module):
                 )
             ids_flat = token_ids.reshape(-1)
             topk_idx, gate_vals = hash_route_topk(
-                ids_flat, self.num_routed_experts, self.top_k,
+                ids_flat,
+                self.num_routed_experts,
+                self.top_k,
                 self.routed_scaling_factor,
             )
             gate_vals = gate_vals.to(x.dtype)
         else:
-            logits = flat @ self.gate                           # (N, E)
+            logits = flat @ self.gate  # (N, E)
             topk_idx, gate_vals = noaux_tc_topk_v4(
-                logits, self.e_score_bias, self.top_k,
+                logits,
+                self.e_score_bias,
+                self.top_k,
                 self.routed_scaling_factor,
                 norm_topk_prob=self.norm_topk_prob,
             )
 
-        # ---- Routed experts (reference: scatter loop over experts) ---------
-        out = torch.zeros_like(flat)
-        for e in range(self.num_routed_experts):
-            # mask: (N, top_k) of which slots picked expert e
-            mask = (topk_idx == e)
-            if not mask.any():
-                continue
-            tok_idx, slot_idx = mask.nonzero(as_tuple=True)
-            x_e = flat[tok_idx]                                  # (M, H)
-            y_e = self._expert_forward(x_e, e)                   # (M, H)
-            scale = gate_vals[tok_idx, slot_idx].unsqueeze(-1)   # (M, 1)
-            out.index_add_(0, tok_idx, y_e * scale)
+        # ---- Routed experts via the production-path selector.
+        # ``deepgemm_megamoe_or_batched`` picks the DeepGEMM FP8 MegaMoE
+        # kernel (single masked grouped GEMM, all experts in one launch)
+        # whenever ``deep_gemm`` is importable AND the loader has packed
+        # ``self.fp8_expert_weights``. Otherwise it transparently routes
+        # through :func:`batched_experts_forward` — same numerical
+        # behaviour as before. See vLLM PR #40760 / SGLang PR #23600.
+        out = deepgemm_megamoe_or_batched(
+            flat,
+            topk_idx,
+            gate_vals,
+            bf16_weights=(self.W_gate, self.W_up, self.W_down),
+            fp8_weights=self.fp8_expert_weights,
+            swiglu_limit=self.swiglu_limit,
+        )
 
         # ---- Shared expert (always on) ------------------------------------
         out = out + self._shared_forward(flat)
@@ -241,14 +268,20 @@ class DeepSeekV4DecoderLayer(nn.Module):
         # paper uses *separate* parameter sets for the two — each sub-block
         # generates its own A/B/C from the *current* residual stream.
         self.mhc_attn = MhcLayer(
-            hidden_size=hidden_size, hc_mult=hc_mult,
-            sinkhorn_iters=sinkhorn_iters, eps=rms_eps,
-            dtype=dtype, device=device,
+            hidden_size=hidden_size,
+            hc_mult=hc_mult,
+            sinkhorn_iters=sinkhorn_iters,
+            eps=rms_eps,
+            dtype=dtype,
+            device=device,
         )
         self.mhc_ffn = MhcLayer(
-            hidden_size=hidden_size, hc_mult=hc_mult,
-            sinkhorn_iters=sinkhorn_iters, eps=rms_eps,
-            dtype=dtype, device=device,
+            hidden_size=hidden_size,
+            hc_mult=hc_mult,
+            sinkhorn_iters=sinkhorn_iters,
+            eps=rms_eps,
+            dtype=dtype,
+            device=device,
         )
 
         self.attention = HcaAttention(
@@ -264,7 +297,8 @@ class DeepSeekV4DecoderLayer(nn.Module):
             rope_base=rope_base,
             rope_max_pos=rope_max_pos,
             rms_eps=rms_eps,
-            dtype=dtype, device=device,
+            dtype=dtype,
+            device=device,
         )
 
         self.moe = DeepSeekV4MoE(
@@ -277,22 +311,23 @@ class DeepSeekV4DecoderLayer(nn.Module):
             n_shared_experts=n_shared_experts,
             routed_scaling_factor=routed_scaling_factor,
             swiglu_limit=swiglu_limit,
-            dtype=dtype, device=device,
+            dtype=dtype,
+            device=device,
         )
 
     def forward(
         self,
-        residual: torch.Tensor,             # (B, T, n_hc, d)
-        positions: torch.Tensor,            # (T,)
+        residual: torch.Tensor,  # (B, T, n_hc, d)
+        positions: torch.Tensor,  # (T,)
         token_ids: Optional[torch.Tensor],  # (B, T) — needed iff hash routing
     ) -> torch.Tensor:
         # ---- Attention sub-block -----------------------------------------
-        attn_in, attn_params = self.mhc_attn.pre_mix(residual)         # (B, T, d)
-        attn_out = self.attention(attn_in, positions)                  # (B, T, d)
+        attn_in, attn_params = self.mhc_attn.pre_mix(residual)  # (B, T, d)
+        attn_out = self.attention(attn_in, positions)  # (B, T, d)
         residual = self.mhc_attn.post_mix(residual, attn_out, attn_params)
 
         # ---- FFN sub-block (MoE) -----------------------------------------
         ffn_in, ffn_params = self.mhc_ffn.pre_mix(residual)
-        ffn_out = self.moe(ffn_in, token_ids)                           # (B, T, d)
+        ffn_out = self.moe(ffn_in, token_ids)  # (B, T, d)
         residual = self.mhc_ffn.post_mix(residual, ffn_out, ffn_params)
         return residual

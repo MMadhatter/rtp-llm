@@ -147,3 +147,103 @@ py_test (
    tags = ["open_skip", "H20"],
    exec_properties = {'gpu':'H20'},
 )
+
+py_test (
+   name = "fused_qk_norm_rope_test",
+   srcs = ["fused_qk_norm_rope_test.py"],
+   deps = [
+       "//rtp_llm/models_py:models",
+       "//rtp_llm:testlib",
+   ],
+   env = test_envs,
+   tags = ["open_skip", "H20"],
+   exec_properties = {'gpu':'H20'},
+)
+
+py_test (
+   name = "deepseek_v4_rope_test",
+   srcs = ["deepseek_v4_rope_test.py"],
+   deps = [
+       "//rtp_llm/models_py:models",
+       "//rtp_llm:testlib",
+   ],
+   env = test_envs,
+   tags = ["open_skip", "H20"],
+   exec_properties = {'gpu':'H20'},
+)
+
+py_test (
+   name = "fused_indexer_test",
+   srcs = ["fused_indexer_test.py"],
+   deps = [
+       "//rtp_llm/models_py:models",
+       "//rtp_llm:testlib",
+   ],
+   env = test_envs,
+   tags = ["open_skip", "H20"],
+   exec_properties = {'gpu':'H20'},
+)
+
+py_test (
+   name = "online_sink_attention_test",
+   srcs = ["online_sink_attention_test.py"],
+   deps = [
+       "//rtp_llm/models_py:models",
+       "//rtp_llm:testlib",
+   ],
+   env = test_envs,
+   tags = ["open_skip", "H20"],
+   exec_properties = {'gpu':'H20'},
+)
+
+py_test (
+   name = "fused_compressor_test",
+   srcs = ["fused_compressor_test.py"],
+   deps = [
+       "//rtp_llm/models_py:models",
+       "//rtp_llm:testlib",
+   ],
+   env = test_envs,
+   tags = ["open_skip", "H20"],
+   exec_properties = {'gpu':'H20'},
+)
+
+# Blackwell-only — kernel skipped on non-sm_100 hosts via runtime decorator.
+py_test (
+   name = "fp4_indexer_sm100_test",
+   srcs = ["fp4_indexer_sm100_test.py"],
+   deps = [
+       "//rtp_llm/models_py:models",
+       "//rtp_llm:testlib",
+   ],
+   env = test_envs,
+   tags = ["open_skip", "SM100_ARM"],
+   exec_properties = {'gpu':'SM100_ARM'},
+)
+
+# Mixed: ReferenceSparseCsaTest runs on CPU; FlashMlaCsaSm100Test +
+# FlashMlaCsaBenchmark are skipped at runtime when sm_100 / flash_mla absent.
+py_test (
+   name = "flashmla_csa_test",
+   srcs = ["flashmla_csa_test.py"],
+   deps = [
+       "//rtp_llm/models_py:models",
+       "//rtp_llm:testlib",
+   ],
+   env = test_envs,
+   tags = ["open_skip", "SM100_ARM"],
+   exec_properties = {'gpu':'SM100_ARM'},
+)
+
+# Same shape contract as fp4_indexer_sm100_test — DeepGEMM FP8 indexer.
+py_test (
+   name = "deepgemm_indexer_test",
+   srcs = ["deepgemm_indexer_test.py"],
+   deps = [
+       "//rtp_llm/models_py:models",
+       "//rtp_llm:testlib",
+   ],
+   env = test_envs,
+   tags = ["open_skip", "H20"],
+   exec_properties = {'gpu':'H20'},
+)

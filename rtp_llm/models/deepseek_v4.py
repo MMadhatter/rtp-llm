@@ -18,10 +18,18 @@ import functools
 import json
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.model_factory_register import register_model
+from rtp_llm.model_loader.ffn_weight import (
+    FfnAtomicWeight,
+    FfnConfig,
+    FfnWeight,
+    MoeAtomicWeight,
+    MoeConfig,
+    MoeWeight,
+)
 from rtp_llm.model_loader.model_weight_info import ModelWeightInfo
 from rtp_llm.model_loader.weight_module import AtomicWeight, WeightModule
 from rtp_llm.models.deepseek_v2 import DeepSeekV2, DeepSeekV2Weight, DeepSeekV3MtpWeight
@@ -29,10 +37,76 @@ from rtp_llm.utils.model_weight import (
     CkptWeightInfo,
     W,
     identity,
+    sp_moe_w1,
+    stack_,
     transpose,
     yarn_get_mscale,
     zeros,
 )
+
+# Per-layer attention type, derived from config.attn_config.layer_compress_ratios.
+# Mirrors :class:`models_py.modules.hybrid.cache_topology.LayerCacheKind` —
+# kept here as plain ints to avoid pulling the model_desc dep into the loader.
+_LAYER_TYPE_NON_CACHE = 0  # MTP placeholder slot (no compress entry generated)
+_LAYER_TYPE_CSA = 4  # Compressed Sparse Attention (m = 4)
+_LAYER_TYPE_HCA = 128  # Heavily Compressed Attention (m' = 128)
+_LAYER_TYPE_SWA_ONLY = -1  # Pure sliding-window (no compressor); compress_ratio == 0
+
+
+class _V4MoeWeight(MoeWeight):
+    """V4-named MoE container.
+
+    The base :class:`MoeWeight` constructor caches three convenience handles
+    (``moe_w1`` / ``moe_w2`` / ``moe_gate``) by indexing into ``sub_weights``
+    with V3's literal name strings — that hard-coded lookup explodes the
+    moment we use V4's ``v4_experts_w*`` keys instead. Override ``__init__``
+    to map those handles onto the V4-named atoms while leaving the rest of
+    the dispatch / postprocess pipeline untouched.
+    """
+
+    def __init__(self, sub_weights, config: MoeConfig, **kwargs):
+        # Defer to CompositeWeight directly to skip V3's name lookup. We still
+        # enforce that everything is a MoeAtomicWeight so the load-time
+        # ``StackSplitTensorSource`` machinery kicks in for stacked experts.
+        from rtp_llm.model_loader.weight_module import CompositeWeight, QuantWeight
+
+        self.config = config
+        assert all(
+            isinstance(sw, MoeAtomicWeight) or isinstance(sw, QuantWeight)
+            for sw in sub_weights
+        )
+        kwargs["name"] = W.moe
+        CompositeWeight.__init__(self, sub_weights, **kwargs)
+        # V3-style handles re-pointed at V4 atoms. Down-projection (w2) and
+        # gate-projection (w1) keep the same mathematical meaning as V3.
+        self.moe_w1 = self.sub_weights.get(W.v4_experts_w1)
+        self.moe_w2 = self.sub_weights.get(W.v4_experts_w2)
+        self.moe_gate = self.sub_weights.get(W.v4_moe_gate_w)
+
+
+def _classify_layer(compress_ratio: int, layer_id: int, num_layers: int) -> int:
+    """Map a compress_ratios entry to one of the four V4 attention kinds.
+
+    The trailing entry (index ``num_layers``) is the MTP slot — always
+    NON_CACHE. Layers with compress_ratio==0 inside the transformer body are
+    SWA-only (Flash uses this for the first 2 layers). 4 / 128 are CSA / HCA.
+    Any other value is rejected — V4 only ships these three compression
+    factors and silently mapping unknown ratios would cause hard-to-debug
+    weight-key mismatches downstream.
+    """
+    if layer_id == num_layers:
+        return _LAYER_TYPE_NON_CACHE
+    if compress_ratio == 0:
+        return _LAYER_TYPE_SWA_ONLY
+    if compress_ratio == _LAYER_TYPE_CSA:
+        return _LAYER_TYPE_CSA
+    if compress_ratio == _LAYER_TYPE_HCA:
+        return _LAYER_TYPE_HCA
+    raise ValueError(
+        f"DeepSeek-V4 layer {layer_id}: unsupported compress_ratio "
+        f"{compress_ratio}; expected one of {{0, 4, 128}}"
+    )
+
 
 # scoring_func enum: 0 = softmax, 1 = sigmoid, 2 = sqrt(softplus) (DeepSeek-V4)
 _SCORING_FUNC_MAP = {
@@ -43,36 +117,516 @@ _SCORING_FUNC_MAP = {
 
 
 class DeepSeekV4Weight(DeepSeekV2Weight):
-    """M0 stub weight loader.
+    """V4 per-layer weight loader (PR-F).
 
-    V4's per-layer weight key set is incompatible with V3 (no
-    ``kv_a_proj_with_mqa`` / ``kv_b_proj``; new mHC, indexer, grouped-O, ...).
-    Until PR-E lands the real layer plan, we expose only the global weights
-    (embedding, final norm, lm_head) and an empty list per layer. This lets
-    the loader run to completion against ckpts that only contain those keys
-    (e.g. random/dummy weights for engine bring-up). Per-layer loading is a
-    no-op; downstream forward will fail because ``_create_python_model``
-    raises ``NotImplementedError``.
+    V4's checkpoint layout has *no* overlap with V3's at the per-layer level
+    (no ``kv_a_proj_with_mqa``, ``kv_b_proj``, ``q_a_layernorm``, …) — every
+    HF key is bespoke. The plan below mirrors the keys observed in
+    DeepSeek-V4-Flash's ``model.safetensors.index.json``:
+
+    * **Always per layer**: ``attn_norm`` / ``ffn_norm``, MQA Q-LoRA pair
+      (``wq_a`` + ``wq_b``), single MQA KV (``wkv``), Q/K RMSNorm, attn sink,
+      grouped-O LoRA (``wo_a`` + ``wo_b``), mHC params for both attn / ffn
+      sub-blocks, MoE gate, shared expert, and the 256 routed experts.
+    * **CSA + HCA layers only**: token-level compressor (``compressor.{ape,
+      norm, wgate, wkv}``).
+    * **CSA layers only** (``compress_ratio == 4``): the lightning indexer
+      branch (``indexer.compressor.*`` + ``indexer.weights_proj`` +
+      ``indexer.wq_b``).
+
+    The branching is driven by ``model_config.attn_config.layer_compress_ratios``
+    — the same array PR-E uses to decide which sub-module to instantiate.
+
+    Globals (``embed`` / ``norm`` / ``head``) live under bare keys
+    (no ``model.`` prefix) and the head-side mHC reduction is stored as
+    ``hc_head_{base, fn, scale}``.
     """
 
     def _process_meta(self, meta_dict, weight_keys):
         # V2's auto-detection looks for q_a_proj / e_score_correction_bias keys
-        # whose presence we cannot guarantee in a V4 ckpt; skip it for M0.
+        # which simply don't exist in a V4 ckpt — running it on V4 data would
+        # silently leave the V2 "is this V3?" flags in their default state.
         return
 
-    def _get_hf_layer_weight_info(self, layer_id: int):
-        # No per-layer plan yet; PR-E (HCA-only model) will populate.
-        return []
+    # ------------------------------------------------------------------
+    # Per-layer plan, branching on compress_ratios.
+    # ------------------------------------------------------------------
+    def _layer_kind(self, layer_id: int) -> int:
+        ratios = list(self.model_config.attn_config.layer_compress_ratios)
+        if not ratios:
+            # Defensive: no compress_ratios configured → treat as HCA (the
+            # densest of the compressed variants, so its key set strictly
+            # contains SWA-only's).
+            return _LAYER_TYPE_HCA
+        if layer_id >= len(ratios):
+            return _LAYER_TYPE_HCA
+        return _classify_layer(ratios[layer_id], layer_id, self._num_layers)
+
+    def _is_hash_routed_layer(self, layer_id: int) -> bool:
+        """Per-layer hash-routing predicate.
+
+        The first ``num_hash_layers`` MoE blocks of the *base* model use a
+        deterministic ``tid2eid`` lookup; later blocks use learned
+        ``noaux_tc`` routing with an ``e_score_correction_bias``. Subclasses
+        (e.g. :class:`DeepSeekV4MtpWeight`) override this to opt out — MTP is
+        a single-token spec head that always uses learned routing.
+        """
+        num_hash = int(self.model_config.moe_hash_routing_layers)
+        return layer_id < num_hash
+
+    def _get_hf_attn_layer_weight_info(self, layer_id: int) -> List[WeightModule]:
+        kind = self._layer_kind(layer_id)
+        # Tensors emitted by every transformer block, regardless of attention
+        # kind. The two LayerNorms straddling the block + the LoRA-decomposed
+        # Q / KV / O paths + Q/K RMSNorm + per-head attention sink.
+        layer: List[WeightModule] = [
+            AtomicWeight(
+                W.v4_attn_norm,
+                [CkptWeightInfo("layers.{i}.attn_norm.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_ffn_norm,
+                [CkptWeightInfo("layers.{i}.ffn_norm.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_q_norm,
+                [CkptWeightInfo("layers.{i}.attn.q_norm.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_kv_norm,
+                [CkptWeightInfo("layers.{i}.attn.kv_norm.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_attn_sink,
+                [CkptWeightInfo("layers.{i}.attn.attn_sink", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wq_a,
+                [CkptWeightInfo("layers.{i}.attn.wq_a.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wq_a_s,
+                [CkptWeightInfo("layers.{i}.attn.wq_a.scale", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wq_b,
+                [CkptWeightInfo("layers.{i}.attn.wq_b.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wq_b_s,
+                [CkptWeightInfo("layers.{i}.attn.wq_b.scale", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wkv,
+                [CkptWeightInfo("layers.{i}.attn.wkv.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wkv_s,
+                [CkptWeightInfo("layers.{i}.attn.wkv.scale", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wo_a,
+                [CkptWeightInfo("layers.{i}.attn.wo_a.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wo_a_s,
+                [CkptWeightInfo("layers.{i}.attn.wo_a.scale", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wo_b,
+                [CkptWeightInfo("layers.{i}.attn.wo_b.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_wo_b_s,
+                [CkptWeightInfo("layers.{i}.attn.wo_b.scale", identity)],
+                identity,
+            ),
+        ]
+
+        # Token-level compressor — only present on layers that actually
+        # compress (CSA m=4 or HCA m'=128). SWA-only layers omit it.
+        if kind in (_LAYER_TYPE_CSA, _LAYER_TYPE_HCA):
+            layer.extend(
+                [
+                    AtomicWeight(
+                        W.v4_compressor_ape,
+                        [CkptWeightInfo("layers.{i}.attn.compressor.ape", identity)],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.v4_compressor_norm,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.compressor.norm.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.v4_compressor_wgate,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.compressor.wgate.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.v4_compressor_wkv,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.compressor.wkv.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                ]
+            )
+
+        # Lightning indexer — CSA only.
+        if kind == _LAYER_TYPE_CSA:
+            layer.extend(
+                [
+                    AtomicWeight(
+                        W.v4_indexer_compressor_ape,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.indexer.compressor.ape",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.v4_indexer_compressor_norm,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.indexer.compressor.norm.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.v4_indexer_compressor_wgate,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.indexer.compressor.wgate.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.v4_indexer_compressor_wkv,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.indexer.compressor.wkv.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.v4_indexer_weights_proj,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.indexer.weights_proj.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.v4_indexer_wq_b,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.indexer.wq_b.weight", identity
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.v4_indexer_wq_b_s,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.attn.indexer.wq_b.scale", identity
+                            )
+                        ],
+                        identity,
+                    ),
+                ]
+            )
+
+        # mHC — A/B/C generators for the attention sub-block, then the FFN
+        # sub-block. Same shape on every layer regardless of attention kind.
+        layer.extend(
+            [
+                AtomicWeight(
+                    W.v4_hc_attn_base,
+                    [CkptWeightInfo("layers.{i}.hc_attn_base", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_hc_attn_fn,
+                    [CkptWeightInfo("layers.{i}.hc_attn_fn", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_hc_attn_scale,
+                    [CkptWeightInfo("layers.{i}.hc_attn_scale", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_hc_ffn_base,
+                    [CkptWeightInfo("layers.{i}.hc_ffn_base", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_hc_ffn_fn,
+                    [CkptWeightInfo("layers.{i}.hc_ffn_fn", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_hc_ffn_scale,
+                    [CkptWeightInfo("layers.{i}.hc_ffn_scale", identity)],
+                    identity,
+                ),
+            ]
+        )
+        return layer
+
+    def _get_hf_moe_layer_weight_info(self, layer_id: int) -> List[WeightModule]:
+        # V4 has no first_k_dense_replace — every transformer block is MoE.
+        moe_config = MoeConfig(
+            align_size=self._align_size,
+            expert_num=self.expert_num_,
+        )
+        ffn_config = FfnConfig(
+            align_size=self._align_size,
+            is_gated_activation=self._is_gated_activation,
+            is_moe=False,
+        )
+
+        # Routing gate is split across two checkpoint conventions: the first
+        # ``num_hash_layers`` MoE blocks ship a static ``tid2eid`` lookup
+        # (deterministic hash routing) and **no** ``e_score_correction_bias``;
+        # the rest ship the bias and **no** lookup. Always emit ``gate.weight``.
+        is_hash_layer = self._is_hash_routed_layer(layer_id)
+        gate_atoms: List[WeightModule] = [
+            FfnAtomicWeight(
+                W.v4_moe_gate_w,
+                [CkptWeightInfo("layers.{i}.ffn.gate.weight", identity)],
+                identity,
+                config=ffn_config,
+            ),
+        ]
+        if is_hash_layer:
+            gate_atoms.append(
+                FfnAtomicWeight(
+                    W.v4_moe_gate_tid2eid,
+                    [CkptWeightInfo("layers.{i}.ffn.gate.tid2eid", identity)],
+                    identity,
+                    config=ffn_config,
+                )
+            )
+        else:
+            gate_atoms.append(
+                FfnAtomicWeight(
+                    W.v4_moe_gate_b,
+                    [CkptWeightInfo("layers.{i}.ffn.gate.bias", identity)],
+                    identity,
+                    config=ffn_config,
+                )
+            )
+
+        return [
+            FfnWeight(sub_weights=gate_atoms, config=ffn_config),
+            # ---- Shared expert (always-on, ungated). Three matrices in the
+            # SwiGLU split: w1 = gate, w3 = up, w2 = down. -----------------
+            FfnWeight(
+                sub_weights=[
+                    FfnAtomicWeight(
+                        W.v4_shared_w1,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.shared_experts.w1.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                        config=ffn_config,
+                    ),
+                    FfnAtomicWeight(
+                        W.v4_shared_w1_s,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.shared_experts.w1.scale",
+                                identity,
+                            )
+                        ],
+                        identity,
+                        config=ffn_config,
+                    ),
+                    FfnAtomicWeight(
+                        W.v4_shared_w2,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.shared_experts.w2.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                        config=ffn_config,
+                    ),
+                    FfnAtomicWeight(
+                        W.v4_shared_w2_s,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.shared_experts.w2.scale",
+                                identity,
+                            )
+                        ],
+                        identity,
+                        config=ffn_config,
+                    ),
+                    FfnAtomicWeight(
+                        W.v4_shared_w3,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.shared_experts.w3.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                        config=ffn_config,
+                    ),
+                    FfnAtomicWeight(
+                        W.v4_shared_w3_s,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.shared_experts.w3.scale",
+                                identity,
+                            )
+                        ],
+                        identity,
+                        config=ffn_config,
+                    ),
+                ],
+                config=ffn_config,
+            ),
+            # ---- Routed experts. Each weight stacks all 256 experts along
+            # an extra leading dim — MoeAtomicWeight resolves ``{expert_id}``
+            # to the per-expert ckpt key at load time and merges them. -----
+            _V4MoeWeight(
+                sub_weights=[
+                    MoeAtomicWeight(
+                        W.v4_experts_w1,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.experts.{expert_id}.w1.weight",
+                                identity,
+                            )
+                        ],
+                        stack_,
+                        config=moe_config,
+                    ),
+                    MoeAtomicWeight(
+                        W.v4_experts_w1_s,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.experts.{expert_id}.w1.scale",
+                                identity,
+                            )
+                        ],
+                        stack_,
+                        config=moe_config,
+                    ),
+                    MoeAtomicWeight(
+                        W.v4_experts_w2,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.experts.{expert_id}.w2.weight",
+                                identity,
+                            )
+                        ],
+                        stack_,
+                        config=moe_config,
+                    ),
+                    MoeAtomicWeight(
+                        W.v4_experts_w2_s,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.experts.{expert_id}.w2.scale",
+                                identity,
+                            )
+                        ],
+                        stack_,
+                        config=moe_config,
+                    ),
+                    MoeAtomicWeight(
+                        W.v4_experts_w3,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.experts.{expert_id}.w3.weight",
+                                identity,
+                            )
+                        ],
+                        stack_,
+                        config=moe_config,
+                    ),
+                    MoeAtomicWeight(
+                        W.v4_experts_w3_s,
+                        [
+                            CkptWeightInfo(
+                                "layers.{i}.ffn.experts.{expert_id}.w3.scale",
+                                identity,
+                            )
+                        ],
+                        stack_,
+                        config=moe_config,
+                    ),
+                ],
+                config=moe_config,
+            ),
+        ]
+
+    def _get_hf_layer_weight_info(self, layer_id: int) -> List[WeightModule]:
+        plan: List[WeightModule] = []
+        plan.extend(self._get_hf_attn_layer_weight_info(layer_id))
+        plan.extend(self._get_hf_moe_layer_weight_info(layer_id))
+        return plan
 
     def _get_weight_info(self):
         # DeepSeek-V4 ckpt key conventions (different from V2/V3):
         #   embed.weight   — token embedding (not model.embed_tokens.weight)
         #   norm.weight    — final RMSNorm  (not model.norm.weight)
         #   head.weight    — lm_head        (not lm_head.weight)
-        #   hc_head_*      — head-side mHC params (loaded by the python model,
-        #                    not part of the global ModelWeights surface)
-        layer_weights: List[List[AtomicWeight]] = [[] for _ in range(self._num_layers)]
-        weights = [
+        #   hc_head_*      — head-side mHC reduction (paper §2.5; folds the
+        #                    n_hc residual streams back into a single hidden
+        #                    state before lm_head).
+        layer_weights: List[List[WeightModule]] = [
+            self._get_hf_layer_weight_info(layer_id)
+            for layer_id in range(self._num_layers)
+        ]
+        weights: List[WeightModule] = [
             AtomicWeight(
                 W.embedding,
                 [CkptWeightInfo("embed.weight", identity)],
@@ -91,6 +645,21 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
             AtomicWeight(
                 W.lm_head, [CkptWeightInfo("head.weight", identity)], identity
             ),
+            AtomicWeight(
+                W.v4_hc_head_base,
+                [CkptWeightInfo("hc_head_base", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_hc_head_fn,
+                [CkptWeightInfo("hc_head_fn", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.v4_hc_head_scale,
+                [CkptWeightInfo("hc_head_scale", identity)],
+                identity,
+            ),
         ]
         return ModelWeightInfo(layer_weights=layer_weights, weights=weights)
 
@@ -98,81 +667,157 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
 class DeepSeekV4MtpWeight(DeepSeekV4Weight):
     """V4 MTP (next-N) weight loader.
 
-    The MTP module's *non-attention* surface (enorm / hnorm / eh_proj /
-    shared_head) is unchanged from V3 — it's a thin wrapper that combines the
-    embedding of the next predicted token with the previous hidden state. We
-    inherit the V4 base weight stub (so the per-layer attention plan stays
-    empty until PR-E lands the real CSA/HCA loader) and bolt the MTP-specific
-    auxiliary tensors onto each MTP layer.
+    V4 MTP is a *full* V4 decoder block (attn + MoE + mHC for both sub-blocks,
+    plus a head-side mHC reduction local to this MTP layer) wrapped with the
+    V3-style ``enorm`` / ``hnorm`` / projection pair that combines the next
+    token's embedding with the previous hidden state. Unlike V3 the embedding
+    and hidden projections are **separate** (``e_proj`` + ``h_proj``) instead
+    of fused into a single ``eh_proj``, so we load them independently.
 
-    Layout matches :class:`DeepSeekV3MtpWeight` ckpt-key conventions:
+    V4-Flash MTP-only ckpt key prefix is ``mtp.{i}.*`` (not
+    ``model.layers.{i}.*`` like V3). MTP layers do not run a compressor —
+    spec-decode operates on a single emitted token at a time.
 
-      * ``model.layers.0.embed_tokens.weight`` → embedding table
-      * ``model.layers.0.shared_head.head.weight`` → lm_head
-      * ``model.layers.{i}.shared_head.norm.weight`` → final layernorm gamma
-      * ``model.layers.{i}.enorm.weight`` → embedding-side RMSNorm gamma
-      * ``model.layers.{i}.hnorm.weight`` → hidden-side RMSNorm gamma
-      * ``model.layers.{i}.eh_proj.weight`` → fused (e ⊕ h) projection (transposed)
+    The published Flash MTP block does *not* ship an embedding table or
+    ``head.weight`` — they are tied to the base model. The loader synthesises
+    zero-shaped placeholders so :class:`ModelWeights` does not raise; the
+    consumer (``MtpExecutor``) is expected to alias the base model's tables.
     """
 
+    def _layer_kind(self, layer_id: int) -> int:
+        # MTP is single-token: no compressor regardless of compress_ratios.
+        return _LAYER_TYPE_SWA_ONLY
+
+    def _is_hash_routed_layer(self, layer_id: int) -> bool:
+        # MTP never uses hash routing — it ships ``ffn.gate.bias`` instead
+        # of ``ffn.gate.tid2eid``.
+        return False
+
+    def _format_layer_keys(
+        self, items: List[WeightModule], prefix: str
+    ) -> List[WeightModule]:
+        """Rewrite each per-layer ckpt key to live under ``{prefix}.{{i}}.*``
+        instead of the base ``layers.{i}.*`` namespace V4 base layers use.
+
+        ``sub_weights`` may be either a list (raw plan) or the dict that
+        ``CompositeWeight.__init__`` builds from one — we walk both shapes
+        so the rewrite covers FFN / MoE composites as well.
+        """
+
+        def visit(node):
+            ck_list = getattr(node, "weights", None)
+            if ck_list:
+                for ck in ck_list:
+                    if ck.name.startswith("layers.{i}."):
+                        ck.name = prefix + "." + ck.name[len("layers.") :]
+            sub = getattr(node, "sub_weights", None)
+            if sub:
+                children = sub.values() if isinstance(sub, dict) else sub
+                for child in children:
+                    visit(child)
+
+        for item in items:
+            visit(item)
+        return items
+
+    def _get_hf_layer_weight_info(self, layer_id: int) -> List[WeightModule]:
+        # Re-use the SWA-only branch of the base layer plan (no compressor)
+        # then rebase every key onto ``mtp.{i}.*`` and add MTP-specific atoms.
+        plan = list(super()._get_hf_layer_weight_info(layer_id))
+        plan = self._format_layer_keys(plan, "mtp")
+        plan.extend(
+            [
+                # Final RMSNorm of the MTP block.
+                AtomicWeight(
+                    W.multi_tokens_predict_final_ln_gamma,
+                    [CkptWeightInfo("mtp.{i}.norm.weight", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.multi_tokens_predict_final_ln_beta,
+                    [],
+                    functools.partial(zeros, shape=[self._hidden_size]),
+                ),
+                # V3-style embedding / hidden RMSNorms applied before the
+                # projection that fuses next-token embedding with prev hidden.
+                AtomicWeight(
+                    W.multi_tokens_predict_enorm,
+                    [CkptWeightInfo("mtp.{i}.enorm.weight", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.multi_tokens_predict_hnorm,
+                    [CkptWeightInfo("mtp.{i}.hnorm.weight", identity)],
+                    identity,
+                ),
+                # V4-specific: separate e_proj / h_proj instead of V3's fused
+                # eh_proj. Each is FP8 with a ue8m0 scale.
+                AtomicWeight(
+                    W.v4_mtp_e_proj,
+                    [CkptWeightInfo("mtp.{i}.e_proj.weight", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_mtp_e_proj_s,
+                    [CkptWeightInfo("mtp.{i}.e_proj.scale", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_mtp_h_proj,
+                    [CkptWeightInfo("mtp.{i}.h_proj.weight", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_mtp_h_proj_s,
+                    [CkptWeightInfo("mtp.{i}.h_proj.scale", identity)],
+                    identity,
+                ),
+                # MTP-local mHC head-side reduction (the MTP layer is "spec
+                # head" and folds the residual stream itself before lm_head).
+                AtomicWeight(
+                    W.v4_hc_head_base,
+                    [CkptWeightInfo("mtp.{i}.hc_head_base", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_hc_head_fn,
+                    [CkptWeightInfo("mtp.{i}.hc_head_fn", identity)],
+                    identity,
+                ),
+                AtomicWeight(
+                    W.v4_hc_head_scale,
+                    [CkptWeightInfo("mtp.{i}.hc_head_scale", identity)],
+                    identity,
+                ),
+            ]
+        )
+        return plan
+
     def _get_weight_info(self):
-        layer_weights: List[List[WeightModule]] = []
-        # MTP shares its embedding & lm_head with the MTP layer-0 ckpt.
-        weights = [
+        assert self._num_layers == 1, (
+            f"DeepSeekV4MtpWeight expects exactly 1 MTP layer, "
+            f"got {self._num_layers}"
+        )
+        layer_weights: List[List[WeightModule]] = [
+            self._get_hf_layer_weight_info(layer_id)
+            for layer_id in range(self._num_layers)
+        ]
+        # MTP module shares its embedding + lm_head with the base model. The
+        # ckpt does not ship them, so synthesise zero placeholders — consumers
+        # (``MtpExecutor``) are responsible for aliasing the real tensors.
+        vocab_size = int(self.model_config.vocab_size)
+        weights: List[WeightModule] = [
             AtomicWeight(
                 W.embedding,
-                [CkptWeightInfo("model.layers.0.embed_tokens.weight", identity)],
-                identity,
+                [],
+                functools.partial(zeros, shape=[vocab_size, self._hidden_size]),
             ),
             AtomicWeight(
                 W.lm_head,
-                [CkptWeightInfo("model.layers.0.shared_head.head.weight", identity)],
-                identity,
+                [],
+                functools.partial(zeros, shape=[vocab_size, self._hidden_size]),
             ),
         ]
-        assert (
-            self._num_layers == 1
-        ), f"DeepSeekV4MtpWeight expects exactly 1 MTP layer, got {self._num_layers}"
-        for layer in range(self._num_layers):
-            # Per-layer attention plan still empty (filled by PR-E). The MTP
-            # auxiliary tensors below are the *only* per-layer weights we need
-            # in order for the loader to walk the ckpt without erroring.
-            layer_plan = list(self._get_hf_layer_weight_info(layer))
-            layer_plan.extend(
-                [
-                    AtomicWeight(
-                        W.multi_tokens_predict_final_ln_gamma,
-                        [
-                            CkptWeightInfo(
-                                "model.layers.{i}.shared_head.norm.weight",
-                                identity,
-                            )
-                        ],
-                        identity,
-                    ),
-                    AtomicWeight(
-                        W.multi_tokens_predict_final_ln_beta,
-                        [],
-                        functools.partial(zeros, shape=[self._hidden_size]),
-                    ),
-                    AtomicWeight(
-                        W.multi_tokens_predict_enorm,
-                        [CkptWeightInfo("model.layers.{i}.enorm.weight", identity)],
-                        identity,
-                    ),
-                    AtomicWeight(
-                        W.multi_tokens_predict_hnorm,
-                        [CkptWeightInfo("model.layers.{i}.hnorm.weight", identity)],
-                        identity,
-                    ),
-                    AtomicWeight(
-                        W.multi_tokens_predict_eh_proj,
-                        [CkptWeightInfo("model.layers.{i}.eh_proj.weight", identity)],
-                        transpose,
-                    ),
-                ]
-            )
-            layer_weights.append(layer_plan)
         return ModelWeightInfo(layer_weights=layer_weights, weights=weights)
 
 
@@ -206,21 +851,25 @@ class DeepSeekV4(DeepSeekV2):
         return False
 
     def _create_python_model(self):
-        # PR-E reference layer composition lives in
-        # ``rtp_llm.models_py.model_desc.deepseek_v4_layer``. Wiring it into
-        # the production ``GenericMoeModel`` pipeline requires the V4-specific
-        # weight-key loader (per-layer plan: W_DQ / W_UQ / W_KV / W_Z /
-        # bias_pos / sink_logits / grouped-O / mHC params / hash router).
-        # Until that loader lands (PR-F per develop_ds_v4.md §8), the engine
-        # path raises so requests fail fast with a useful pointer instead of
-        # silently using V3 weights.
-        raise NotImplementedError(
-            "DeepSeek-V4 production forward path needs the V4 per-layer "
-            "weight loader. See "
-            "rtp_llm/models_py/model_desc/deepseek_v4_layer.py for the "
-            "reference layer composition (mHC + HCA attention + V4 MoE) "
-            "and develop_ds_v4.md §6 for the milestone breakdown."
+        # Engine wiring for the V4 forward path. See
+        # ``rtp_llm.models_py.model_desc.deepseek_v4`` for the model class —
+        # it dispatches per layer on ``compress_ratios`` to either CSA or HCA
+        # (with SWA-only collapsed onto HCA m'=1) and wraps each block in
+        # mHC. KV cache integration is mocked (stateless re-prefill) until
+        # the M4 heterogeneous KV cache lands; decode requests will work but
+        # without prefix-cache savings.
+        from rtp_llm.models_py.model_desc.deepseek_v4 import DeepSeekV4Model
+
+        self.py_model = DeepSeekV4Model(
+            self.model_config,
+            self.parallelism_config,
+            self.weight,
+            max_generate_batch_size=self.max_generate_batch_size,
+            fmha_config=self.fmha_config,
+            py_hw_kernel_config=self.hw_kernel_config,
+            device_resource_config=self.device_resource_config,
         )
+        return self.py_model
 
     @staticmethod
     def get_weight_cls():

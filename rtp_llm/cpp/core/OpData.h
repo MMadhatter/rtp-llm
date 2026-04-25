@@ -480,7 +480,7 @@ struct MoeConfigs {
     size_t dp_rank                = 0;
     size_t dp_size                = 1;
 
-    int    scoring_func          = 0;  // 0: softmax, 1: sigmoid
+    int    scoring_func          = 0;  // 0: softmax, 1: sigmoid, 2: sqrt(softplus) [DeepSeek-V4]
     int    topk_group            = 1;
     int    n_group               = 1;
     double routed_scaling_factor = 1.0;  // used in deepseek v2 and glm4 moe

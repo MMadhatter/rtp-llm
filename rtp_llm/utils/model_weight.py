@@ -276,7 +276,7 @@ def sp_neg1_part_by_head(
     t_0 = torch.split(
         t[:, : head_num * size_per_head], head_num * size_per_head // tp, dim=-1
     )[tp_rank]
-    t_1 = t[:, head_num * size_per_head:]
+    t_1 = t[:, head_num * size_per_head :]
     return torch.concat([t_0, t_1], dim=-1)
 
 
@@ -371,7 +371,7 @@ def stack_moe_w1_pad(ts: List[torch.Tensor], moe_align_size: int, dim: int):
         dim: Dimension to pad (1 after stacking)
     """
     gate_ = ts[: len(ts) // 2]
-    up_ = ts[len(ts) // 2:]
+    up_ = ts[len(ts) // 2 :]
     w1 = torch.stack(gate_, dim=0)
     w3 = torch.stack(up_, dim=0)
 
@@ -413,7 +413,7 @@ def stack_0(ts: List[torch.Tensor]) -> torch.Tensor:
 
 def stack_moe_w1(ts: List[torch.Tensor]):
     gate = ts[: len(ts) // 2]
-    up = ts[len(ts) // 2:]
+    up = ts[len(ts) // 2 :]
     ws = []
     for w1, w3 in zip(gate, up):
         ws.append(concat_0([w1, w3]))
@@ -423,7 +423,7 @@ def stack_moe_w1(ts: List[torch.Tensor]):
 
 def stack_moe_w1_s2(ts: List[torch.Tensor]):
     gate = ts[: len(ts) // 2]
-    up = ts[len(ts) // 2:]
+    up = ts[len(ts) // 2 :]
     ws = []
     for w1, w3 in zip(gate, up):
         ws.append(max_scalar([w1, w3]))
@@ -449,8 +449,8 @@ def get_sp_tensor(
 
     _kv_tp = math.gcd(head_num_kv, tp)
     _kv_rank = tp_rank // (tp // _kv_tp)
-    ks = sp_neg1(t[:, q_hidden: q_hidden + kv_hidden], _kv_tp, _kv_rank)
-    vs = sp_neg1(t[:, q_hidden + kv_hidden:], _kv_tp, _kv_rank)
+    ks = sp_neg1(t[:, q_hidden : q_hidden + kv_hidden], _kv_tp, _kv_rank)
+    vs = sp_neg1(t[:, q_hidden + kv_hidden :], _kv_tp, _kv_rank)
     return torch.concat([qs, ks, vs], dim=1).contiguous()
 
 
@@ -544,8 +544,8 @@ def get_sp_tensor_blocked(
     qs = sp_neg1(t[:, :q_hidden], tp, tp_rank)
     _kv_tp = math.gcd(head_num_kv, tp)
     _kv_rank = tp_rank // (tp // _kv_tp)
-    ks = sp_neg1(t[:, q_hidden: q_hidden + kv_hidden], _kv_tp, _kv_rank)
-    vs = sp_neg1(t[:, q_hidden + kv_hidden:], _kv_tp, _kv_rank)
+    ks = sp_neg1(t[:, q_hidden : q_hidden + kv_hidden], _kv_tp, _kv_rank)
+    vs = sp_neg1(t[:, q_hidden + kv_hidden :], _kv_tp, _kv_rank)
     return torch.concat([qs, ks, vs], dim=1).contiguous()
 
 
@@ -581,7 +581,7 @@ def sp_attn_gate(
     local_head_num = head_num // tp
     start_idx = local_head_num * tp_rank
     end_idx = local_head_num * (tp_rank + 1)
-    t = t[:, start_idx * size_per_head: end_idx * size_per_head]
+    t = t[:, start_idx * size_per_head : end_idx * size_per_head]
     return t
 
 
@@ -652,7 +652,7 @@ def sp_0_pad8(t: torch.Tensor, tp: int, tp_rank: int, **kwargs: Any) -> torch.Te
         if len(t.shape) == 2:
             return torch.concat(
                 [
-                    t[tp_rank * per_slice_size:, :],
+                    t[tp_rank * per_slice_size :, :],
                     torch.zeros([pad_size, t.shape[1]], device=t.device).to(t.dtype),
                 ],
                 dim=0,
@@ -660,16 +660,16 @@ def sp_0_pad8(t: torch.Tensor, tp: int, tp_rank: int, **kwargs: Any) -> torch.Te
         else:
             return torch.concat(
                 [
-                    t[tp_rank * per_slice_size:, :],
+                    t[tp_rank * per_slice_size :, :],
                     torch.zeros([pad_size], device=t.device).to(t.dtype),
                 ],
                 dim=0,
             )
     else:
         if len(t.shape) == 2:
-            return t[tp_rank * per_slice_size: (tp_rank + 1) * per_slice_size, :]
+            return t[tp_rank * per_slice_size : (tp_rank + 1) * per_slice_size, :]
         else:
-            return t[tp_rank * per_slice_size: (tp_rank + 1) * per_slice_size]
+            return t[tp_rank * per_slice_size : (tp_rank + 1) * per_slice_size]
 
 
 def merge_qkv_hf(ts: List[torch.Tensor]):
@@ -1045,7 +1045,7 @@ def sp_0_w13(
 def split_slopes_tp(slopes: torch.Tensor, head_num: int, tp: int, tp_rank: int):
     local_head_num = 1 if head_num == 1 else head_num // tp
     start_pos = local_head_num * tp_rank
-    return slopes[start_pos: start_pos + local_head_num]
+    return slopes[start_pos : start_pos + local_head_num]
 
 
 def get_slopes(n: int) -> List[float]:
@@ -1069,6 +1069,7 @@ def slopes(ts: List[torch.Tensor], n: int):
     slopes = torch.Tensor(get_slopes(n))
     return slopes
 
+
 def merge_qkvz_transpose_reorder(
     ts: List[torch.Tensor],
 ):
@@ -1081,6 +1082,7 @@ def merge_qkvz_transpose_reorder(
     z = ts[1]
     return torch.cat([qkv, z], dim=0).T
 
+
 def merge_ba_transpose_reorder(
     ts: List[torch.Tensor],
 ):
@@ -1088,6 +1090,7 @@ def merge_ba_transpose_reorder(
     b = ts[0]
     a = ts[1]
     return torch.cat([b, a], dim=0).T
+
 
 def split_q_gate(ts: List[torch.Tensor], head_num: int, head_dim: int, part: int):
     """Split q_gate tensor into q or gate part.
@@ -1106,9 +1109,11 @@ def split_q_gate(ts: List[torch.Tensor], head_num: int, head_dim: int, part: int
     else:
         return t[:, 1, :, :].reshape(-1, dim1)
 
+
 def plus_one(ts: List[torch.Tensor]):
     """Add one to the tensor. Qwen3Next uses gemma_rms_norm."""
     return ts[0] + 1
+
 
 class W:
     # global
@@ -1238,6 +1243,74 @@ class W:
     mla_indexer_weights_proj_w = (
         "self_attention_weights.mla.indexer.weights_proj.kernel"
     )
+
+    # ----- DeepSeek-V4 -----
+    # Attention norms / extras (per-layer).
+    v4_attn_norm = "deepseek_v4.attn_norm.gamma"
+    v4_ffn_norm = "deepseek_v4.ffn_norm.gamma"
+    v4_q_norm = "deepseek_v4.attn.q_norm.gamma"
+    v4_kv_norm = "deepseek_v4.attn.kv_norm.gamma"
+    v4_attn_sink = "deepseek_v4.attn.attn_sink"
+    # Q-LoRA & MQA KV & Output-LoRA (FP8 weight + ue8m0 scale).
+    v4_wq_a = "deepseek_v4.attn.wq_a.kernel"
+    v4_wq_a_s = "deepseek_v4.attn.wq_a.scale"
+    v4_wq_b = "deepseek_v4.attn.wq_b.kernel"
+    v4_wq_b_s = "deepseek_v4.attn.wq_b.scale"
+    v4_wkv = "deepseek_v4.attn.wkv.kernel"
+    v4_wkv_s = "deepseek_v4.attn.wkv.scale"
+    v4_wo_a = "deepseek_v4.attn.wo_a.kernel"
+    v4_wo_a_s = "deepseek_v4.attn.wo_a.scale"
+    v4_wo_b = "deepseek_v4.attn.wo_b.kernel"
+    v4_wo_b_s = "deepseek_v4.attn.wo_b.scale"
+    # Token-level compressor (HCA single branch / CSA shared with above).
+    v4_compressor_ape = "deepseek_v4.attn.compressor.ape"
+    v4_compressor_norm = "deepseek_v4.attn.compressor.norm.gamma"
+    v4_compressor_wgate = "deepseek_v4.attn.compressor.wgate.kernel"
+    v4_compressor_wkv = "deepseek_v4.attn.compressor.wkv.kernel"
+    # Lightning indexer (CSA layers only).
+    v4_indexer_compressor_ape = "deepseek_v4.attn.indexer.compressor.ape"
+    v4_indexer_compressor_norm = "deepseek_v4.attn.indexer.compressor.norm.gamma"
+    v4_indexer_compressor_wgate = "deepseek_v4.attn.indexer.compressor.wgate.kernel"
+    v4_indexer_compressor_wkv = "deepseek_v4.attn.indexer.compressor.wkv.kernel"
+    v4_indexer_weights_proj = "deepseek_v4.attn.indexer.weights_proj.kernel"
+    v4_indexer_wq_b = "deepseek_v4.attn.indexer.wq_b.kernel"
+    v4_indexer_wq_b_s = "deepseek_v4.attn.indexer.wq_b.scale"
+    # MoE: gate + shared expert + routed experts (stacked along expert dim).
+    v4_moe_gate_w = "deepseek_v4.ffn.gate.kernel"
+    v4_moe_gate_b = "deepseek_v4.ffn.gate.bias"
+    v4_moe_gate_tid2eid = "deepseek_v4.ffn.gate.tid2eid"
+    v4_shared_w1 = "deepseek_v4.ffn.shared_experts.w1.kernel"
+    v4_shared_w1_s = "deepseek_v4.ffn.shared_experts.w1.scale"
+    v4_shared_w2 = "deepseek_v4.ffn.shared_experts.w2.kernel"
+    v4_shared_w2_s = "deepseek_v4.ffn.shared_experts.w2.scale"
+    v4_shared_w3 = "deepseek_v4.ffn.shared_experts.w3.kernel"
+    v4_shared_w3_s = "deepseek_v4.ffn.shared_experts.w3.scale"
+    v4_experts_w1 = "deepseek_v4.ffn.experts.w1.kernel"
+    v4_experts_w1_s = "deepseek_v4.ffn.experts.w1.scale"
+    v4_experts_w2 = "deepseek_v4.ffn.experts.w2.kernel"
+    v4_experts_w2_s = "deepseek_v4.ffn.experts.w2.scale"
+    v4_experts_w3 = "deepseek_v4.ffn.experts.w3.kernel"
+    v4_experts_w3_s = "deepseek_v4.ffn.experts.w3.scale"
+    # mHC per-block parameters (one set per attention block, one per FFN block).
+    v4_hc_attn_base = "deepseek_v4.hc_attn.base"
+    v4_hc_attn_fn = "deepseek_v4.hc_attn.fn"
+    v4_hc_attn_scale = "deepseek_v4.hc_attn.scale"
+    v4_hc_ffn_base = "deepseek_v4.hc_ffn.base"
+    v4_hc_ffn_fn = "deepseek_v4.hc_ffn.fn"
+    v4_hc_ffn_scale = "deepseek_v4.hc_ffn.scale"
+    # mHC head-side reduction (global, applied before lm_head).
+    v4_hc_head_base = "deepseek_v4.hc_head.base"
+    v4_hc_head_fn = "deepseek_v4.hc_head.fn"
+    v4_hc_head_scale = "deepseek_v4.hc_head.scale"
+    # MTP-only auxiliaries (V4 MTP merges the V3-style enorm/hnorm pair with
+    # explicit e/h projections instead of a fused eh_proj).
+    v4_mtp_e_proj = "deepseek_v4.mtp.e_proj.kernel"
+    v4_mtp_e_proj_s = "deepseek_v4.mtp.e_proj.scale"
+    v4_mtp_h_proj = "deepseek_v4.mtp.h_proj.kernel"
+    v4_mtp_h_proj_s = "deepseek_v4.mtp.h_proj.scale"
+    v4_mtp_enorm = "deepseek_v4.mtp.enorm.gamma"
+    v4_mtp_hnorm = "deepseek_v4.mtp.hnorm.gamma"
+
     # cross attn
     cross_attn_pre_ln_gamma = "cross_attention_weights_pre_layernorm.gamma"
     cross_attn_pre_ln_beta = "cross_attention_weights_pre_layernorm.beta"
@@ -1458,6 +1531,64 @@ class W:
         mla_indexer_weights_proj_w: sp_id,
         mla_indexer_qb_w: sp_id,
         mla_indexer_k_w: sp_id,
+        # ----- DeepSeek-V4 (reference: TP=1 baseline; per-layer TP comes with
+        # the FlashMLA V4 backend. Until then sp_id replicates everywhere.) ---
+        v4_attn_norm: sp_id,
+        v4_ffn_norm: sp_id,
+        v4_q_norm: sp_id,
+        v4_kv_norm: sp_id,
+        v4_attn_sink: sp_id,
+        v4_wq_a: sp_id,
+        v4_wq_a_s: sp_id,
+        v4_wq_b: sp_id,
+        v4_wq_b_s: sp_id,
+        v4_wkv: sp_id,
+        v4_wkv_s: sp_id,
+        v4_wo_a: sp_id,
+        v4_wo_a_s: sp_id,
+        v4_wo_b: sp_id,
+        v4_wo_b_s: sp_id,
+        v4_compressor_ape: sp_id,
+        v4_compressor_norm: sp_id,
+        v4_compressor_wgate: sp_id,
+        v4_compressor_wkv: sp_id,
+        v4_indexer_compressor_ape: sp_id,
+        v4_indexer_compressor_norm: sp_id,
+        v4_indexer_compressor_wgate: sp_id,
+        v4_indexer_compressor_wkv: sp_id,
+        v4_indexer_weights_proj: sp_id,
+        v4_indexer_wq_b: sp_id,
+        v4_indexer_wq_b_s: sp_id,
+        v4_moe_gate_w: sp_id,
+        v4_moe_gate_b: sp_id,
+        v4_moe_gate_tid2eid: sp_id,
+        v4_shared_w1: sp_id,
+        v4_shared_w1_s: sp_id,
+        v4_shared_w2: sp_id,
+        v4_shared_w2_s: sp_id,
+        v4_shared_w3: sp_id,
+        v4_shared_w3_s: sp_id,
+        v4_experts_w1: sp_moe_w1,
+        v4_experts_w1_s: sp_moe_w1,
+        v4_experts_w2: sp_moe_neg1,
+        v4_experts_w2_s: sp_moe_neg1,
+        v4_experts_w3: sp_moe_w1,
+        v4_experts_w3_s: sp_moe_w1,
+        v4_hc_attn_base: sp_id,
+        v4_hc_attn_fn: sp_id,
+        v4_hc_attn_scale: sp_id,
+        v4_hc_ffn_base: sp_id,
+        v4_hc_ffn_fn: sp_id,
+        v4_hc_ffn_scale: sp_id,
+        v4_hc_head_base: sp_id,
+        v4_hc_head_fn: sp_id,
+        v4_hc_head_scale: sp_id,
+        v4_mtp_e_proj: sp_id,
+        v4_mtp_e_proj_s: sp_id,
+        v4_mtp_h_proj: sp_id,
+        v4_mtp_h_proj_s: sp_id,
+        v4_mtp_enorm: sp_id,
+        v4_mtp_hnorm: sp_id,
     }
 
     weights_list = [
