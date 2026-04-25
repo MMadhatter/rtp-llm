@@ -166,13 +166,16 @@ def git_deps():
     new_git_repository(
         name = "flashmla",
         remote = "https://github.com/deepseek-ai/FlashMLA.git",
-        # DeepSeek-V4 (PR-C TODO): bump to a commit that ships the V4
-        # sparse + dense MQA paths (head_dim=512 / kv_head=1, sink, swa-bypass).
-        # vLLM PR #40760 uses vllm-project/FlashMLA fork @ a6ec2ba7; an upstream
-        # deepseek-ai/FlashMLA equivalent commit is needed here. Until then,
-        # V4 will fall back to the python reference attention impl
-        # (rtp_llm/models_py/modules/hybrid/hca_attention.py) which is correct
-        # but slow.
+        # The pinned commit + the wheel shipped at flash_mla 1.0.0 already
+        # expose every V4-class entry point we use:
+        #   * flash_mla_with_kvcache(..., attn_sink, indices,
+        #     extra_k_cache, topk_length, is_fp8_kvcache,
+        #     extra_indices_in_kvcache, extra_topk_length) — sink + sparse
+        #     + SWA-bypass + FP8 KV cache, all in the same call.
+        #   * flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v=512,
+        #     attn_sink, topk_length) — CSA dense MQA path with d_v=512.
+        # The Python wrappers live in
+        # rtp_llm/models_py/modules/hybrid/flashmla_csa.py.
         commit = "b31bfe72a83ea205467b3271a5845440a03ed7cb",
         build_file = str(Label("//3rdparty/flashmla:flashmla.BUILD")),
         patches = [
