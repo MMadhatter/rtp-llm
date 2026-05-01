@@ -20,6 +20,26 @@ from rtp_llm.models_py.modules.dsv4.rope import (
     apply_rotary_emb_batched,
 )
 
+# Fused einsum + ReLU + weighted-sum kernel.  Replaces the torch chain
+# `(einsum.relu_() * w.unsqueeze(-1)).sum(dim=2)` in both decode and
+# prefill paths.  Set DSV4_INDEXER_FAST=0 to force the REF chain (debug
+# only).
+try:
+    from rtp_llm.models_py.modules.dsv4._indexer_score_triton import v4_indexer_score
+
+    _INDEXER_FAST_OK = True
+except Exception:  # pragma: no cover — keep V4 importable without Triton
+    v4_indexer_score = None
+    _INDEXER_FAST_OK = False
+
+
+def _use_indexer_fast() -> bool:
+    if not _INDEXER_FAST_OK:
+        return False
+    import os as _os
+
+    return _os.environ.get("DSV4_INDEXER_FAST", "1") != "0"
+
 
 class Indexer(nn.Module):
     def __init__(
@@ -235,20 +255,34 @@ class Indexer(nn.Module):
             ((start_pos + 1) // ratio).to(torch.int64).view(bsz, 1, 1)
         )  # [B, 1, 1]
         T_max = self.kv_cache.shape[1]
-        kv_full = self.kv_cache[:bsz].float()  # [B, T_max, D_idx]
-        q32 = q.float()  # [B, 1, H_idx, D_idx]
-        w32 = weights.float()  # [B, 1, H_idx]
-        # einsum: [B, S, H, D] x [B, T, D] -> [B, S, H, T]
-        score = torch.einsum("bshd,btd->bsht", q32, kv_full)
-        score = (score.relu_() * w32.unsqueeze(-1)).sum(dim=2)  # [B, S=1, T_max]
-
-        # Mask T positions >= compressed_len[r] to -inf.
-        t_arange = torch.arange(T_max, device=score.device).view(1, 1, T_max)
-        score = torch.where(
-            t_arange < compressed_len,
-            score,
-            torch.full_like(score, float("-inf")),
-        )
+        # Synthesize per-row q_pos so the kernel's APPLY_MASK rule
+        # ``t < (q_pos + 1) // ratio`` collapses to ``t < compressed_len[r]``.
+        q_pos = (compressed_len.view(bsz) * ratio - 1).to(torch.int32)  # [B]
+        if _use_indexer_fast() and q.is_cuda:
+            kv_full_bf16 = self.kv_cache[:bsz].to(torch.bfloat16).contiguous()
+            q_bf16 = q if q.dtype == torch.bfloat16 else q.to(torch.bfloat16)
+            q_bf16 = q_bf16.contiguous()
+            w_bf16 = weights.to(torch.bfloat16).contiguous()  # kernel casts to fp32
+            # Kernel emits -inf in masked entries when APPLY_MASK=True.
+            score = v4_indexer_score(
+                q_bf16,
+                kv_full_bf16,
+                w_bf16,
+                q_pos=q_pos.unsqueeze(1),  # [B, S=1]
+                compress_ratio=ratio,
+            )  # [B, 1, T_max] fp32
+        else:
+            kv_full = self.kv_cache[:bsz].float()  # [B, T_max, D_idx]
+            q32 = q.float()
+            w32 = weights.float()
+            score = torch.einsum("bshd,btd->bsht", q32, kv_full)
+            score = (score.relu_() * w32.unsqueeze(-1)).sum(dim=2)
+            t_arange = torch.arange(T_max, device=score.device).view(1, 1, T_max)
+            score = torch.where(
+                t_arange < compressed_len,
+                score,
+                torch.full_like(score, float("-inf")),
+            )
 
         # topk over T_max — returns valid indices for the leading
         # prefix; for requests with compressed_len < K the tail of the
@@ -330,32 +364,65 @@ class Indexer(nn.Module):
         # TileLang kernel — eliminates the materialized intermediate
         # entirely (online ReLU+reduce in shared memory).
         kv = self.kv_cache[:bsz, : end_pos // ratio]
-        q_f = q.float()
-        w_f = weights.float()
-        S = q_f.size(1)
-        # Chunk size picked so peak = chunk_size * n_heads * T * 4 bytes
-        # stays under ~2 GB for typical T up to 32K.
-        max_chunk_bytes = 2 * (1 << 30)
+        S = q.size(1)
         T = kv.size(1)
-        denom = max(self.n_heads * max(T, 1) * 4, 1)
-        chunk_size = max(1, min(S, max_chunk_bytes // denom))
-        if chunk_size >= S:
-            index_score = torch.einsum("bshd,btd->bsht", q_f, kv.float())
-            index_score = (index_score.relu_() * w_f.unsqueeze(-1)).sum(dim=2)
+
+        # Decide whether prefill (start_pos == 0, non-batched) — only
+        # path that needs the per-row causal mask folded into the score.
+        is_prefill_for_score = not is_batched and (
+            isinstance(start_pos, int)
+            and start_pos == 0
+            or isinstance(start_pos, torch.Tensor)
+            and start_pos.item() == 0
+        )
+
+        if _use_indexer_fast() and q.is_cuda and S > 0 and T > 0:
+            q_bf16 = (
+                q if q.dtype == torch.bfloat16 else q.to(torch.bfloat16)
+            ).contiguous()
+            kv_bf16 = kv.to(torch.bfloat16).contiguous()
+            w_bf16 = weights.to(torch.bfloat16).contiguous()
+            if is_prefill_for_score:
+                if cp_on:
+                    qpos_row = cp_ctx.global_positions.to(torch.int32)  # [S]
+                else:
+                    qpos_row = torch.arange(S, device=q.device, dtype=torch.int32)
+                # [B, S] int32; broadcast same row across B (cheap; tiny tensor).
+                q_pos_kernel = qpos_row.view(1, S).expand(bsz, S).contiguous()
+            else:
+                q_pos_kernel = None
+            index_score = v4_indexer_score(
+                q_bf16,
+                kv_bf16,
+                w_bf16,
+                q_pos=q_pos_kernel,
+                compress_ratio=ratio,
+            )  # [B, S, T] fp32; -inf in causal-masked entries when prefill
         else:
-            parts = []
-            kv_f = kv.float()
-            for i in range(0, S, chunk_size):
-                end = min(i + chunk_size, S)
-                score = torch.einsum(
-                    "bshd,btd->bsht",
-                    q_f[:, i:end],
-                    kv_f,
-                )
-                score = (score.relu_() * w_f[:, i:end].unsqueeze(-1)).sum(dim=2)
-                parts.append(score)
-            index_score = torch.cat(parts, dim=1)
-            del parts, kv_f
+            q_f = q.float()
+            w_f = weights.float()
+            # Chunk size picked so peak = chunk_size * n_heads * T * 4 bytes
+            # stays under ~2 GB for typical T up to 32K.
+            max_chunk_bytes = 2 * (1 << 30)
+            denom = max(self.n_heads * max(T, 1) * 4, 1)
+            chunk_size = max(1, min(S, max_chunk_bytes // denom))
+            if chunk_size >= S:
+                index_score = torch.einsum("bshd,btd->bsht", q_f, kv.float())
+                index_score = (index_score.relu_() * w_f.unsqueeze(-1)).sum(dim=2)
+            else:
+                parts = []
+                kv_f = kv.float()
+                for i in range(0, S, chunk_size):
+                    end = min(i + chunk_size, S)
+                    score = torch.einsum(
+                        "bshd,btd->bsht",
+                        q_f[:, i:end],
+                        kv_f,
+                    )
+                    score = (score.relu_() * w_f[:, i:end].unsqueeze(-1)).sum(dim=2)
+                    parts.append(score)
+                index_score = torch.cat(parts, dim=1)
+                del parts, kv_f
 
         # Causal mask: each Q token at GLOBAL position g can only read
         # compressed KV blocks [0, (g+1)//ratio).  Only needed for prefill

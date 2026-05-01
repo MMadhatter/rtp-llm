@@ -20,7 +20,10 @@ from rtp_llm.models_py.modules.dsv4.cp import (
     cp_all_gather_full,
     cp_should_gather,
 )
-from rtp_llm.models_py.modules.dsv4.rope import apply_rotary_emb, apply_rotary_emb_batched
+from rtp_llm.models_py.modules.dsv4.rope import (
+    apply_rotary_emb,
+    apply_rotary_emb_batched,
+)
 
 # P2 (prefill_opt/final_plan.md): fused softmax+weighted-sum Triton kernel.
 # Replaces the prefill `(kv * score.softmax(dim=2)).sum(dim=2)` chain
@@ -340,9 +343,19 @@ class Compressor(nn.Module):
             kv_state_view = self.kv_state[:bsz]  # [B, ratio, coff*d]
             score_state_view = self.score_state[:bsz]
 
-        kv_compressed = (kv_state_view * score_state_view.softmax(dim=1)).sum(
-            dim=1, keepdim=True
-        )  # [B, 1, d]
+        # Fused softmax(dim=1) + weighted-sum.  Reuses the prefill pool kernel
+        # by adding a unit NB axis: [B, G, D] -> [B, 1, G, D] -> [B, 1, D].
+        # Both ratios qualify (G=ratio HCA / 2*ratio CSA, both ≤ 256 pow2).
+        if _use_compressor_fast() and kv_state_view.is_cuda and bsz > 0:
+            kv_c = kv_state_view.unsqueeze(1)
+            sc_c = score_state_view.unsqueeze(1)
+            kv_c = kv_c if kv_c.is_contiguous() else kv_c.contiguous()
+            sc_c = sc_c if sc_c.is_contiguous() else sc_c.contiguous()
+            kv_compressed = v4_compressor_pool(kv_c, sc_c)  # [B, 1, D] fp32
+        else:
+            kv_compressed = (kv_state_view * score_state_view.softmax(dim=1)).sum(
+                dim=1, keepdim=True
+            )  # [B, 1, D]
 
         kv_compressed = self._rmsnorm(kv_compressed.to(dtype))  # [B, 1, d]
 
