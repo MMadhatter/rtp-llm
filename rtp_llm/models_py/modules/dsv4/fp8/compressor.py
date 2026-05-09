@@ -52,6 +52,7 @@ from rtp_llm.models_py.modules.dsv4._compressor_vllm_triton import (
 )
 from rtp_llm.models_py.modules.dsv4.cp import (
     CPContext,
+    build_cp_full_prefill_positions,
     cp_all_gather_full,
     cp_should_gather,
 )
@@ -523,6 +524,38 @@ class CompressorFP8(nn.Module):
             kv = cp_all_gather_full(kv, cp_ctx)
             score = cp_all_gather_full(score, cp_ctx)
             bsz, seqlen = kv.size(0), kv.size(1)
+            # Any caller-provided ``meta`` was sized for the rank-local
+            # (chunk_length) view; the post-gather kv/score tensors are sized
+            # for the GLOBAL ``seq_len_full``. Drop the stale meta so the
+            # rebuild path below can feed ``prepare_metadata`` full per-request
+            # positions/b_idx from CPContext.
+            # ``bsz`` here is the leading dim of the compressor input, NOT
+            # the number of prefill requests — production prefill always
+            # flattens multi-request input to ``[1, T_total, dim]`` (with
+            # T_total being the sum of per-request lengths). Multi-request CP
+            # keeps this convention and makes
+            # ``seqlen == seq_len_full == sum_i L_i_global``.
+            assert bsz == 1, "CompressorFP8 expects flattened [1, T_total, dim] input"
+            if (
+                cp_ctx is not None
+                and cp_ctx.input_lengths_global is not None
+                and cp_ctx.input_lengths_global.numel() > 0
+            ):
+                (
+                    positions,
+                    b_idx,
+                    seq_start_per_req,
+                    cu_seq_per_req,
+                ) = build_cp_full_prefill_positions(cp_ctx, device)
+                meta = self.prepare_metadata(
+                    positions,
+                    b_idx,
+                    is_batched=bool(cp_ctx.input_lengths_global.numel() > 1),
+                    seq_start_per_req=seq_start_per_req,
+                    cu_seq_per_req=cu_seq_per_req,
+                )
+            else:
+                meta = None
 
         N = bsz * seqlen
         # ``reshape(N, -1)`` collapses dim-0/1 for 3D, no-op for 2D — same

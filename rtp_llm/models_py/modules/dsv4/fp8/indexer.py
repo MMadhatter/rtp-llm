@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from rtp_llm.models_py.modules.dsv4.cp import CPContext
 from rtp_llm.models_py.modules.dsv4.fp8._indexer_q_quant_triton import (
     indexer_q_fp8_quant_fold,
 )
@@ -226,6 +227,14 @@ class IndexerFP8(PoolBackedModule):
         self._kv_cache_t = max_seq_len // compress_ratio
         self._kv_cache_d = index_head_dim
         self.freqs_cis: Optional[torch.Tensor] = None
+        # Context-Parallel context bound by ``V4Transformer._propagate_cp_ctx``
+        # before each prefill forward (Phase F). Decode runs with this
+        # cleared. Under cp_size > 1, ``prepare()`` swaps in
+        # ``cp_ctx.input_lengths_global`` for the per-request length math
+        # so T (compressed-K count) reflects the gather'd global view, and
+        # the nested compressor rebuilds its slot mappings post-gather
+        # (CompressorFP8.forward handles that internally).
+        self._cp_ctx: Optional[CPContext] = None
 
     # --------------------------------------------------------------
     # Pool propagation to nested compressor
@@ -243,11 +252,23 @@ class IndexerFP8(PoolBackedModule):
     def _clear_nested_pool(self) -> None:
         self.compressor.clear_pool_context()
 
-    def set_cp_ctx(self, cp_ctx) -> None:
-        # IndexerFP8 does not support Context-Parallel. transformer's
-        # global ``_propagate_cp_ctx`` calls this on every indexer; accept
-        # ``None`` (CP off) silently and refuse a real ctx loudly.
-        assert cp_ctx is None, "IndexerFP8 does not support Context-Parallel"
+    def set_cp_ctx(self, cp_ctx: Optional[CPContext]) -> None:
+        """Bind the per-forward CPContext (Phase F / Phase-2).
+
+        Phase-2 lifts the prior B==1 restriction: ``prepare`` already
+        consumes ``cp_ctx.input_lengths_global`` as a per-request array
+        (computing ``T_per_req`` elementwise), so multi-request CP just
+        works at this layer. The nested compressor's CP context is
+        bound by ``V4Transformer._propagate_cp_ctx`` separately (it walks
+        ``indexer.compressor`` directly) so we don't need to forward
+        here. Accepting ``None`` with cp_size <= 1 is the no-op.
+        """
+        if cp_ctx is not None and cp_ctx.cp_size > 1:
+            assert (
+                cp_ctx.input_lengths_global is not None
+                and cp_ctx.input_lengths_global.numel() >= 1
+            ), "IndexerFP8 CP requires cp_ctx.input_lengths_global"
+        self._cp_ctx = cp_ctx
 
     # --------------------------------------------------------------
     # Q-projection + RoPE helper (shared between prefill & decode)
@@ -454,11 +475,26 @@ class IndexerFP8(PoolBackedModule):
         # whenever ``DSV4_VARLEN_PREFILL=1`` so we don't re-check each
         # tensor — set ``DSV4_VARLEN_PREFILL=0`` to take the legacy path.
         use_varlen = os.environ.get("DSV4_VARLEN_PREFILL", "1") != "0"
+        # Phase F: under CP the framework's ``input_lengths`` is rank-local
+        # (chunk_length per req). The nested ``CompressorFP8.forward``
+        # all-gathers KV/score to the full ``seq_len_full`` per req, so the
+        # compressed-K count ``T_b = (prefix + S_b) // ratio`` must use the
+        # GLOBAL per-req length to size the score axis (ks/ke/cu_kv_seqlens
+        # all index into a per-rank pool that holds compressed entries for
+        # the entire global sequence). ``prefix_lengths`` is rank-invariant
+        # so it doesn't need swapping. Q stays rank-local — ``positions_d``
+        # uses ``position_ids`` which already carries GLOBAL absolute
+        # positions on each rank-local token.
+        cp_ctx = getattr(self, "_cp_ctx", None)
+        cp_active = cp_ctx is not None and cp_ctx.cp_size > 1
+        eff_input_lengths = input_lengths
+        if cp_active and cp_ctx.input_lengths_global is not None:
+            eff_input_lengths = cp_ctx.input_lengths_global
         if use_varlen:
             # Per-request compressed-K count: T_b = (sp_b + S_b) // ratio.
             seq_total_per_req = prefix_lengths.to(
                 device=device, dtype=torch.int64
-            ) + input_lengths.to(
+            ) + eff_input_lengths.to(
                 device=device, dtype=torch.int64
             )  # [B]
             T_per_req = (seq_total_per_req // ratio).to(torch.int32)  # [B]
@@ -593,7 +629,16 @@ class IndexerFP8(PoolBackedModule):
 
             self._propagate_pool_to_nested()
             try:
-                if use_varlen:
+                if cp_active:
+                    # Phase F: under CP the nested compressor will all-gather
+                    # KV/score to the full seq_len_full inside its forward(),
+                    # so any meta we build here from rank-local
+                    # ``position_ids`` / ``req_id_per_token`` would be sized
+                    # for the wrong N. Leave ``compressor_meta = None`` and
+                    # let CompressorFP8.forward rebuild from the post-gather
+                    # global seqlen.
+                    compressor_meta = None
+                elif use_varlen:
                     # Multi-request varlen: feed the nested compressor the
                     # per-token global positions + per-token request id, plus
                     # the per-request raw-window arrays. Without this the
