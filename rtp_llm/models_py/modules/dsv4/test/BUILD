@@ -1,4 +1,49 @@
 py_test(
+    name = "test_cp_context_build",
+    srcs = ["test_cp_context_build.py"],
+    deps = [
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
+    name = "test_cp_topk_idxs_align",
+    srcs = ["test_cp_topk_idxs_align.py"],
+    deps = [
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
+    name = "test_cp_via_concat_meta",
+    srcs = ["test_cp_via_concat_meta.py"],
+    deps = [
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
+    name = "test_cp_indexer_seq_total",
+    srcs = ["test_cp_indexer_seq_total.py"],
+    deps = [
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
+    name = "test_cp_workspace_combine_topk",
+    srcs = ["test_cp_workspace_combine_topk.py"],
+    deps = [
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
     name = "mhc_test",
     srcs = ["mhc_test.py"],
     deps = [
