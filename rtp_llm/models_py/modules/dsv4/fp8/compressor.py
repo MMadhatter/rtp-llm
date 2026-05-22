@@ -141,6 +141,43 @@ class CompressorMeta:
     compressed_lens_per_token: Optional[torch.Tensor] = None
 
 
+@dataclass
+class _CompressorPending:
+    """In-flight state between :meth:`CompressorFP8.start_prefill` and
+    :meth:`CompressorFP8.finish_prefill`.
+
+    Captured at ``start_prefill`` time so the orchestrator (attention
+    overlap path) can interleave other work on the default stream while
+    the CP all-gather drains on ``cp_gather_stream``. Holds:
+
+    * ``fused_flat`` — rank-local ``[T_local, 2*out_dim]`` fused KV/gate
+      projection. When CP is on, this is the source of the NCCL gather
+      (``fused_gather_handle``) and ``finish_prefill`` overwrites the
+      local reference with the gathered full-seq tensor.
+    * ``fused_gather_handle`` — ``CPCudaAsyncGatherHandle`` (or sync handle)
+      when CP is active; ``None`` when CP is off (single-rank prefill).
+    * ``sp / bsz / seqlen`` — pre-resolved scalars mirroring what
+      ``forward`` derives from ``start_pos`` / input shape, so
+      ``finish_prefill`` does not need to re-inspect ``x``.
+    * ``meta`` — caller-provided ``CompressorMeta`` (CP requires it; non-CP
+      may pass ``None`` and let ``finish_prefill`` rebuild positions/b_idx
+      from ``sp``/``bsz``/``seqlen``, matching ``forward``'s fallback).
+    * ``out_dim`` — ``(1 + overlap) * head_dim``. Captured at start_prefill
+      time so finish_prefill stays pure (no self peek).
+
+    Used **only** by the overlap orchestrator; the baseline ``forward``
+    path is unchanged.
+    """
+
+    fused_flat: torch.Tensor
+    fused_gather_handle: Optional[Any]
+    sp: int
+    bsz: int
+    seqlen: int
+    meta: Optional[CompressorMeta]
+    out_dim: int
+
+
 class _CompressorNorm(nn.Module):
     """RMSNorm weight holder — bf16 (vLLM kernel reads bf16 weight)."""
 
@@ -595,6 +632,143 @@ class CompressorFP8(nn.Module):
                 seq_start_per_req=meta.seq_start_per_req if use_varlen_raw else None,
                 cu_seq_per_req=meta.cu_seq_per_req if use_varlen_raw else None,
             )
+
+    # ----------------------------------------------------------------------
+    # Overlap orchestration: split-phase prefill (start / finish).
+    #
+    # The baseline :meth:`forward` below is a strict superset of these two
+    # split-phase methods (start + finish performed sequentially). The
+    # overlap orchestrator in attention.py uses the split-phase variant so
+    # it can interleave the CP all-gather (queued on a side stream by
+    # ``start_prefill``) with default-stream compute (SWA pool write,
+    # indexer compute_q) before waiting on the gather inside
+    # ``finish_prefill``.
+    #
+    # Contract:
+    #   * Every ``start_prefill`` call must be paired with exactly one
+    #     ``finish_prefill`` call on the returned handle.
+    #   * On warmup (no pool bound) ``start_prefill`` returns ``None`` and
+    #     ``finish_prefill(None)`` is a no-op — callers can chain
+    #     unconditionally without warmup branching.
+    #   * ``cp_gather_stream`` is the caller-owned CP gather stream. Sharing
+    #     one stream across multiple compressor calls in the same layer
+    #     (e.g. CSA: nested indexer + main) is required for FIFO ordering
+    #     of NCCL collectives within the ProcessGroup.
+    # ----------------------------------------------------------------------
+    def start_prefill(
+        self,
+        x: torch.Tensor,
+        start_pos,
+        *,
+        meta: Optional[CompressorMeta] = None,
+        cp_gather_stream: Optional[Any] = None,
+    ) -> Optional[_CompressorPending]:
+        """Begin a prefill compressor launch without waiting on the CP gather.
+
+        Steps performed eagerly on the **default** stream:
+          * shape / sp resolve (mirrors ``forward``);
+          * warmup early return → ``None`` (no pool bound by framework);
+          * fused KV/gate projection (``_linear_bf16_bf16_fp32``).
+
+        Steps deferred to :meth:`finish_prefill`:
+          * waiting the CP all-gather (queued here on
+            ``cp_gather_stream`` when CP is active);
+          * splitting fused → kv_flat + score_flat;
+          * the ``_launch`` writer kernel.
+        """
+        if x.dim() == 2:
+            bsz = 1
+            seqlen = int(x.size(0))
+        else:
+            bsz, seqlen, _ = x.size()
+        sp = (
+            int(start_pos.item())
+            if isinstance(start_pos, torch.Tensor)
+            else int(start_pos)
+        )
+        if self._state_pool_3d is None or self._kv_pool_3d is None or self._kv_eb <= 0:
+            return None
+
+        out_dim = (1 + self.overlap) * self.head_dim
+        with record_function_range("dsv4.fp8.compressor.prefill.fused_linear"):
+            fused_out = _linear_bf16_bf16_fp32(x, self._wkv_wgate_fused)
+            N = bsz * seqlen
+            fused_flat = fused_out.reshape(N, -1)
+
+        cp_ctx = self._cp_ctx
+        cp_gather = cp_should_gather(cp_ctx, start_pos)
+        fused_gather_handle = None
+        if cp_gather:
+            assert cp_ctx is not None
+            assert meta is not None, (
+                "CompressorFP8 CP start_prefill requires hoisted "
+                "CompressorMeta; non-CP path may pass meta=None"
+            )
+            N_full = int(cp_ctx.seq_len_full)
+            assert int(meta.positions.numel()) == N_full, (
+                f"CP compressor meta/token length mismatch: "
+                f"meta={meta.positions.numel()} seq_len_full={N_full}"
+            )
+            gather_stream = cp_gather_stream
+            if gather_stream is None and fused_flat.is_cuda:
+                gather_stream = torch.cuda.Stream(device=fused_flat.device)
+            with record_function_range(
+                "dsv4.fp8.compressor.prefill.cp_gather_kv_score"
+            ):
+                fused_gather_handle = cp_all_gather_full_async(
+                    fused_flat, cp_ctx, stream=gather_stream
+                )
+
+        return _CompressorPending(
+            fused_flat=fused_flat,
+            fused_gather_handle=fused_gather_handle,
+            sp=sp,
+            bsz=bsz,
+            seqlen=seqlen,
+            meta=meta,
+            out_dim=out_dim,
+        )
+
+    def finish_prefill(self, pending: Optional[_CompressorPending]) -> None:
+        """Drain a :meth:`start_prefill` and write the FP8 KV pool.
+
+        Mirrors the second half of :meth:`forward` (wait → split → launch).
+        ``pending=None`` is a no-op (warmup early-return path from
+        ``start_prefill``).
+        """
+        if pending is None:
+            return  # warmup, mirrors forward()'s early return
+        fused_flat = pending.fused_flat
+        out_dim = pending.out_dim
+        meta = pending.meta
+        if pending.fused_gather_handle is not None:
+            with record_function_range("dsv4.fp8.compressor.prefill.cp_wait_kv_score"):
+                fused_flat = cp_wait_gather_full(pending.fused_gather_handle)
+
+        with record_function_range("dsv4.fp8.compressor.prefill.split_kv_score"):
+            assert fused_flat.dim() == 2, (
+                f"CompressorFP8 prefill expects flat fused projection, got "
+                f"{tuple(fused_flat.shape)}"
+            )
+            assert fused_flat.size(1) == 2 * out_dim, (
+                f"CompressorFP8 fused hidden mismatch: got {fused_flat.size(1)}, "
+                f"expected {2 * out_dim}"
+            )
+            kv_flat = fused_flat[:, :out_dim]
+            score_flat = fused_flat[:, out_dim:]
+
+        if meta is None:
+            # Non-CP fallback: rebuild positions/b_idx from sp/bsz/seqlen.
+            device = fused_flat.device
+            with record_function_range("dsv4.fp8.compressor.prefill.build_meta"):
+                positions, b_idx = _build_prefill_positions(
+                    pending.sp, pending.bsz, pending.seqlen, device
+                )
+                meta = self.prepare_metadata(positions, b_idx)
+
+        seq_start = None if meta.is_batched else pending.sp
+        with record_function_range("dsv4.fp8.compressor.prefill.launch"):
+            self._launch(kv_flat, score_flat, meta, seq_start=seq_start)
 
     # ----------------------------------------------------------------------
     # Forward (prefill)

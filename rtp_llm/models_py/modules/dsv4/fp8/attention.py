@@ -51,9 +51,9 @@ from rtp_llm.models_py.modules.dsv4.cp import (
 from rtp_llm.models_py.modules.dsv4.fp8.compressor import CompressorFP8, CompressorMeta
 from rtp_llm.models_py.modules.dsv4.fp8.indexer import IndexerFP8
 from rtp_llm.models_py.modules.dsv4.qlinear import _fp8_dequant_to_fp32
-from rtp_llm.models_py.utils.memory import dispose_tensor
 from rtp_llm.models_py.modules.dsv4.rope import apply_rotary_emb, precompute_freqs_cis
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
+from rtp_llm.models_py.utils.memory import dispose_tensor
 from rtp_llm.ops.compute_ops import KVCacheRegionName, rtp_llm_ops
 
 
@@ -109,6 +109,19 @@ def _use_read_from_pool() -> bool:
 # regression can be bisected without reverting the patch series.
 def _use_varlen_prefill() -> bool:
     return os.environ.get("DSV4_VARLEN_PREFILL", "1") != "0"
+
+
+# Phase-Z (post-revert): overlap the prefill CP all-gather with same-layer
+# default-stream compute (SWA write for HCA; SWA write + indexer for CSA).
+# Default OFF — the baseline ``_forward_prefill_compressed`` / per-ratio
+# bodies are byte-for-byte the historical non-overlap path. ``DSV4_
+# PREFILL_CP_OVERLAP=1`` opts the layer into the orchestrator that lives
+# in ``_forward_prefill_*_overlapped``. The orchestrator additionally
+# refuses to engage under CUDA graph capture (NCCL collectives are not
+# capturable on this branch) and when CP is inactive (``cp_size <= 1``),
+# in which case the baseline path runs even with the env on.
+def _prefill_cp_overlap_enabled() -> bool:
+    return os.environ.get("DSV4_PREFILL_CP_OVERLAP", "0") == "1"
 
 
 def _flat_1d(t: torch.Tensor) -> torch.Tensor:
@@ -1915,16 +1928,10 @@ class AttentionFP8(nn.Module):
         assert attn_metadata.req_id_per_token_long is not None
         assert attn_metadata.decode_seq_start_per_req is not None
         assert attn_metadata.decode_cu_seq_per_req is not None
-        state_slots = attn_metadata.compressor_state_slot_mappings.get(
-            state_attn_type
-        )
+        state_slots = attn_metadata.compressor_state_slot_mappings.get(state_attn_type)
         kv_slots = attn_metadata.pool_write_slot_mappings.get(kv_attn_type)
         assert state_slots is not None and kv_slots is not None
-        from rtp_llm.models_py.modules.dsv4.attn_type import (
-            CSA_KV,
-            HCA_KV,
-            INDEXER_KV,
-        )
+        from rtp_llm.models_py.modules.dsv4.attn_type import CSA_KV, HCA_KV, INDEXER_KV
 
         ratio_by_kv = {CSA_KV: 4, INDEXER_KV: 4, HCA_KV: 128}
         ratio = ratio_by_kv.get(kv_attn_type)
@@ -2299,6 +2306,52 @@ class AttentionFP8(nn.Module):
             self._kv_cache = prev_kv
             self._block_tables_by_type = prev_bt
 
+    # ------------------------------------------------------------------
+    # CP-overlap orchestration helpers (Phase-Z; env-default-off)
+    # ------------------------------------------------------------------
+    def _should_overlap_cp_for_prefill(self, common: PrefillMeta) -> bool:
+        """Per-call gate for the CP-overlap orchestrator.
+
+        All four conditions must hold:
+          * ``DSV4_PREFILL_CP_OVERLAP=1`` (default off — baseline path);
+          * CP is actually active (``cp_size > 1``); no NCCL gather to
+            overlap with otherwise;
+          * not inside a CUDA-graph capture — NCCL collectives are not
+            capturable on this branch and ``cp_all_gather_full_async``
+            calls ``work.wait()``;
+          * the layer has a compressor (``compress_ratio > 0``) —
+            SWA-only layers (ratio == 0) have nothing to overlap.
+        """
+        if not _prefill_cp_overlap_enabled():
+            return False
+        if not common.cp_on or common.cp_ctx is None or common.cp_ctx.cp_size <= 1:
+            return False
+        if self.compress_ratio == 0:
+            return False
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return False
+        return True
+
+    def _get_cp_gather_stream(self, device: torch.device) -> torch.cuda.Stream:
+        """Lazily allocate and cache one CP gather stream per layer instance.
+
+        The same stream is reused across the layer's compressor calls (HCA:
+        main only; CSA: nested-indexer + main) so their NCCL collectives
+        share FIFO ordering on the side stream — required for rank-
+        consistent execution within a single ``ProcessGroup``.
+        """
+        stream = getattr(self, "_cp_gather_stream_cached", None)
+        # ``stream.device`` is always indexed (``cuda:N``); ``device`` may
+        # come in either form. Compare by ``index`` (resolving ``None`` to
+        # the current device) instead of full ``torch.device`` equality.
+        want_index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        if stream is None or stream.device.index != want_index:
+            stream = torch.cuda.Stream(device=device)
+            self._cp_gather_stream_cached = stream
+        return stream
+
     def _forward_prefill(
         self, x: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
@@ -2314,6 +2367,12 @@ class AttentionFP8(nn.Module):
         ``csa`` / ``hca`` additionally share the ``[sliding | compressed]``
         kv_cat + sparse_attn epilogue via :meth:`_forward_prefill_compressed`.
 
+        Under ``DSV4_PREFILL_CP_OVERLAP=1`` + CP-active, CSA/HCA layers
+        instead dispatch to the overlap orchestrators (which hoist the
+        compressor's CP all-gather ahead of the SWA write so they can
+        overlap on default vs side stream). The baseline sequential path
+        below stays byte-equal otherwise.
+
         FP8 KV-cache is asserted at the public ``forward()`` entry; this
         body assumes FP8 unconditionally.
         """
@@ -2321,6 +2380,19 @@ class AttentionFP8(nn.Module):
             common = self._prefill_common_setup(x, positions)
         with record_function_range("dsv4.fp8.attn.prefill.compute_qkv"):
             qkv = self._prefill_compute_qkv(x, common)
+
+        # Phase-Z overlap dispatch: hoist the SWA write into the orchestrator
+        # so it can run on the default stream while the compressor NCCL
+        # gather drains on the side stream. The baseline path below is
+        # left untouched for non-overlap and warmup forwards.
+        if self._should_overlap_cp_for_prefill(common):
+            if self.compress_ratio == 128:
+                with record_function_range("dsv4.fp8.attn.prefill.path_hca_overlap"):
+                    return self._forward_prefill_hca_overlapped(x, qkv, common)
+            if self.compress_ratio == 4:
+                with record_function_range("dsv4.fp8.attn.prefill.path_csa_overlap"):
+                    return self._forward_prefill_csa_overlapped(x, qkv, common)
+
         # SWA pool write — every FP8 layer populates the SWA pool for
         # downstream decode. Safe to do before attention because new K
         # (abs pos [sp, sp+S)) and any cont-prefill prefix tail
@@ -2399,6 +2471,92 @@ class AttentionFP8(nn.Module):
             workspace_meta=common.csa_meta.workspace_meta,
         )
 
+    def _forward_prefill_csa_overlapped(
+        self,
+        x: torch.Tensor,
+        qkv: PrefillQKV,
+        common: PrefillMeta,
+    ) -> torch.Tensor:
+        """CSA path with two CP all-gathers overlapped onto the SWA write
+        + indexer compute_q.
+
+        Phase-Z orchestrator. CSA layers issue TWO independent NCCL
+        collectives per step (nested indexer compressor + main CSA
+        compressor); both must share the same ``cp_gather_stream`` so
+        NCCL's per-stream FIFO ordering keeps the two collectives
+        rank-consistent within the ProcessGroup. Sequence:
+
+          1. ``compressor.start_prefill`` enqueues NCCL #1 (main CSA
+             compressor's fused-KV gather) on ``cp_gather_stream``;
+          2. ``indexer.start_prefill_nested_compressor`` enqueues NCCL
+             #2 (nested indexer compressor's fused-KV gather) on the
+             SAME stream — runs after NCCL #1 (FIFO);
+          3. ``_prefill_write_swa_fp8_paged`` on the default stream
+             overlaps with both gathers above;
+          4. ``indexer.forward_with_pending_nested`` waits NCCL #2,
+             writes the indexer-side pool, then runs the indexer's
+             default-stream kernel chain (compute_q + gather_k +
+             quant_q + score + topk) to produce ``raw`` cmp_topk;
+          5. ``compressor.finish_prefill`` waits NCCL #1 + writes the
+             CSA pool (already drained by step 4's wait of NCCL #2,
+             but the split + ``_launch`` still needs to run);
+          6. ``_forward_prefill_compressed(_skip_compressor_write=True,
+             cmp_topk_runtime=raw)`` runs workspace_attn over the
+             just-written CSA pool + the indexer topk.
+
+        Bit-equal to :meth:`_forward_prefill_csa` (sequential baseline):
+        same kernel inputs, same compressor_meta, same indexer chain,
+        same workspace path — only the launch ordering differs.
+        """
+        from rtp_llm.models_py.modules.dsv4.fp8.indexer import IndexerFP8
+
+        assert isinstance(
+            self.indexer, IndexerFP8
+        ), "CSA overlap requires IndexerFP8 (BF16 indexer not supported)"
+        assert common.csa_meta is not None, (
+            "CSA overlap prefill requires common.csa_meta — built by "
+            "_build_csa_prefill_meta"
+        )
+        assert common.cp_ctx is not None and common.cp_on, (
+            "_forward_prefill_csa_overlapped invoked without CP active — "
+            "_should_overlap_cp_for_prefill guards this"
+        )
+
+        cp_stream = self._get_cp_gather_stream(x.device)
+        csa_meta = common.csa_meta
+        with record_function_range("dsv4.fp8.attn.csa_overlap.start_main_compressor"):
+            main_pending = self.compressor.start_prefill(
+                x,
+                common.sp_int,
+                meta=csa_meta.compressor_meta,
+                cp_gather_stream=cp_stream,
+            )
+        with record_function_range("dsv4.fp8.attn.csa_overlap.start_nested_compressor"):
+            nested_pending = self.indexer.start_prefill_nested_compressor(
+                x,
+                csa_meta.indexer_meta.sp_int,
+                meta=csa_meta.indexer_meta.compressor_meta,
+                cp_gather_stream=cp_stream,
+            )
+        with record_function_range("dsv4.fp8.attn.csa_overlap.swa_write"):
+            self._prefill_write_swa_fp8_paged(common, qkv.kv_full)
+        with record_function_range("dsv4.fp8.attn.csa_overlap.indexer"):
+            raw = self.indexer.forward_with_pending_nested(
+                x, qkv.qr, csa_meta.indexer_meta, nested_pending
+            )
+        with record_function_range("dsv4.fp8.attn.csa_overlap.finish_main_compressor"):
+            self.compressor.finish_prefill(main_pending)
+
+        return self._forward_prefill_compressed(
+            x,
+            qkv,
+            common,
+            cmp_topk_runtime=raw,
+            compressor_meta=csa_meta.compressor_meta,
+            workspace_meta=csa_meta.workspace_meta,
+            _skip_compressor_write=True,
+        )
+
     def _forward_prefill_hca(
         self,
         x: torch.Tensor,
@@ -2422,6 +2580,67 @@ class AttentionFP8(nn.Module):
             workspace_meta=common.hca_meta.workspace_meta,
         )
 
+    def _forward_prefill_hca_overlapped(
+        self,
+        x: torch.Tensor,
+        qkv: PrefillQKV,
+        common: PrefillMeta,
+    ) -> torch.Tensor:
+        """HCA path with CP all-gather overlapped onto the SWA pool write.
+
+        Phase-Z orchestrator. Reachable only when
+        ``_should_overlap_cp_for_prefill`` returned True (env on + CP
+        active + not capturing). Sequence:
+
+          1. ``compressor.start_prefill`` enqueues the fused-KV CP gather
+             on ``cp_gather_stream`` (side stream — no default-stream
+             dependency yet);
+          2. ``_prefill_write_swa_fp8_paged`` runs on the default stream
+             in parallel with the NCCL gather above (disjoint pool +
+             independent input ``qkv.kv_full``);
+          3. ``compressor.finish_prefill`` waits the gather + writes the
+             HCA pool;
+          4. ``_forward_prefill_compressed(_skip_compressor_write=True)``
+             runs the workspace path over the just-written HCA pool.
+
+        Bit-equal to :meth:`_forward_prefill_hca` (sequential baseline):
+        same kernel inputs, same compressor_meta, same workspace path —
+        only the launch ordering differs.
+        """
+        assert self.indexer is None, "HCA layer must not have an indexer"
+        assert common.hca_meta is not None, (
+            "HCA overlap prefill requires common.hca_meta — built by "
+            "_build_hca_prefill_meta"
+        )
+        assert common.cp_ctx is not None and common.cp_on, (
+            "_forward_prefill_hca_overlapped invoked without CP active — "
+            "_should_overlap_cp_for_prefill guards this"
+        )
+
+        cp_stream = self._get_cp_gather_stream(x.device)
+        with record_function_range("dsv4.fp8.attn.hca_overlap.start_compressor"):
+            main_pending = self.compressor.start_prefill(
+                x,
+                common.sp_int,
+                meta=common.hca_meta.compressor_meta,
+                cp_gather_stream=cp_stream,
+            )
+        with record_function_range("dsv4.fp8.attn.hca_overlap.swa_write"):
+            # Default-stream work that overlaps with the NCCL gather above.
+            self._prefill_write_swa_fp8_paged(common, qkv.kv_full)
+        with record_function_range("dsv4.fp8.attn.hca_overlap.finish_compressor"):
+            self.compressor.finish_prefill(main_pending)
+
+        return self._forward_prefill_compressed(
+            x,
+            qkv,
+            common,
+            cmp_topk_runtime=None,
+            compressor_meta=common.hca_meta.compressor_meta,
+            workspace_meta=common.hca_meta.workspace_meta,
+            _skip_compressor_write=True,
+        )
+
     def _forward_prefill_compressed(
         self,
         x: torch.Tensor,
@@ -2430,11 +2649,21 @@ class AttentionFP8(nn.Module):
         cmp_topk_runtime: Optional[torch.Tensor],
         compressor_meta,
         workspace_meta: Optional[WorkspaceMeta],
+        *,
+        _skip_compressor_write: bool = False,
     ) -> torch.Tensor:
         """Shared CSA/HCA epilogue: write compressed-K via main compressor
         (with hoisted ``compressor_meta``), then run the workspace-path
         attention. Falls back to ``_attn_fp8_swa_via_kv_full`` on warmup
-        when ``workspace_meta`` is None (pool context unbound)."""
+        when ``workspace_meta`` is None (pool context unbound).
+
+        ``_skip_compressor_write`` is the Phase-Z overlap escape hatch:
+        the orchestrator (HCA/CSA) has already drained the compressor's
+        gather via ``finish_prefill``, so this method must NOT issue a
+        second synchronous compressor call (which would re-do the work
+        and break correctness). Baseline (non-overlap) callers leave
+        the default ``False`` and the historical sequential path runs.
+        """
         # Compressor write (return value is unused — compressor handles its
         # own pool dual-write; the workspace path re-reads the just-written
         # tail via dequantize_and_gather_k_cache, with BF16 overlay on top).
@@ -2443,8 +2672,9 @@ class AttentionFP8(nn.Module):
         # rewrap so the batched (B>1) caller can reuse this code path
         # without re-shaping. B==1 reaches the same kernel — same flat
         # ``[T_total, dim]`` reshape inside ``_launch``.
-        with record_function_range("dsv4.fp8.attn.compressed.compressor"):
-            self.compressor(x, common.sp_int, meta=compressor_meta)
+        if not _skip_compressor_write:
+            with record_function_range("dsv4.fp8.attn.compressed.compressor"):
+                self.compressor(x, common.sp_int, meta=compressor_meta)
 
         if workspace_meta is None:
             # Warmup forward: pool not bound. Fall back to BF16 ``kv_full``
