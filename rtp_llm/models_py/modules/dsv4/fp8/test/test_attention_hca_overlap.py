@@ -88,6 +88,11 @@ def _make_common(
 ) -> PrefillMeta:
     """Minimal PrefillMeta with just the fields the orchestrator + gate
     inspect (cp_on, cp_ctx, sp_int, hca_meta)."""
+    tensor_device = (
+        device
+        if device.type != "cuda" or torch.cuda.is_available()
+        else torch.device("cpu")
+    )
     if cp_on:
         cp_ctx = SimpleNamespace(cp_size=cp_size, seq_len_full=4)
     else:
@@ -103,11 +108,11 @@ def _make_common(
         device=device,
         cp_ctx=cp_ctx,
         cp_on=cp_on,
-        freqs_cis=torch.zeros(1, dtype=torch.float32, device=device),
-        topk_idxs=torch.zeros(1, dtype=torch.int32, device=device),
+        freqs_cis=torch.zeros(1, dtype=torch.float32, device=tensor_device),
+        topk_idxs=torch.zeros(1, dtype=torch.int32, device=tensor_device),
         sp_int=0,
         any_cont=False,
-        row_seqlens_full=torch.tensor([2], dtype=torch.long, device=device),
+        row_seqlens_full=torch.tensor([2], dtype=torch.long, device=tensor_device),
         hca_meta=hca_meta,
     )
 
@@ -154,20 +159,21 @@ class HCAOverlapGateTest(unittest.TestCase):
         with self._with_env("1"):
             self.assertFalse(layer._should_overlap_cp_for_prefill(common))
 
-    def test_env_on_cp_active_hca_is_true(self) -> None:
+    def test_env_on_cp_active_cpu_device_is_false(self) -> None:
         layer = _make_attention_stub(compress_ratio=128)
         common = _make_common(cp_on=True, device=self.device)
         with self._with_env("1"):
-            # On CPU torch.cuda.is_current_stream_capturing is unavailable;
-            # the gate falls through (cuda.is_available() guard).
+            self.assertFalse(layer._should_overlap_cp_for_prefill(common))
+
+    def test_env_on_cp_active_cuda_hca_is_true(self) -> None:
+        layer = _make_attention_stub(compress_ratio=128)
+        common = _make_common(cp_on=True, device=torch.device("cuda"))
+        with self._with_env("1"):
             self.assertTrue(layer._should_overlap_cp_for_prefill(common))
 
-    def test_env_on_cp_active_csa_is_true(self) -> None:
-        # P3 only ships HCA dispatch — but the gate itself returns True
-        # for CSA so the P4 orchestrator can opt in without rewriting the
-        # gate.
+    def test_env_on_cp_active_cuda_csa_is_true(self) -> None:
         layer = _make_attention_stub(compress_ratio=4)
-        common = _make_common(cp_on=True, device=self.device)
+        common = _make_common(cp_on=True, device=torch.device("cuda"))
         with self._with_env("1"):
             self.assertTrue(layer._should_overlap_cp_for_prefill(common))
 

@@ -2312,10 +2312,12 @@ class AttentionFP8(nn.Module):
     def _should_overlap_cp_for_prefill(self, common: PrefillMeta) -> bool:
         """Per-call gate for the CP-overlap orchestrator.
 
-        All four conditions must hold:
+        All five conditions must hold:
           * ``DSV4_PREFILL_CP_OVERLAP=1`` (default off — baseline path);
           * CP is actually active (``cp_size > 1``); no NCCL gather to
             overlap with otherwise;
+          * prefill tensors are CUDA-backed — CPU / sync-reference CP
+            should keep using the baseline path;
           * not inside a CUDA-graph capture — NCCL collectives are not
             capturable on this branch and ``cp_all_gather_full_async``
             calls ``work.wait()``;
@@ -2327,6 +2329,8 @@ class AttentionFP8(nn.Module):
         if not common.cp_on or common.cp_ctx is None or common.cp_ctx.cp_size <= 1:
             return False
         if self.compress_ratio == 0:
+            return False
+        if common.device.type != "cuda":
             return False
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return False
@@ -2340,6 +2344,12 @@ class AttentionFP8(nn.Module):
         share FIFO ordering on the side stream — required for rank-
         consistent execution within a single ``ProcessGroup``.
         """
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError(
+                f"CP-overlap gather stream requires a CUDA device, got {device}"
+            )
+
         stream = getattr(self, "_cp_gather_stream_cached", None)
         # ``stream.device`` is always indexed (``cuda:N``); ``device`` may
         # come in either form. Compare by ``index`` (resolving ``None`` to
@@ -2348,7 +2358,7 @@ class AttentionFP8(nn.Module):
             device.index if device.index is not None else torch.cuda.current_device()
         )
         if stream is None or stream.device.index != want_index:
-            stream = torch.cuda.Stream(device=device)
+            stream = torch.cuda.Stream(device=torch.device("cuda", want_index))
             self._cp_gather_stream_cached = stream
         return stream
 

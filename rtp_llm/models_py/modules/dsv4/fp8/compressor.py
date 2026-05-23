@@ -164,6 +164,9 @@ class _CompressorPending:
       from ``sp``/``bsz``/``seqlen``, matching ``forward``'s fallback).
     * ``out_dim`` — ``(1 + overlap) * head_dim``. Captured at start_prefill
       time so finish_prefill stays pure (no self peek).
+    * ``restored_buf`` — optional full-sequence destination used by the
+      non-prefix CP restore path. It is kept on the pending object so the
+      restored fused tensor's storage stays owned through ``finish_prefill``.
 
     Used **only** by the overlap orchestrator; the baseline ``forward``
     path is unchanged.
@@ -176,6 +179,7 @@ class _CompressorPending:
     seqlen: int
     meta: Optional[CompressorMeta]
     out_dim: int
+    restored_buf: Optional[torch.Tensor] = None
 
 
 class _CompressorNorm(nn.Module):
@@ -709,6 +713,13 @@ class CompressorFP8(nn.Module):
                 f"CP compressor meta/token length mismatch: "
                 f"meta={meta.positions.numel()} seq_len_full={N_full}"
             )
+            restored_buf = None
+            if not cp_ctx.unpad_restore_is_prefix:
+                restored_buf = torch.empty(
+                    (N_full, int(fused_flat.size(1))),
+                    dtype=fused_flat.dtype,
+                    device=fused_flat.device,
+                )
             gather_stream = cp_gather_stream
             if gather_stream is None and fused_flat.is_cuda:
                 gather_stream = torch.cuda.Stream(device=fused_flat.device)
@@ -716,8 +727,13 @@ class CompressorFP8(nn.Module):
                 "dsv4.fp8.compressor.prefill.cp_gather_kv_score"
             ):
                 fused_gather_handle = cp_all_gather_full_async(
-                    fused_flat, cp_ctx, stream=gather_stream
+                    fused_flat,
+                    cp_ctx,
+                    stream=gather_stream,
+                    restored_buf=restored_buf,
                 )
+        else:
+            restored_buf = None
 
         return _CompressorPending(
             fused_flat=fused_flat,
@@ -727,6 +743,7 @@ class CompressorFP8(nn.Module):
             seqlen=seqlen,
             meta=meta,
             out_dim=out_dim,
+            restored_buf=restored_buf,
         )
 
     def finish_prefill(self, pending: Optional[_CompressorPending]) -> None:
