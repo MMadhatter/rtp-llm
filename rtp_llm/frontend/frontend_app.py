@@ -27,9 +27,11 @@ from rtp_llm.distribute.distributed_server import get_world_info
 from rtp_llm.embedding.embedding_type import TYPE_STR, EmbeddingType
 from rtp_llm.frontend.frontend_server import FrontendServer
 from rtp_llm.frontend.frontend_worker import (
+    get_control_addrs_from_env,
     get_control_addrs_from_world_info,
     get_dp_addrs_from_world_info,
 )
+from rtp_llm.frontend.sleep_routes import register_sleep_routes
 from rtp_llm.openai.api_datatype import (
     BatchChatCompletionRequest,
     ChatCompletionRequest,
@@ -75,7 +77,7 @@ class FrontendApp(object):
         self.separated_frontend = separated_frontend
 
         # DP addresses are serving route targets; lifecycle control must fan out
-        # to every backend rank because freeze/resume is process-local.
+        # to every backend rank because sleep/wake_up is process-local.
         engine_config = EngineConfig.create(py_env_configs, nccl_comm_config=None)
         world_info = get_world_info(
             server_config=py_env_configs.server_config,
@@ -86,11 +88,14 @@ class FrontendApp(object):
             world_info=world_info,
             parallelism_config=engine_config.parallelism_config,
         )
-        control_addresses = get_control_addrs_from_world_info(world_info)
+        control_addresses = get_control_addrs_from_env()
+        if not control_addresses:
+            control_addresses = get_control_addrs_from_world_info(world_info)
         self.grpc_client = GrpcClientWrapper(
             self.server_config.rpc_server_port,
             dp_addresses=dp_addresses,
             control_addresses=control_addresses,
+            expected_control_address_count=engine_config.parallelism_config.world_size,
         )
 
         logging.info(
@@ -162,7 +167,7 @@ class FrontendApp(object):
         try:
             server = GracefulShutdownServer(config)
             server.set_server(self.frontend_server)
-            # freeze all current tracked objects to reduce gc cost
+            # Move current tracked objects into GC's permanent generation to reduce collection cost.
             gc.collect()
             gc.freeze()
             server.run()
@@ -294,42 +299,7 @@ class FrontendApp(object):
             result = await self.grpc_client.post_request("set_log_level", req)
             return result
 
-        # freeze/resume lifecycle admin proxy (design doc M2)
-        # request format (all fields optional):
-        #   {"mode": "graceful"|"force", "drain_timeout_ms": 30000, "reason": "..."}
-        @app.post("/admin/freeze")
-        async def admin_freeze(req: Optional[Dict[Any, Any]] = Body(None)):
-            req = req or {}
-            mode = req.get("mode", "graceful")
-            if mode not in ("graceful", "force"):
-                return ORJSONResponse(
-                    status_code=400,
-                    content={"error": 'freeze mode must be "graceful" or "force"'},
-                )
-            response = await self.grpc_client.post_request("freeze", req)
-            if "error" in response:
-                status_code = (
-                    409 if response.get("grpc_status") == "FAILED_PRECONDITION" else 500
-                )
-                return ORJSONResponse(status_code=status_code, content=response)
-            return response
-
-        @app.post("/admin/resume")
-        async def admin_resume(req: Optional[Dict[Any, Any]] = Body(None)):
-            response = await self.grpc_client.post_request("resume", req or {})
-            if "error" in response:
-                status_code = (
-                    409 if response.get("grpc_status") == "FAILED_PRECONDITION" else 500
-                )
-                return ORJSONResponse(status_code=status_code, content=response)
-            return response
-
-        @app.get("/admin/freeze_status")
-        async def admin_freeze_status():
-            response = await self.grpc_client.post_request("freeze_status", {})
-            if "error" in response:
-                return ORJSONResponse(status_code=500, content=response)
-            return response
+        register_sleep_routes(app, self.grpc_client)
 
         # request format: '{"trace_name":"normal_profiler", "start_step": 0, "num_steps": 3, "enable_all_rank": false}'
         @app.post("/rtp_llm/start_profile")

@@ -10,7 +10,7 @@
 #include "rtp_llm/cpp/api_server/ErrorResponse.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/api_server/AccessLogWrapper.h"
-#include "rtp_llm/cpp/engine_base/freeze/AdmissionGate.h"
+#include "rtp_llm/cpp/engine_base/sleep/AdmissionGate.h"
 
 using namespace autil::legacy;
 using namespace autil::legacy::json;
@@ -125,7 +125,7 @@ bool InferenceService::rejectIfUnavailable(const std::unique_ptr<http_server::Ht
     if (!engine_) {
         return false;
     }
-    AdmissionGate gate(&engine_->freezeController());
+    AdmissionGate gate(&engine_->sleepController());
     const auto    result = gate.checkDetail();
     if (result.admitted) {
         return false;

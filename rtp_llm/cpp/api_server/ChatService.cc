@@ -4,7 +4,7 @@
 #include "rtp_llm/cpp/api_server/http_server/http_server/HttpRequest.h"
 #include "rtp_llm/cpp/api_server/AccessLogWrapper.h"
 #include "rtp_llm/cpp/api_server/Exception.h"
-#include "rtp_llm/cpp/engine_base/freeze/AdmissionGate.h"
+#include "rtp_llm/cpp/engine_base/sleep/AdmissionGate.h"
 
 using namespace autil::legacy;
 using namespace autil::legacy::json;
@@ -17,7 +17,7 @@ bool ChatService::rejectIfUnavailable(const std::unique_ptr<http_server::HttpRes
     if (!engine_) {
         return false;
     }
-    AdmissionGate gate(&engine_->freezeController());
+    AdmissionGate gate(&engine_->sleepController());
     const auto    result = gate.checkDetail();
     if (result.admitted) {
         return false;
