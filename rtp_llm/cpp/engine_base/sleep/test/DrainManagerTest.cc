@@ -1,4 +1,4 @@
-#include "rtp_llm/cpp/engine_base/freeze/DrainManager.h"
+#include "rtp_llm/cpp/engine_base/sleep/DrainManager.h"
 
 #include <atomic>
 #include <chrono>
@@ -136,10 +136,9 @@ TEST_F(DrainManagerTest, ForceDrainInvokesCancelAndKeepsWaitingForStreaming) {
         manager_.notifyDrainProgress();
     });
 
-    FreezeOptions opt;
-    opt.mode             = "force";
-    opt.force            = true;
-    opt.drain_timeout_ms = 10000;
+    SleepOptions opt;
+    opt.mode             = "abort";
+    opt.timeout_ms = 10000;
     EXPECT_TRUE(manager_.drain(opt));
 
     EXPECT_EQ(cancel_called.load(), 1);
@@ -152,9 +151,9 @@ TEST_F(DrainManagerTest, ForceDrainWithoutCancelCallbackStillWaits) {
     std::atomic<size_t> inflight{1};
     manager_.registerCounter("rpc_onflight", [&]() { return inflight.load(); });
 
-    FreezeOptions opt;
-    opt.force            = true;
-    opt.drain_timeout_ms = 30;
+    SleepOptions opt;
+    opt.mode             = "abort";
+    opt.timeout_ms = 30;
     // No cancel callback injected: force degrades to graceful wait and times out.
     EXPECT_FALSE(manager_.drain(opt));
 
@@ -166,9 +165,9 @@ TEST_F(DrainManagerTest, GracefulDrainDoesNotInvokeCancel) {
     std::atomic<int> cancel_called{0};
     manager_.setCancelCallback([&]() { cancel_called++; });
 
-    FreezeOptions opt;
-    opt.mode             = "graceful";
-    opt.drain_timeout_ms = 10;
+    SleepOptions opt;
+    opt.mode             = "wait";
+    opt.timeout_ms = 10;
     EXPECT_TRUE(manager_.drain(opt));
     EXPECT_EQ(cancel_called.load(), 0);
 }
@@ -205,8 +204,8 @@ TEST_F(DrainManagerTest, AggregateCountsByKind) {
     EXPECT_TRUE(manager_.drained());
 }
 
-// DrainManager as M1's FreezeHooks drain provider.
-TEST_F(DrainManagerTest, InstallHooksDrivesFreezeLifecycleController) {
+// DrainManager as M1's SleepHooks drain provider.
+TEST_F(DrainManagerTest, InstallHooksDrivesSleepLifecycleController) {
     std::atomic<size_t> requests{1};
     std::atomic<size_t> transfers{2};
     std::atomic<int>    cancel_called{0};
@@ -215,8 +214,8 @@ TEST_F(DrainManagerTest, InstallHooksDrivesFreezeLifecycleController) {
         "connector_inflight", [&]() { return transfers.load(); }, DrainManager::CounterKind::CACHE_TRANSFER);
     manager_.setCancelCallback([&]() { cancel_called++; });
 
-    FreezeLifecycleController controller;
-    FreezeHooks               hooks;
+    SleepLifecycleController controller(true);
+    SleepHooks               hooks;
     manager_.installHooks(hooks);
     controller.setHooks(hooks);
 
@@ -225,19 +224,19 @@ TEST_F(DrainManagerTest, InstallHooksDrivesFreezeLifecycleController) {
     EXPECT_EQ(status.active_request_count, 1);
     EXPECT_EQ(status.active_cache_transfer_count, 2);
 
-    // Graceful freeze with busy counters: drain hook fails, stays DRAINING.
-    FreezeOptions opt;
-    opt.drain_timeout_ms = 20;
-    auto result          = controller.freeze(opt);
+    // Graceful sleep with busy counters: drain hook fails, stays DRAINING.
+    SleepOptions opt;
+    opt.timeout_ms = 20;
+    auto result          = controller.sleep(opt);
     EXPECT_FALSE(result.ok);
-    EXPECT_EQ(controller.state(), FreezeState::DRAINING);
+    EXPECT_EQ(controller.state(), SleepState::DRAINING);
     EXPECT_EQ(cancel_called.load(), 0);
 
-    // Counters reach zero: idempotent freeze retry now drains and freezes.
+    // Counters reach zero: idempotent sleep retry now drains and sleeps.
     requests  = 0;
     transfers = 0;
-    EXPECT_TRUE(controller.freeze(opt).ok);
-    EXPECT_EQ(controller.state(), FreezeState::FROZEN);
+    EXPECT_TRUE(controller.sleep(opt).ok);
+    EXPECT_EQ(controller.state(), SleepState::SLEEPING);
 
     status = controller.status();
     EXPECT_EQ(status.active_request_count, 0);

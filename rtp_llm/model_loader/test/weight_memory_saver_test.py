@@ -1,4 +1,4 @@
-"""Unit tests for rtp_llm.model_loader.weight_memory_saver (Freeze/Resume M6).
+"""Unit tests for rtp_llm.model_loader.weight_memory_saver (Sleep/wake_up M6).
 
 GPU-free: torch_memory_saver is faked via sys.modules injection (or forced
 to be un-importable with a None sys.modules entry), so the tests validate:
@@ -52,16 +52,20 @@ class _FakeTms:
 
 class WeightMemorySaverTestBase(unittest.TestCase):
     def setUp(self) -> None:
-        self._saved_env = os.environ.get(wms.ENV_SWITCH)
+        self._saved_env = {
+            wms.ENV_SWITCH: os.environ.get(wms.ENV_SWITCH),
+            wms.LEGACY_ENV_SWITCH: os.environ.get(wms.LEGACY_ENV_SWITCH),
+        }
         self._saved_module = sys.modules.get(_TMS_MODULE)
         self._had_module = _TMS_MODULE in sys.modules
         wms._reset_for_testing()
 
     def tearDown(self) -> None:
-        if self._saved_env is None:
-            os.environ.pop(wms.ENV_SWITCH, None)
-        else:
-            os.environ[wms.ENV_SWITCH] = self._saved_env
+        for name, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         if self._had_module:
             sys.modules[_TMS_MODULE] = self._saved_module
         else:
@@ -88,6 +92,7 @@ class DefaultDisabledTest(WeightMemorySaverTestBase):
     def setUp(self) -> None:
         super().setUp()
         os.environ.pop(wms.ENV_SWITCH, None)
+        os.environ.pop(wms.LEGACY_ENV_SWITCH, None)
 
     def test_disabled_flags(self) -> None:
         self.assertFalse(wms.is_enabled())
@@ -115,6 +120,16 @@ class DefaultDisabledTest(WeightMemorySaverTestBase):
         os.environ[wms.ENV_SWITCH] = "0"
         self.assertFalse(wms.is_enabled())
         self.assertFalse(wms.is_available())
+
+    def test_runtime_override_enables_without_env(self) -> None:
+        os.environ.pop(wms.ENV_SWITCH, None)
+        wms.configure_from_runtime(True)
+        self.assertTrue(wms.is_enabled())
+
+    def test_runtime_override_disables_even_when_env_is_set(self) -> None:
+        os.environ[wms.ENV_SWITCH] = "1"
+        wms.configure_from_runtime(False)
+        self.assertFalse(wms.is_enabled())
 
 
 class UnavailableTest(WeightMemorySaverTestBase):
@@ -226,6 +241,26 @@ class FakeTmsForwardingTest(WeightMemorySaverTestBase):
             self.assertFalse(wms.is_paused())
         self.assertEqual(self.fake.pause_calls, [wms.WEIGHTS_TAG] * 2)
         self.assertEqual(self.fake.resume_calls, [wms.WEIGHTS_TAG] * 2)
+
+
+class LegacyEnvForwardingTest(WeightMemorySaverTestBase):
+    """Low-level developer override remains available without sleep endpoints."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ.pop(wms.ENV_SWITCH, None)
+        os.environ[wms.LEGACY_ENV_SWITCH] = "1"
+        self.fake = self._inject_fake_tms()
+
+    def test_legacy_env_enables_weight_saver(self) -> None:
+        self.assertTrue(wms.is_enabled())
+        self.assertTrue(wms.is_available())
+        with wms.weights_region():
+            pass
+        self.assertEqual(
+            self.fake.region_calls,
+            [{"tag": wms.WEIGHTS_TAG, "enable_cpu_backup": True}],
+        )
 
 
 if __name__ == "__main__":

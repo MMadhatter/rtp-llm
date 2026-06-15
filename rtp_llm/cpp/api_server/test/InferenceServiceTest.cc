@@ -95,9 +95,9 @@ protected:
     ModelConfig                                          model_config_;
 };
 
-TEST_F(InferenceServiceTest, Inference_FrozenRejectsBeforeParsing) {
+TEST_F(InferenceServiceTest, Inference_SleepingRejectsBeforeParsing) {
     SetToMaster();
-    ASSERT_TRUE(mock_engine_->freezeController().freeze(FreezeOptions()).ok);
+    ASSERT_TRUE(mock_engine_->sleepController().sleep(SleepOptions()).ok);
 
     auto writer = dynamic_cast<http_server::HttpResponseWriter*>(mock_writer_.get());
     ASSERT_TRUE(writer != nullptr);
@@ -106,7 +106,7 @@ TEST_F(InferenceServiceTest, Inference_FrozenRejectsBeforeParsing) {
 
     EXPECT_CALL(*mock_writer_, Write).WillOnce(Invoke([](const std::string& data) {
         EXPECT_THAT(data, HasSubstr(R"("error_code":8600)"));
-        EXPECT_THAT(data, HasSubstr(R"("state":"FROZEN")"));
+        EXPECT_THAT(data, HasSubstr(R"("state":"SLEEPING")"));
         return true;
     }));
 

@@ -14,6 +14,6 @@ if __name__ == "__main__":
 
         cdll.LoadLibrary(nvshmem_so)
 
-    from freeze_service_unittest_lib import RunCppUnittest
+    from sleep_service_unittest_lib import RunCppUnittest
 
     sys.exit(RunCppUnittest())

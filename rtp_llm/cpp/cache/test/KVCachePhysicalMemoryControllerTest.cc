@@ -191,19 +191,38 @@ TEST_F(KVCachePhysicalMemoryControllerTest, CustomTagIsForwardedToBackend) {
     EXPECT_EQ(backend_->resume_calls_[0], "my_tag");
 }
 
-// TmsBackend dlsym probe: this test binary is not started with the torch_memory_saver
+TEST(VmmTagStatsRegistryTest, RecordsKnownAllocationStatsByTag) {
+    VmmTagStatsRegistry::resetForTest();
+
+    EXPECT_EQ(VmmTagStatsRegistry::stats("kv_cache").allocation_count, 0u);
+    EXPECT_EQ(VmmTagStatsRegistry::stats("kv_cache").total_size_bytes, 0u);
+
+    VmmTagStatsRegistry::recordAllocation("kv_cache", 4096);
+    VmmTagStatsRegistry::recordAllocation("kv_cache", 8192);
+    VmmTagStatsRegistry::recordAllocation("cuda_graph", 1024);
+
+    auto kv_stats = VmmTagStatsRegistry::stats("kv_cache");
+    EXPECT_EQ(kv_stats.allocation_count, 2u);
+    EXPECT_EQ(kv_stats.total_size_bytes, 12288u);
+
+    auto graph_stats = VmmTagStatsRegistry::stats("cuda_graph");
+    EXPECT_EQ(graph_stats.allocation_count, 1u);
+    EXPECT_EQ(graph_stats.total_size_bytes, 1024u);
+}
+
+// VmmBackend dlsym probe: this test binary is not started with the torch_memory_saver
 // LD_PRELOAD shim, so the probe must cleanly report "unavailable" instead of crashing.
-TEST(TmsBackendTest, UnavailableWithoutPreloadShim) {
-    TmsBackend backend;
+TEST(VmmBackendTest, UnavailableWithoutPreloadShim) {
+    VmmBackend backend;
     EXPECT_FALSE(backend.isAvailable());
-    EXPECT_EQ(backend.name(), "torch_memory_saver");
+    EXPECT_EQ(backend.name(), "vmm");
     EXPECT_FALSE(backend.pause("kv_cache"));
     EXPECT_FALSE(backend.resume("kv_cache"));
     EXPECT_FALSE(backend.beginAllocationRegion("kv_cache"));
     EXPECT_FALSE(backend.endAllocationRegion());
 
-    // A controller on top of an unavailable TmsBackend degrades gracefully.
-    KVCachePhysicalMemoryController controller(std::make_shared<TmsBackend>());
+    // A controller on top of an unavailable VMM backend degrades gracefully.
+    KVCachePhysicalMemoryController controller(std::make_shared<VmmBackend>());
     ASSERT_EQ(controller.allocateOrAttach(reinterpret_cast<void*>(0xdead0000), 4096),
               reinterpret_cast<void*>(0xdead0000));
     EXPECT_FALSE(controller.pausePhysicalMemory());

@@ -13,7 +13,7 @@
 namespace rtp_llm {
 namespace test {
 
-// Freeze/resume (M5): BlockPool::resetMetadata + BlockCache::clear/generation.
+// Sleep/wake_up (M5): BlockPool::resetMetadata + BlockCache::clear/generation.
 // BlockPool part needs a GPU (the pool buffer is allocated via torch::empty(kCUDA)).
 class KVCacheMetadataResetTest: public ::testing::Test {
 protected:

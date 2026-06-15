@@ -87,7 +87,7 @@ cc_library(
         "ModelStatusServiceTest.cc",
         "ParallelInfoTest.cc",
         "SysCmdServiceTest.cc",
-        "FreezeServiceTest.cc",
+        "SleepServiceTest.cc",
         "TokenizerEncodeResponseTest.cc",
         "TokenizerServiceTest.cc",
         "GenerateStreamWrapperTest.cc",
@@ -105,16 +105,16 @@ cc_library(
     alwayslink = 1,
 )
 
-# FreezeService (admin freeze/resume endpoints) unittest, runs cpp gtest via python
+# SleepService admin endpoints unittest, runs cpp gtest via python
 py_test(
-    name = "freeze_service_unittest",  # 需要有一个同名 py 文件
+    name = "sleep_service_unittest",  # 需要有一个同名 py 文件
     python_version = 'PY3',
     srcs_version = 'PY3',
     srcs = [
-        "freeze_service_unittest.py",
+        "sleep_service_unittest.py",
     ],
     deps = [
-        ":freeze_service_unittest_pylib",
+        ":sleep_service_unittest_pylib",
     ],
     imports = [
         ".",
@@ -127,21 +127,21 @@ py_test(
 )
 
 py_library(
-    name = "freeze_service_unittest_pylib",
+    name = "sleep_service_unittest_pylib",
     srcs = [],
     deps = [
         "//rtp_llm:torch",
     ],
     data = [
-        ":freeze_service_unittest_lib.so",
+        ":sleep_service_unittest_lib.so",
     ],
 )
 
 cc_binary(
-    name = "freeze_service_unittest_lib.so",
+    name = "sleep_service_unittest_lib.so",
     srcs = [],
     deps = [
-        ":freeze_service_unittest_lib",
+        ":sleep_service_unittest_lib",
         "//rtp_llm/cpp/pybind:th_compute_lib",
     ],
     data = ["//:rtp_compute_ops"],
@@ -149,16 +149,16 @@ cc_binary(
 )
 
 cc_library(
-    name = "freeze_service_unittest_lib",
+    name = "sleep_service_unittest_lib",
     srcs = [
         "mock/MockEngineBase.h",
         "mock/MockHttpResponseWriter.h",
-        "FreezeServiceTest.cc",
-        "FreezeServiceTestMain.cc",
+        "SleepServiceTest.cc",
+        "SleepServiceTestMain.cc",
     ],
     deps = test_deps + [
         "//rtp_llm/cpp/api_server:http_api_server",
-        "//rtp_llm/cpp/engine_base/freeze:freeze",
+        "//rtp_llm/cpp/engine_base/sleep:sleep",
     ],
     copts = test_copts,
     alwayslink = 1,

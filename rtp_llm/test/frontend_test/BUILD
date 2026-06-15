@@ -12,13 +12,19 @@ py_test(
 )
 
 py_test(
-    name = "admin_freeze_routes_test",
+    name = "sleep_routes_test",
     srcs = [
-        "admin_freeze_routes_test.py",
+        "sleep_routes_test.py",
     ],
     deps = [
-        "//rtp_llm:ops",
-        "//rtp_llm:testlib",
+        "//rtp_llm:fastapi",
+        "//rtp_llm:frontend_sleep_routes",
+        "//rtp_llm:frontend_worker_address_utils",
+        "//rtp_llm:protobuf",
+        "//rtp_llm:utils",
+        "//rtp_llm/cpp/model_rpc:grpcio",
+        "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto",
+        "//rtp_llm/metrics:metrics",
     ],
     exec_properties = {'gpu': 'H20'},
     tags = ["frontend"],

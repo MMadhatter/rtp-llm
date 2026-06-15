@@ -1,7 +1,7 @@
 #include "gtest/gtest.h"
 
-#include "rtp_llm/cpp/engine_base/freeze/AdmissionGate.h"
-#include "rtp_llm/cpp/engine_base/freeze/FreezeLifecycleController.h"
+#include "rtp_llm/cpp/engine_base/sleep/AdmissionGate.h"
+#include "rtp_llm/cpp/engine_base/sleep/SleepLifecycleController.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
 
@@ -11,9 +11,9 @@ namespace {
 
 constexpr int64_t kEngineUnavailable = 8600;
 
-FreezeHooks successHooks() {
-    FreezeHooks hooks;
-    hooks.drain = [](const FreezeOptions&) { return true; };
+SleepHooks successHooks() {
+    SleepHooks hooks;
+    hooks.drain = [](const SleepOptions&) { return true; };
     return hooks;
 }
 
@@ -21,12 +21,12 @@ FreezeHooks successHooks() {
 
 class AdmissionGateTest: public ::testing::Test {
 protected:
-    FreezeLifecycleController controller_;
+    SleepLifecycleController controller_{true};
     AdmissionGate             gate_{&controller_, "test_instance_0"};
 };
 
 TEST_F(AdmissionGateTest, RunningAdmits) {
-    ASSERT_EQ(controller_.state(), FreezeState::RUNNING);
+    ASSERT_EQ(controller_.state(), SleepState::RUNNING);
     EXPECT_TRUE(gate_.check().ok());
     const auto detail = gate_.checkDetail();
     EXPECT_TRUE(detail.admitted);
@@ -42,12 +42,12 @@ TEST_F(AdmissionGateTest, NullControllerAdmits) {
 }
 
 TEST_F(AdmissionGateTest, DrainingRejects) {
-    FreezeHooks hooks;
+    SleepHooks hooks;
     // Drain "timeout": controller stays in DRAINING per design.
-    hooks.drain = [](const FreezeOptions&) { return false; };
+    hooks.drain = [](const SleepOptions&) { return false; };
     controller_.setHooks(hooks);
-    EXPECT_FALSE(controller_.freeze(FreezeOptions{}).ok);
-    ASSERT_EQ(controller_.state(), FreezeState::DRAINING);
+    EXPECT_FALSE(controller_.sleep(SleepOptions{}).ok);
+    ASSERT_EQ(controller_.state(), SleepState::DRAINING);
 
     const auto status = gate_.check();
     EXPECT_EQ(status.error_code(), grpc::StatusCode::UNAVAILABLE);
@@ -56,54 +56,54 @@ TEST_F(AdmissionGateTest, DrainingRejects) {
     EXPECT_EQ(detail.state, "DRAINING");
 }
 
-TEST_F(AdmissionGateTest, FreezingRejects) {
-    FreezeHooks hooks = successHooks();
-    // Observe gate behavior while the controller is mid-FREEZING.
-    hooks.pauseKvMemory = [this](const FreezeOptions&) {
-        EXPECT_EQ(controller_.state(), FreezeState::FREEZING);
+TEST_F(AdmissionGateTest, SuspendingRejects) {
+    SleepHooks hooks = successHooks();
+    // Observe gate behavior while the controller is mid-SUSPENDING.
+    hooks.releaseKvMemoryBacking = [this](const SleepOptions&) {
+        EXPECT_EQ(controller_.state(), SleepState::SUSPENDING);
         const auto status = gate_.check();
         EXPECT_EQ(status.error_code(), grpc::StatusCode::UNAVAILABLE);
-        EXPECT_EQ(gate_.checkDetail().state, "FREEZING");
+        EXPECT_EQ(gate_.checkDetail().state, "SUSPENDING");
         return true;
     };
     controller_.setHooks(hooks);
-    EXPECT_TRUE(controller_.freeze(FreezeOptions{}).ok);
+    EXPECT_TRUE(controller_.sleep(SleepOptions{}).ok);
 }
 
-TEST_F(AdmissionGateTest, FrozenRejects) {
+TEST_F(AdmissionGateTest, SleepingRejects) {
     controller_.setHooks(successHooks());
-    ASSERT_TRUE(controller_.freeze(FreezeOptions{}).ok);
-    ASSERT_EQ(controller_.state(), FreezeState::FROZEN);
+    ASSERT_TRUE(controller_.sleep(SleepOptions{}).ok);
+    ASSERT_EQ(controller_.state(), SleepState::SLEEPING);
 
     const auto status = gate_.check();
     EXPECT_EQ(status.error_code(), grpc::StatusCode::UNAVAILABLE);
     const auto detail = gate_.checkDetail();
     EXPECT_FALSE(detail.admitted);
-    EXPECT_EQ(detail.state, "FROZEN");
+    EXPECT_EQ(detail.state, "SLEEPING");
     EXPECT_EQ(detail.error_code, kEngineUnavailable);
 }
 
-TEST_F(AdmissionGateTest, ResumingRejects) {
-    FreezeHooks hooks = successHooks();
-    // Observe gate behavior while the controller is mid-RESUMING.
-    hooks.resumeKvMemory = [this]() {
-        EXPECT_EQ(controller_.state(), FreezeState::RESUMING);
+TEST_F(AdmissionGateTest, WakingUpRejects) {
+    SleepHooks hooks = successHooks();
+    // Observe gate behavior while the controller is mid-WAKING_UP.
+    hooks.restoreKvMemoryBackingAndResetMetadata = [this]() {
+        EXPECT_EQ(controller_.state(), SleepState::WAKING_UP);
         const auto status = gate_.check();
         EXPECT_EQ(status.error_code(), grpc::StatusCode::UNAVAILABLE);
-        EXPECT_EQ(gate_.checkDetail().state, "RESUMING");
+        EXPECT_EQ(gate_.checkDetail().state, "WAKING_UP");
         return true;
     };
     controller_.setHooks(hooks);
-    ASSERT_TRUE(controller_.freeze(FreezeOptions{}).ok);
-    EXPECT_TRUE(controller_.resume().ok);
+    ASSERT_TRUE(controller_.sleep(SleepOptions{}).ok);
+    EXPECT_TRUE(controller_.wakeUp().ok);
 }
 
 TEST_F(AdmissionGateTest, ErrorRejects) {
-    FreezeHooks hooks   = successHooks();
-    hooks.pauseKvMemory = [](const FreezeOptions&) { return false; };
+    SleepHooks hooks   = successHooks();
+    hooks.releaseKvMemoryBacking = [](const SleepOptions&) { return false; };
     controller_.setHooks(hooks);
-    EXPECT_FALSE(controller_.freeze(FreezeOptions{}).ok);
-    ASSERT_EQ(controller_.state(), FreezeState::ERROR);
+    EXPECT_FALSE(controller_.sleep(SleepOptions{}).ok);
+    ASSERT_EQ(controller_.state(), SleepState::ERROR);
 
     const auto status = gate_.check();
     EXPECT_EQ(status.error_code(), grpc::StatusCode::UNAVAILABLE);
@@ -114,8 +114,8 @@ TEST_F(AdmissionGateTest, ErrorRejects) {
 
 TEST_F(AdmissionGateTest, ErrorBodyFieldsComplete) {
     controller_.setHooks(successHooks());
-    ASSERT_TRUE(controller_.freeze(FreezeOptions{}).ok);
-    ASSERT_EQ(controller_.state(), FreezeState::FROZEN);
+    ASSERT_TRUE(controller_.sleep(SleepOptions{}).ok);
+    ASSERT_EQ(controller_.state(), SleepState::SLEEPING);
 
     // Structured detail carries the full M4 error body.
     const auto detail = gate_.checkDetail();
@@ -123,9 +123,9 @@ TEST_F(AdmissionGateTest, ErrorBodyFieldsComplete) {
     EXPECT_EQ(detail.error_code, static_cast<int64_t>(ErrorCode::ENGINE_UNAVAILABLE));
     EXPECT_EQ(detail.error_code_str, "ENGINE_UNAVAILABLE");
     EXPECT_EQ(detail.instance_id, "test_instance_0");
-    EXPECT_EQ(detail.freeze_epoch, controller_.freezeEpoch());
-    EXPECT_GE(detail.freeze_epoch, 1);
-    EXPECT_EQ(detail.state, "FROZEN");
+    EXPECT_EQ(detail.sleep_epoch, controller_.sleepEpoch());
+    EXPECT_GE(detail.sleep_epoch, 1);
+    EXPECT_EQ(detail.state, "SLEEPING");
     EXPECT_FALSE(detail.message.empty());
 
     // grpc::Status error_details round-trips through ErrorDetailsPB.
@@ -138,31 +138,31 @@ TEST_F(AdmissionGateTest, ErrorBodyFieldsComplete) {
     EXPECT_EQ(details.error_code_str(), "ENGINE_UNAVAILABLE");
     EXPECT_EQ(details.error_message(), detail.message);
     EXPECT_EQ(details.instance_id(), "test_instance_0");
-    EXPECT_EQ(details.freeze_epoch(), detail.freeze_epoch);
-    EXPECT_EQ(details.state(), "FROZEN");
+    EXPECT_EQ(details.sleep_epoch(), detail.sleep_epoch);
+    EXPECT_EQ(details.state(), "SLEEPING");
 
     // JSON body for the HTTP layer contains the same fields.
     const auto json = AdmissionGate::toJson(detail);
     EXPECT_NE(json.find("\"error_code\":8600"), std::string::npos);
     EXPECT_NE(json.find("\"error_code_str\":\"ENGINE_UNAVAILABLE\""), std::string::npos);
     EXPECT_NE(json.find("\"instance_id\":\"test_instance_0\""), std::string::npos);
-    EXPECT_NE(json.find("\"freeze_epoch\":" + std::to_string(detail.freeze_epoch)), std::string::npos);
-    EXPECT_NE(json.find("\"state\":\"FROZEN\""), std::string::npos);
+    EXPECT_NE(json.find("\"sleep_epoch\":" + std::to_string(detail.sleep_epoch)), std::string::npos);
+    EXPECT_NE(json.find("\"state\":\"SLEEPING\""), std::string::npos);
 }
 
-TEST_F(AdmissionGateTest, AdmitsAgainAfterResume) {
+TEST_F(AdmissionGateTest, AdmitsAgainAfterWakeUp) {
     controller_.setHooks(successHooks());
-    ASSERT_TRUE(controller_.freeze(FreezeOptions{}).ok);
+    ASSERT_TRUE(controller_.sleep(SleepOptions{}).ok);
     EXPECT_EQ(gate_.check().error_code(), grpc::StatusCode::UNAVAILABLE);
 
-    ASSERT_TRUE(controller_.resume().ok);
-    ASSERT_EQ(controller_.state(), FreezeState::RUNNING);
+    ASSERT_TRUE(controller_.wakeUp().ok);
+    ASSERT_EQ(controller_.state(), SleepState::RUNNING);
     EXPECT_TRUE(gate_.check().ok());
     const auto detail = gate_.checkDetail();
     EXPECT_TRUE(detail.admitted);
     EXPECT_EQ(detail.state, "RUNNING");
-    // Epoch from the completed freeze cycle is still visible.
-    EXPECT_GE(detail.freeze_epoch, 1);
+    // Epoch from the completed sleep cycle is still visible.
+    EXPECT_GE(detail.sleep_epoch, 1);
 }
 
 }  // namespace rtp_llm

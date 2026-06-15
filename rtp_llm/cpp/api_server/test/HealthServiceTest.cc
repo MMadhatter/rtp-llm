@@ -65,17 +65,17 @@ TEST_F(HealthServiceTest, HealthCheck_ServerStopped) {
     writer_ptr.release();
 }
 
-TEST_F(HealthServiceTest, HealthCheck_FrozenEngineNotReady) {
+TEST_F(HealthServiceTest, HealthCheck_SleepingEngineNotReady) {
     auto mock_engine = std::make_shared<MockEngineBase>();
-    ASSERT_TRUE(mock_engine->freezeController().freeze(FreezeOptions()).ok);
+    ASSERT_TRUE(mock_engine->sleepController().sleep(SleepOptions()).ok);
     auto health_service = std::make_shared<HealthService>([mock_engine]() {
-        return mock_engine->freezeController().admit() ? "" :
-                                                         freezeStateToString(mock_engine->freezeController().state());
+        return mock_engine->sleepController().admit() ? "" :
+                                                         sleepStateToString(mock_engine->sleepController().state());
     });
 
     EXPECT_CALL(*mock_writer_, Write).WillOnce(Invoke([](const std::string& data) {
         EXPECT_THAT(data, HasSubstr(R"("detail":"engine is not ready")"));
-        EXPECT_THAT(data, HasSubstr(R"("state":"FROZEN")"));
+        EXPECT_THAT(data, HasSubstr(R"("state":"SLEEPING")"));
         return true;
     }));
 

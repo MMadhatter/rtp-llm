@@ -107,13 +107,13 @@ protected:
     std::vector<int>                                     data_;
 };
 
-TEST_F(ChatServiceTest, ChatCompletions_FrozenRejectsBeforeEnqueue) {
-    ASSERT_TRUE(mock_engine_->freezeController().freeze(FreezeOptions()).ok);
+TEST_F(ChatServiceTest, ChatCompletions_SleepingRejectsBeforeEnqueue) {
+    ASSERT_TRUE(mock_engine_->sleepController().sleep(SleepOptions()).ok);
     http_server::HttpRequest request;
 
     EXPECT_CALL(*mock_writer_, Write).WillOnce(Invoke([](const std::string& data) {
         EXPECT_THAT(data, HasSubstr(R"("error_code":8600)"));
-        EXPECT_THAT(data, HasSubstr(R"("state":"FROZEN")"));
+        EXPECT_THAT(data, HasSubstr(R"("state":"SLEEPING")"));
         return true;
     }));
 

@@ -3,7 +3,7 @@
 #include <pybind11/pybind11.h>
 #include "autil/Log.h"
 
-const std::string FREEZE_UNITTEST_DEFAULT_LOG_CONF = R"conf(
+const std::string SLEEP_UNITTEST_DEFAULT_LOG_CONF = R"conf(
 alog.rootLogger=INFO, unittestAppender
 alog.max_msg_len=4096
 alog.appender.unittestAppender=ConsoleAppender
@@ -17,15 +17,15 @@ namespace py = pybind11;
 namespace rtp_llm {
 
 // 模块名与生成的动态库的名字必须一致
-PYBIND11_MODULE(freeze_service_unittest_lib, m) {
+PYBIND11_MODULE(sleep_service_unittest_lib, m) {
     m.def(
         "RunCppUnittest",
         []() {
-            AUTIL_LOG_CONFIG_FROM_STRING(FREEZE_UNITTEST_DEFAULT_LOG_CONF.c_str());
+            AUTIL_LOG_CONFIG_FROM_STRING(SLEEP_UNITTEST_DEFAULT_LOG_CONF.c_str());
             ::testing::InitGoogleTest();
             return RUN_ALL_TESTS();
         },
-        "run freeze service cpp unittest cases");
+        "run sleep service cpp unittest cases");
 }
 
 }  // namespace rtp_llm
