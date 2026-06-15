@@ -16,9 +16,11 @@ from fastapi.testclient import TestClient
 from rtp_llm.frontend.sleep_routes import register_sleep_routes
 from rtp_llm.frontend.worker_address_utils import (
     SLEEP_CONTROL_ADDRESSES_ENV,
+    SLEEP_INFER_CONTROL_ADDRESSES_ENV,
     get_control_addrs_from_env,
     get_control_addrs_from_world_info,
     get_dp_addrs_from_world_info,
+    infer_control_addrs_from_gang_metadata,
 )
 
 SLEEP_STATUS_OK: Dict[str, Any] = {
@@ -60,7 +62,21 @@ class FakeParallelismConfig:
     def __init__(self):
         self.tp_size = 1
         self.world_rank = 0
+        self.world_size = 1
+        self.local_world_size = 1
         self.ffn_disaggregate_config = FakeFfnDisaggregateConfig()
+
+
+class FakeServerConfig:
+    def __init__(self):
+        self.start_port = 20000
+        self.worker_info_port_num = 8
+
+
+class FakeDistributeConfig:
+    def __init__(self, gang_config_string="", distribute_config_file=""):
+        self.gang_config_string = gang_config_string
+        self.distribute_config_file = distribute_config_file
 
 
 class FakeWorkerInfo:
@@ -176,6 +192,15 @@ class SleepRoutesTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         post_request.assert_awaited_once_with("sleep", {"tags": None})
 
+    def test_sleep_phase_rejected_without_backend_call(self):
+        post_request = AsyncMock()
+        client = build_test_client(post_request)
+        with client:
+            response = client.post("/sleep", json={"phase": "prepare"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("error", response.json())
+        post_request.assert_not_awaited()
+
     def test_sleep_conflict_maps_to_409(self):
         post_request = AsyncMock(
             return_value={
@@ -212,6 +237,15 @@ class SleepRoutesTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
         post_request.assert_awaited_once_with("wake_up", {})
+
+    def test_wake_up_phase_rejected_without_backend_call(self):
+        post_request = AsyncMock()
+        client = build_test_client(post_request)
+        with client:
+            response = client.post("/wake_up", json={"phase": "prepare"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("error", response.json())
+        post_request.assert_not_awaited()
 
     def test_wake_up_backend_error_maps_to_500(self):
         post_request = AsyncMock(return_value={"error": "backend unreachable"})
@@ -260,7 +294,9 @@ class SleepRoutesTest(unittest.TestCase):
 
 class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
 
-    def _build_wrapper(self, control_addresses=None, expected_control_address_count=None):
+    def _build_wrapper(
+        self, control_addresses=None, expected_control_address_count=None
+    ):
         import rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 as pb2
         from rtp_llm.utils.grpc_client_wrapper import GrpcClientWrapper
 
@@ -337,6 +373,18 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(commit_request.commit_only)
             self.assertEqual(commit_request.timeout_ms, 0)
 
+    async def test_sleep_serving_phase_rejected_before_status_probe(self):
+        wrapper, pb2 = self._build_wrapper()
+        address = wrapper.control_addresses[0]
+        wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(
+            return_value=self._status_pb(pb2)
+        )
+
+        result = await wrapper.sleep_serving({"phase": "prepare"})
+
+        self.assertEqual(result["grpc_status"], "INVALID_ARGUMENT")
+        wrapper._dp_stubs[address].GetSleepStatus.assert_not_awaited()
+
     async def test_wake_up_serving_success(self):
         addresses = ["127.0.0.1:10001", "127.0.0.1:10009"]
         wrapper, pb2 = self._build_wrapper(control_addresses=addresses)
@@ -368,6 +416,18 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(prepare_request.commit_only)
             self.assertFalse(commit_request.prepare_only)
             self.assertTrue(commit_request.commit_only)
+
+    async def test_wake_up_serving_phase_rejected_before_status_probe(self):
+        wrapper, pb2 = self._build_wrapper()
+        address = wrapper.control_addresses[0]
+        wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(
+            return_value=self._status_pb(pb2)
+        )
+
+        result = await wrapper.wake_up_serving({"phase": "prepare"})
+
+        self.assertEqual(result["grpc_status"], "INVALID_ARGUMENT")
+        wrapper._dp_stubs[address].GetSleepStatus.assert_not_awaited()
 
     async def test_get_sleep_status_returns_full_schema(self):
         wrapper, pb2 = self._build_wrapper()
@@ -402,7 +462,9 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(expected_keys, set(result.keys()))
         self.assertEqual(result["state"], "RUNNING")
 
-    async def test_get_sleep_status_disables_sleep_when_control_coverage_incomplete(self):
+    async def test_get_sleep_status_disables_sleep_when_control_coverage_incomplete(
+        self,
+    ):
         wrapper, pb2 = self._build_wrapper(
             control_addresses=["127.0.0.1:10001"],
             expected_control_address_count=2,
@@ -418,6 +480,28 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["supported_levels"], [])
         self.assertEqual(result["supported_modes"], [])
         self.assertIn("control address coverage incomplete", result["disabled_reason"])
+
+    async def test_get_sleep_status_refreshes_control_addresses_from_resolver(self):
+        addresses = ["127.0.0.1:10001", "127.0.0.1:10009"]
+        wrapper, pb2 = self._build_wrapper(
+            control_addresses=[addresses[0]],
+            expected_control_address_count=2,
+        )
+        wrapper._control_address_resolver = MagicMock(return_value=addresses)
+        for address in addresses:
+            wrapper._dp_channels[address] = MagicMock()
+            wrapper._dp_stubs[address] = MagicMock()
+            wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(
+                return_value=self._status_pb(pb2)
+            )
+
+        result = await wrapper.get_sleep_status()
+
+        self.assertTrue(result["effective"])
+        self.assertEqual(wrapper.control_addresses, addresses)
+        wrapper._control_address_resolver.assert_called_once()
+        for address in addresses:
+            wrapper._dp_stubs[address].GetSleepStatus.assert_awaited_once()
 
     async def test_sleep_serving_rejects_when_control_coverage_incomplete(self):
         wrapper, pb2 = self._build_wrapper(
@@ -470,7 +554,9 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["grpc_status"], "INVALID_ARGUMENT")
         wrapper._dp_stubs[address].GetSleepStatus.assert_not_awaited()
 
-    async def test_sleep_serving_level_zero_returns_unimplemented_before_status_probe(self):
+    async def test_sleep_serving_level_zero_returns_unimplemented_before_status_probe(
+        self,
+    ):
         wrapper, pb2 = self._build_wrapper()
         address = wrapper.control_addresses[0]
         wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(
@@ -499,9 +585,7 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
     async def test_sleep_serving_null_tags_are_treated_as_empty_list(self):
         wrapper, pb2 = self._build_wrapper()
         address = wrapper.control_addresses[0]
-        wrapper._dp_stubs[address].SleepServing = AsyncMock(
-            return_value=pb2.EmptyPB()
-        )
+        wrapper._dp_stubs[address].SleepServing = AsyncMock(return_value=pb2.EmptyPB())
         wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(
             side_effect=[
                 self._status_pb(pb2),
@@ -691,7 +775,9 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("prepare wake_up", result["error"])
         for address in addresses:
             self.assertEqual(wrapper._dp_stubs[address].WakeUpServing.await_count, 1)
-            prepare_request = wrapper._dp_stubs[address].WakeUpServing.await_args.args[0]
+            prepare_request = wrapper._dp_stubs[address].WakeUpServing.await_args.args[
+                0
+            ]
             self.assertTrue(prepare_request.prepare_only)
             self.assertFalse(prepare_request.commit_only)
 
@@ -708,7 +794,9 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
         wrapper._dp_stubs[addresses[1]].WakeUpServing = AsyncMock(
             side_effect=[
                 pb2.EmptyPB(),
-                self._aio_error(grpc.StatusCode.FAILED_PRECONDITION, "restartEngine failed"),
+                self._aio_error(
+                    grpc.StatusCode.FAILED_PRECONDITION, "restartEngine failed"
+                ),
             ]
         )
 
@@ -821,6 +909,45 @@ class SleepControlAddressTest(unittest.TestCase):
                 "127.0.0.1:20025",
             ],
         )
+
+    def test_infer_control_addresses_from_gang_metadata_is_opt_in(self):
+        pc = FakeParallelismConfig()
+        pc.world_size = 4
+        pc.local_world_size = 2
+        gang_config = (
+            "name:foo_part0,ip:10.0.0.1,port:20000;"
+            "name:foo_part1,ip:10.0.0.2,port:20000"
+        )
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(
+                infer_control_addrs_from_gang_metadata(
+                    FakeServerConfig(), FakeDistributeConfig(gang_config), pc
+                ),
+                [],
+            )
+
+    def test_infer_control_addresses_from_gang_metadata(self):
+        pc = FakeParallelismConfig()
+        pc.world_size = 4
+        pc.local_world_size = 2
+        gang_config = (
+            "name:foo_part1,ip:10.0.0.2,port:20000;"
+            "name:foo_part0,ip:10.0.0.1,port:20000"
+        )
+        with patch.dict(
+            "os.environ", {SLEEP_INFER_CONTROL_ADDRESSES_ENV: "1"}, clear=True
+        ):
+            self.assertEqual(
+                infer_control_addrs_from_gang_metadata(
+                    FakeServerConfig(), FakeDistributeConfig(gang_config), pc
+                ),
+                [
+                    "10.0.0.1:20001",
+                    "10.0.0.1:20009",
+                    "10.0.0.2:20001",
+                    "10.0.0.2:20009",
+                ],
+            )
 
 
 if __name__ == "__main__":

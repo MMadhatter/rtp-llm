@@ -22,6 +22,11 @@ def register_sleep_routes(app: FastAPI, grpc_client: Any) -> None:
     @app.post("/sleep")
     async def sleep(req: Optional[Dict[Any, Any]] = Body(None)):
         req = req or {}
+        if "phase" in req:
+            return ORJSONResponse(
+                status_code=400,
+                content={"error": "sleep phase is unsupported"},
+            )
         try:
             level = int(req.get("level", 1))
             if "timeout_ms" in req:
@@ -57,14 +62,24 @@ def register_sleep_routes(app: FastAPI, grpc_client: Any) -> None:
             )
         response = await grpc_client.post_request("sleep", req)
         if "error" in response:
-            return ORJSONResponse(status_code=sleep_error_status(response), content=response)
+            return ORJSONResponse(
+                status_code=sleep_error_status(response), content=response
+            )
         return response
 
     @app.post("/wake_up")
     async def wake_up(req: Optional[Dict[Any, Any]] = Body(None)):
-        response = await grpc_client.post_request("wake_up", req or {})
+        req = req or {}
+        if "phase" in req:
+            return ORJSONResponse(
+                status_code=400,
+                content={"error": "wake_up phase is unsupported"},
+            )
+        response = await grpc_client.post_request("wake_up", req)
         if "error" in response:
-            return ORJSONResponse(status_code=sleep_error_status(response), content=response)
+            return ORJSONResponse(
+                status_code=sleep_error_status(response), content=response
+            )
         return response
 
     @app.get("/is_sleeping")

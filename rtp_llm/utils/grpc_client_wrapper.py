@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import grpc
 from google.protobuf.json_format import MessageToDict
@@ -86,6 +86,16 @@ def _report_sleep_status_metrics(status: Dict[str, Any]) -> None:
     )
 
 
+def _normalize_json_request(req: Any) -> Dict[str, Any]:
+    if isinstance(req, str):
+        req = json.loads(req)
+    if req is None:
+        return {}
+    if not isinstance(req, dict):
+        raise ValueError("request body must be a JSON object")
+    return req
+
+
 class GrpcClientWrapper:
     """Wrapper for direct gRPC calls to replace async_request_server"""
 
@@ -95,6 +105,7 @@ class GrpcClientWrapper:
         dp_addresses: Optional[List[str]] = None,
         control_addresses: Optional[List[str]] = None,
         expected_control_address_count: Optional[int] = None,
+        control_address_resolver: Optional[Callable[[], List[str]]] = None,
     ):
         self.server_port = server_port
         self.address = f"localhost:{server_port}"
@@ -110,6 +121,7 @@ class GrpcClientWrapper:
             control_addresses if control_addresses else [self.address]
         )
         self.expected_control_address_count = expected_control_address_count
+        self._control_address_resolver = control_address_resolver
         self._lifecycle_lock = asyncio.Lock()
         self._dp_channels: Dict[str, Any] = {}
         self._dp_stubs: Dict[str, Any] = {}
@@ -125,6 +137,32 @@ class GrpcClientWrapper:
             "sleep mode disabled: lifecycle control address coverage incomplete, "
             f"expected {expected} backend ranks but discovered {actual}"
         )
+
+    def _refresh_control_addresses_if_needed(self) -> None:
+        if self._control_address_resolver is None:
+            return
+        expected = int(self.expected_control_address_count or 0)
+        if expected > 0 and len(self.control_addresses) >= expected:
+            return
+        try:
+            resolved_addresses = _dedupe_addresses(
+                self._control_address_resolver() or []
+            )
+        except Exception as e:
+            logging.warning("sleep control address resolver failed: %s", e)
+            return
+        if not resolved_addresses:
+            return
+        if expected > 0 and len(resolved_addresses) < len(self.control_addresses):
+            return
+        if resolved_addresses == self.control_addresses:
+            return
+        logging.info(
+            "refresh sleep control addresses: old=%s, new=%s",
+            self.control_addresses,
+            resolved_addresses,
+        )
+        self.control_addresses = resolved_addresses
 
     async def _ensure_connection(self):
         """Ensure gRPC channel and stub are created"""
@@ -326,7 +364,9 @@ class GrpcClientWrapper:
             }
 
         states = {str(result.get("state", "")) for result in successes}
-        enabled = {bool(result.get("sleep_mode_enabled", False)) for result in successes}
+        enabled = {
+            bool(result.get("sleep_mode_enabled", False)) for result in successes
+        }
         effective = {bool(result.get("effective", False)) for result in successes}
         gpu_states = {str(result.get("gpu_resource_state", "")) for result in successes}
         kv_states = {str(result.get("kv_memory_state", "")) for result in successes}
@@ -384,10 +424,18 @@ class GrpcClientWrapper:
 
     async def _sleep_serving_locked(self, req: Any) -> Dict[str, Any]:
         try:
-            if isinstance(req, str):
-                req = json.loads(req)
-            if req is None:
-                req = {}
+            try:
+                req = _normalize_json_request(req)
+            except ValueError as e:
+                return {
+                    "error": str(e),
+                    "grpc_status": "INVALID_ARGUMENT",
+                }
+            if "phase" in req:
+                return {
+                    "error": "sleep phase is unsupported",
+                    "grpc_status": "INVALID_ARGUMENT",
+                }
             try:
                 level = int(req.get("level", 1))
                 timeout_ms = int(req.get("timeout_ms", 0))
@@ -434,9 +482,7 @@ class GrpcClientWrapper:
                 return {
                     "error": status.get("disabled_reason", "sleep mode is disabled"),
                     "grpc_status": "UNIMPLEMENTED",
-                    "sleep_mode_enabled": bool(
-                        status.get("sleep_mode_enabled", False)
-                    ),
+                    "sleep_mode_enabled": bool(status.get("sleep_mode_enabled", False)),
                     "effective": False,
                     "supported_levels": status.get("supported_levels", []),
                     "supported_modes": status.get("supported_modes", []),
@@ -514,6 +560,18 @@ class GrpcClientWrapper:
 
     async def _wake_up_serving_locked(self, req: Any = None) -> Dict[str, Any]:
         try:
+            try:
+                req = _normalize_json_request(req)
+            except ValueError as e:
+                return {
+                    "error": str(e),
+                    "grpc_status": "INVALID_ARGUMENT",
+                }
+            if "phase" in req:
+                return {
+                    "error": "wake_up phase is unsupported",
+                    "grpc_status": "INVALID_ARGUMENT",
+                }
             status = await self.get_sleep_status()
             if "error" in status:
                 return status
@@ -521,9 +579,7 @@ class GrpcClientWrapper:
                 return {
                     "error": status.get("disabled_reason", "sleep mode is disabled"),
                     "grpc_status": "UNIMPLEMENTED",
-                    "sleep_mode_enabled": bool(
-                        status.get("sleep_mode_enabled", False)
-                    ),
+                    "sleep_mode_enabled": bool(status.get("sleep_mode_enabled", False)),
                     "effective": False,
                     "supported_levels": status.get("supported_levels", []),
                     "supported_modes": status.get("supported_modes", []),
@@ -574,6 +630,7 @@ class GrpcClientWrapper:
     async def get_sleep_status(self, req: Any = None) -> Dict[str, Any]:
         """Get aggregate sleep lifecycle status from every control rank."""
         try:
+            self._refresh_control_addresses_if_needed()
             request = pb2.EmptyPB()
             results = await self._broadcast_control_rpc(
                 "GetSleepStatus", request, timeout_s=3
