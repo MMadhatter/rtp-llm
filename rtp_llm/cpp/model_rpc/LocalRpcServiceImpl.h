@@ -98,17 +98,23 @@ public:
     }
 
     ::grpc::Status
-    FreezeServing(::grpc::ServerContext* context, const FreezeRequestPB* request, EmptyPB* response) override {
-        return local_server_->FreezeServing(context, request, response);
-    }
-
-    ::grpc::Status ResumeServing(::grpc::ServerContext* context, const EmptyPB* request, EmptyPB* response) override {
-        return local_server_->ResumeServing(context, request, response);
+    SleepServing(::grpc::ServerContext* context, const SleepRequestPB* request, EmptyPB* response) override {
+        return local_server_->SleepServing(context, request, response);
     }
 
     ::grpc::Status
-    GetFreezeStatus(::grpc::ServerContext* context, const EmptyPB* request, FreezeStatusResponsePB* response) override {
-        return local_server_->GetFreezeStatus(context, request, response);
+    WakeUpServing(::grpc::ServerContext* context, const WakeUpRequestPB* request, EmptyPB* response) override {
+        return local_server_->WakeUpServing(context, request, response);
+    }
+
+    ::grpc::Status
+    IsSleeping(::grpc::ServerContext* context, const EmptyPB* request, IsSleepingResponsePB* response) override {
+        return local_server_->IsSleeping(context, request, response);
+    }
+
+    ::grpc::Status
+    GetSleepStatus(::grpc::ServerContext* context, const EmptyPB* request, SleepStatusResponsePB* response) override {
+        return local_server_->GetSleepStatus(context, request, response);
     }
 
     WorkerStatusInfo getWorkerStatusInfo(int64_t latest_finished_version) {

@@ -152,7 +152,7 @@ absl::Status NormalExecutor::processImpl(const std::list<GenerateStreamPtr>& str
         model_input.skip_run  = streams.empty() && !enable_ffn_disaggregate_;
         if (pause_signal && model_input.skip_run) {
             // Reuse the skip-run shape broadcast to carry a TP pause marker.
-            // Worker ranks may receive this before their local freeze RPC has
+            // Worker ranks may receive this before their local sleep RPC has
             // set pause_, so NormalEngine must pause itself after process().
             model_input.is_fake_stream = true;
         }

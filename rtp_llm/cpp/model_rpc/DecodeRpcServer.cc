@@ -64,6 +64,11 @@ DecodeRpcServer::~DecodeRpcServer() {
     }
 }
 
+size_t DecodeRpcServer::activeCacheTransferCount() {
+    return RemoteRpcServer::activeCacheTransferCount()
+           + onflight_load_cache_requests_.load(std::memory_order_relaxed);
+}
+
 void DecodeRpcServer::prepareGenerateContext(DecodeGenerateContext& decode_context) {
     RTP_LLM_PROFILE_FUNCTION();
     decode_context.time_info.updateRequestBegineTime();

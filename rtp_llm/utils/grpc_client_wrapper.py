@@ -47,6 +47,45 @@ def _error_details(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return details
 
 
+def _report_metric_if_ready(metric: Any, value: float) -> None:
+    if not bool(getattr(kmonitor, "_inited", False)):
+        return
+    kmonitor.report(metric, value)
+
+
+def _report_lifecycle_action_metrics(
+    action: str, start_time_ms: float, result: Dict[str, Any]
+) -> None:
+    duration_ms = time.time() * 1000 - start_time_ms
+    if action == "sleep":
+        qps_metric = AccMetrics.SLEEP_QPS_METRIC
+        success_metric = AccMetrics.SLEEP_SUCCESS_QPS_METRIC
+        error_metric = AccMetrics.SLEEP_ERROR_QPS_METRIC
+        rt_metric = GaugeMetrics.SLEEP_RT_METRIC
+    else:
+        qps_metric = AccMetrics.WAKE_UP_QPS_METRIC
+        success_metric = AccMetrics.WAKE_UP_SUCCESS_QPS_METRIC
+        error_metric = AccMetrics.WAKE_UP_ERROR_QPS_METRIC
+        rt_metric = GaugeMetrics.WAKE_UP_RT_METRIC
+
+    _report_metric_if_ready(qps_metric, 1)
+    _report_metric_if_ready(rt_metric, duration_ms)
+    _report_metric_if_ready(error_metric if "error" in result else success_metric, 1)
+
+
+def _report_sleep_status_metrics(status: Dict[str, Any]) -> None:
+    if "error" in status:
+        return
+    _report_metric_if_ready(
+        GaugeMetrics.SLEEP_ACTIVE_REQUEST_COUNT_METRIC,
+        _as_int(status.get("active_request_count", 0)),
+    )
+    _report_metric_if_ready(
+        GaugeMetrics.SLEEP_ACTIVE_CACHE_TRANSFER_COUNT_METRIC,
+        _as_int(status.get("active_cache_transfer_count", 0)),
+    )
+
+
 class GrpcClientWrapper:
     """Wrapper for direct gRPC calls to replace async_request_server"""
 
@@ -55,13 +94,14 @@ class GrpcClientWrapper:
         server_port: int,
         dp_addresses: Optional[List[str]] = None,
         control_addresses: Optional[List[str]] = None,
+        expected_control_address_count: Optional[int] = None,
     ):
         self.server_port = server_port
         self.address = f"localhost:{server_port}"
         self.channel = None
         self.stub = None
         # Serving-route broadcast targets, normally one representative per DP
-        # group. Do not use these for freeze/resume: lifecycle control must
+        # group. Do not use these for sleep/wake_up: lifecycle control must
         # reach every backend rank process that owns GPU resources.
         self.dp_addresses = _dedupe_addresses(
             dp_addresses if dp_addresses else [self.address]
@@ -69,9 +109,22 @@ class GrpcClientWrapper:
         self.control_addresses = _dedupe_addresses(
             control_addresses if control_addresses else [self.address]
         )
+        self.expected_control_address_count = expected_control_address_count
         self._lifecycle_lock = asyncio.Lock()
         self._dp_channels: Dict[str, Any] = {}
         self._dp_stubs: Dict[str, Any] = {}
+
+    def _control_address_coverage_error(self) -> str:
+        if not self.expected_control_address_count:
+            return ""
+        actual = len(self.control_addresses)
+        expected = int(self.expected_control_address_count)
+        if actual >= expected:
+            return ""
+        return (
+            "sleep mode disabled: lifecycle control address coverage incomplete, "
+            f"expected {expected} backend ranks but discovered {actual}"
+        )
 
     async def _ensure_connection(self):
         """Ensure gRPC channel and stub are created"""
@@ -252,12 +305,12 @@ class GrpcClientWrapper:
         ]
         return await asyncio.gather(*tasks)
 
-    def _aggregate_freeze_status(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _aggregate_sleep_status(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         successes = [result for result in results if "error" not in result]
         failures = [result for result in results if "error" in result]
         if not successes:
             return {
-                "error": "Failed to get freeze status from all control ranks",
+                "error": "Failed to get sleep status from all control ranks",
                 "grpc_status": (
                     failures[0].get("grpc_status", "UNAVAILABLE")
                     if failures
@@ -267,23 +320,39 @@ class GrpcClientWrapper:
             }
         if failures:
             return {
-                "error": "Failed to get freeze status from some control ranks",
+                "error": "Failed to get sleep status from some control ranks",
                 "grpc_status": failures[0].get("grpc_status", "UNAVAILABLE"),
                 "details": _error_details(results),
             }
 
         states = {str(result.get("state", "")) for result in successes}
+        enabled = {bool(result.get("sleep_mode_enabled", False)) for result in successes}
+        effective = {bool(result.get("effective", False)) for result in successes}
         gpu_states = {str(result.get("gpu_resource_state", "")) for result in successes}
         kv_states = {str(result.get("kv_memory_state", "")) for result in successes}
-        if len(states) != 1 or len(gpu_states) != 1 or len(kv_states) != 1:
+        supported_levels = {
+            tuple(result.get("supported_levels", [])) for result in successes
+        }
+        supported_modes = {
+            tuple(result.get("supported_modes", [])) for result in successes
+        }
+        if (
+            len(states) != 1
+            or len(enabled) != 1
+            or len(effective) != 1
+            or len(gpu_states) != 1
+            or len(kv_states) != 1
+            or len(supported_levels) != 1
+            or len(supported_modes) != 1
+        ):
             return {
-                "error": "Freeze status did not converge across control ranks",
+                "error": "Sleep status did not converge across control ranks",
                 "grpc_status": "FAILED_PRECONDITION",
             }
 
         aggregate = dict(successes[0])
-        aggregate["freeze_epoch"] = max(
-            _as_int(result.get("freeze_epoch", 0)) for result in successes
+        aggregate["sleep_epoch"] = max(
+            _as_int(result.get("sleep_epoch", 0)) for result in successes
         )
         aggregate["active_request_count"] = sum(
             _as_int(result.get("active_request_count", 0)) for result in successes
@@ -297,131 +366,238 @@ class GrpcClientWrapper:
         )
         aggregate.pop("address", None)
         aggregate.pop("status", None)
+        coverage_error = self._control_address_coverage_error()
+        if coverage_error:
+            aggregate["effective"] = False
+            aggregate["supported_levels"] = []
+            aggregate["supported_modes"] = []
+            aggregate["disabled_reason"] = coverage_error
         return aggregate
 
-    async def freeze_serving(self, req: Any) -> Dict[str, Any]:
-        """Trigger engine freeze on every lifecycle control rank."""
+    async def sleep_serving(self, req: Any) -> Dict[str, Any]:
+        """Trigger engine sleep on every lifecycle control rank."""
+        start_time = time.time() * 1000
         async with self._lifecycle_lock:
-            return await self._freeze_serving_locked(req)
+            result = await self._sleep_serving_locked(req)
+        _report_lifecycle_action_metrics("sleep", start_time, result)
+        return result
 
-    async def _freeze_serving_locked(self, req: Any) -> Dict[str, Any]:
+    async def _sleep_serving_locked(self, req: Any) -> Dict[str, Any]:
         try:
             if isinstance(req, str):
                 req = json.loads(req)
             if req is None:
                 req = {}
-            mode = str(req.get("mode", "graceful"))
-            drain_timeout_ms = int(req.get("drain_timeout_ms", 0))
-            request = pb2.FreezeRequestPB(
+            try:
+                level = int(req.get("level", 1))
+                timeout_ms = int(req.get("timeout_ms", 0))
+            except (TypeError, ValueError):
+                return {
+                    "error": "sleep level and timeout_ms must be integers",
+                    "grpc_status": "INVALID_ARGUMENT",
+                }
+            if level == 0:
+                return {
+                    "error": "sleep level=0 state-preserving sleep is defined but not implemented",
+                    "grpc_status": "UNIMPLEMENTED",
+                    "supported_levels": [1],
+                    "supported_modes": ["wait", "abort"],
+                }
+            if level != 1:
+                return {
+                    "error": "sleep level must be 0 or 1",
+                    "grpc_status": "INVALID_ARGUMENT",
+                }
+            mode = str(req.get("mode", "wait"))
+            if mode not in ("wait", "abort"):
+                return {
+                    "error": 'sleep mode must be "wait" or "abort"',
+                    "grpc_status": "INVALID_ARGUMENT",
+                }
+            tags = req.get("tags", [])
+            if tags is None:
+                tags = []
+            if not isinstance(tags, list):
+                return {
+                    "error": "sleep tags must be a list",
+                    "grpc_status": "INVALID_ARGUMENT",
+                }
+            if any(not isinstance(tag, str) or not tag for tag in tags):
+                return {
+                    "error": "sleep tags must be non-empty strings",
+                    "grpc_status": "INVALID_ARGUMENT",
+                }
+            status = await self.get_sleep_status()
+            if "error" in status:
+                return status
+            if not bool(status.get("effective", False)):
+                return {
+                    "error": status.get("disabled_reason", "sleep mode is disabled"),
+                    "grpc_status": "UNIMPLEMENTED",
+                    "sleep_mode_enabled": bool(
+                        status.get("sleep_mode_enabled", False)
+                    ),
+                    "effective": False,
+                    "supported_levels": status.get("supported_levels", []),
+                    "supported_modes": status.get("supported_modes", []),
+                }
+            request = pb2.SleepRequestPB(
+                level=level,
                 mode=mode,
-                drain_timeout_ms=drain_timeout_ms,
-                force=(mode == "force"),
+                timeout_ms=timeout_ms,
                 reason=str(req.get("reason", "")),
+                tags=list(tags),
             )
-            prepare_request = pb2.FreezeRequestPB()
+            prepare_request = pb2.SleepRequestPB()
             prepare_request.CopyFrom(request)
             prepare_request.prepare_only = True
-            commit_request = pb2.FreezeRequestPB()
+            commit_request = pb2.SleepRequestPB()
             commit_request.CopyFrom(request)
             commit_request.commit_only = True
-            commit_request.drain_timeout_ms = 0
+            commit_request.timeout_ms = 0
 
             # prepare blocks on drain; leave headroom on top of drain timeout.
             # Only after every rank is drained do we send commit, avoiding a
-            # half-frozen instance when one rank times out.
-            timeout_s = max(60.0, drain_timeout_ms / 1000.0 + 30.0)
+            # partially sleeping instance when one rank times out.
+            timeout_s = max(60.0, timeout_ms / 1000.0 + 30.0)
             prepare_results = await self._broadcast_control_rpc(
-                "FreezeServing", prepare_request, timeout_s
+                "SleepServing", prepare_request, timeout_s
             )
             failures = [result for result in prepare_results if "error" in result]
             if failures:
                 abort_results = await self._broadcast_control_rpc(
-                    "ResumeServing", pb2.EmptyPB(), timeout_s=60
+                    "WakeUpServing", pb2.WakeUpRequestPB(), timeout_s=60
                 )
                 return {
-                    "error": "Failed to prepare freeze on some control ranks",
+                    "error": "Failed to prepare sleep on some control ranks",
                     "grpc_status": failures[0].get("grpc_status", "UNKNOWN"),
                     "details": _error_details(prepare_results)
                     or _error_details(abort_results),
                 }
 
             commit_results = await self._broadcast_control_rpc(
-                "FreezeServing", commit_request, timeout_s=60
+                "SleepServing", commit_request, timeout_s=60
             )
             failures = [result for result in commit_results if "error" in result]
             if failures:
                 return {
-                    "error": "Failed to commit freeze on some control ranks",
+                    "error": "Failed to commit sleep on some control ranks",
                     "grpc_status": failures[0].get("grpc_status", "UNKNOWN"),
                     "details": _error_details(commit_results),
                 }
-            status = await self.get_freeze_status()
+            status = await self.get_sleep_status()
             if "error" in status:
                 return status
-            if status.get("state") != "FROZEN":
+            if status.get("state") != "SLEEPING":
                 return {
-                    "error": "Freeze did not converge on all control ranks",
+                    "error": "Sleep did not converge on all control ranks",
                     "grpc_status": "FAILED_PRECONDITION",
                 }
             return {"status": "ok"}
         except grpc.aio.AioRpcError as e:
-            logging.error(f"Freeze serving failed: {e.details()}")
+            logging.error(f"Sleep serving failed: {e.details()}")
             return {
-                "error": f"Failed to freeze serving: {e.details()}",
+                "error": f"Failed to sleep serving: {e.details()}",
                 "grpc_status": e.code().name,
             }
         except Exception as e:
-            logging.error(f"Freeze serving failed: {e}")
-            return {"error": f"Failed to freeze serving: {str(e)}"}
+            logging.error(f"Sleep serving failed: {e}")
+            return {"error": f"Failed to sleep serving: {str(e)}"}
 
-    async def resume_serving(self, req: Any = None) -> Dict[str, Any]:
-        """Trigger engine resume on every lifecycle control rank."""
+    async def wake_up_serving(self, req: Any = None) -> Dict[str, Any]:
+        """Trigger engine wake_up on every lifecycle control rank."""
+        start_time = time.time() * 1000
         async with self._lifecycle_lock:
-            return await self._resume_serving_locked(req)
+            result = await self._wake_up_serving_locked(req)
+        _report_lifecycle_action_metrics("wake_up", start_time, result)
+        return result
 
-    async def _resume_serving_locked(self, req: Any = None) -> Dict[str, Any]:
+    async def _wake_up_serving_locked(self, req: Any = None) -> Dict[str, Any]:
         try:
-            request = pb2.EmptyPB()
-            results = await self._broadcast_control_rpc(
-                "ResumeServing", request, timeout_s=600
+            status = await self.get_sleep_status()
+            if "error" in status:
+                return status
+            if not bool(status.get("effective", False)):
+                return {
+                    "error": status.get("disabled_reason", "sleep mode is disabled"),
+                    "grpc_status": "UNIMPLEMENTED",
+                    "sleep_mode_enabled": bool(
+                        status.get("sleep_mode_enabled", False)
+                    ),
+                    "effective": False,
+                    "supported_levels": status.get("supported_levels", []),
+                    "supported_modes": status.get("supported_modes", []),
+                }
+            prepare_request = pb2.WakeUpRequestPB(prepare_only=True)
+            commit_request = pb2.WakeUpRequestPB(commit_only=True)
+
+            prepare_results = await self._broadcast_control_rpc(
+                "WakeUpServing", prepare_request, timeout_s=600
             )
-            failures = [result for result in results if "error" in result]
+            failures = [result for result in prepare_results if "error" in result]
             if failures:
                 return {
-                    "error": "Failed to resume serving on some control ranks",
+                    "error": "Failed to prepare wake_up on some control ranks",
                     "grpc_status": failures[0].get("grpc_status", "UNKNOWN"),
-                    "details": _error_details(results),
+                    "details": _error_details(prepare_results),
                 }
-            status = await self.get_freeze_status()
+
+            commit_results = await self._broadcast_control_rpc(
+                "WakeUpServing", commit_request, timeout_s=60
+            )
+            failures = [result for result in commit_results if "error" in result]
+            if failures:
+                return {
+                    "error": "Failed to commit wake_up on some control ranks",
+                    "grpc_status": failures[0].get("grpc_status", "UNKNOWN"),
+                    "details": _error_details(commit_results),
+                }
+            status = await self.get_sleep_status()
             if "error" in status:
                 return status
             if status.get("state") != "RUNNING":
                 return {
-                    "error": "Resume did not converge on all control ranks",
+                    "error": "Wake_up did not converge on all control ranks",
                     "grpc_status": "FAILED_PRECONDITION",
                 }
             return {"status": "ok"}
         except grpc.aio.AioRpcError as e:
-            logging.error(f"Resume serving failed: {e.details()}")
+            logging.error(f"Wake_up serving failed: {e.details()}")
             return {
-                "error": f"Failed to resume serving: {e.details()}",
+                "error": f"Failed to wake_up serving: {e.details()}",
                 "grpc_status": e.code().name,
             }
         except Exception as e:
-            logging.error(f"Resume serving failed: {e}")
-            return {"error": f"Failed to resume serving: {str(e)}"}
+            logging.error(f"Wake_up serving failed: {e}")
+            return {"error": f"Failed to wake_up serving: {str(e)}"}
 
-    async def get_freeze_status(self, req: Any = None) -> Dict[str, Any]:
-        """Get aggregate freeze lifecycle status from every control rank."""
+    async def get_sleep_status(self, req: Any = None) -> Dict[str, Any]:
+        """Get aggregate sleep lifecycle status from every control rank."""
         try:
             request = pb2.EmptyPB()
             results = await self._broadcast_control_rpc(
-                "GetFreezeStatus", request, timeout_s=3
+                "GetSleepStatus", request, timeout_s=3
             )
-            return self._aggregate_freeze_status(results)
+            status = self._aggregate_sleep_status(results)
+            _report_sleep_status_metrics(status)
+            return status
         except Exception as e:
-            logging.error(f"Get freeze status failed: {e}")
-            return {"error": f"Failed to get freeze status: {str(e)}"}
+            logging.error(f"Get sleep status failed: {e}")
+            return {"error": f"Failed to get sleep status: {str(e)}"}
+
+    async def is_sleeping(self, req: Any = None) -> Dict[str, Any]:
+        status = await self.get_sleep_status(req)
+        if "error" in status:
+            return status
+        return {
+            "is_sleeping": status.get("state") == "SLEEPING",
+            "sleep_mode_enabled": bool(status.get("sleep_mode_enabled", False)),
+            "effective": bool(status.get("effective", False)),
+            "supported_levels": status.get("supported_levels", []),
+            "supported_modes": status.get("supported_modes", []),
+            "state": status.get("state", ""),
+            "disabled_reason": status.get("disabled_reason", ""),
+        }
 
     async def start_profile(self, req: Any) -> Dict[str, Any]:
         """Start profiling switch in backend process"""
@@ -507,12 +683,14 @@ class GrpcClientWrapper:
                 return await self.get_worker_status(req)
             elif uri == "set_log_level":
                 return await self.set_log_level(req)
-            elif uri == "freeze":
-                return await self.freeze_serving(req)
-            elif uri == "resume":
-                return await self.resume_serving(req)
-            elif uri == "freeze_status":
-                return await self.get_freeze_status(req)
+            elif uri == "sleep":
+                return await self.sleep_serving(req)
+            elif uri == "wake_up":
+                return await self.wake_up_serving(req)
+            elif uri == "is_sleeping":
+                return await self.is_sleeping(req)
+            elif uri == "sleep_status":
+                return await self.get_sleep_status(req)
             elif uri == "start_profile":
                 return await self.start_profile(req)
             elif uri == "update_eplb_config":

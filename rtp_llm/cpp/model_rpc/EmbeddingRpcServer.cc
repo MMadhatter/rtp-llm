@@ -107,7 +107,7 @@ grpc::Status EmbeddingRpcServiceImpl::health(grpc::ServerContext*            con
                                              const EmbeddingHealthRequestPB* request,
                                              EmptyPB*                        writer) {
     RTP_LLM_LOG_DEBUG("Received embedding health check request");
-    // M8: report not-ready while freezing/frozen so LB drops the instance.
+    // Report not-ready while sleeping or transitioning so LB drops the instance.
     return checkAdmission();
 }
 }  // namespace rtp_llm

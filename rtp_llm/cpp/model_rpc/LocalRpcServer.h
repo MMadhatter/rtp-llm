@@ -2,14 +2,17 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <iostream>
+#include <unordered_map>
+#include <vector>
 #include "grpc++/grpc++.h"
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/utils/AtomicUtil.h"
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
-#include "rtp_llm/cpp/engine_base/freeze/AdmissionGate.h"
-#include "rtp_llm/cpp/engine_base/freeze/DrainManager.h"
+#include "rtp_llm/cpp/engine_base/sleep/AdmissionGate.h"
+#include "rtp_llm/cpp/engine_base/sleep/DrainManager.h"
 #include "rtp_llm/cpp/cache/KVCachePhysicalMemoryController.h"
 #include "rtp_llm/cpp/engine_base/EngineInitParams.h"
 #include "rtp_llm/cpp/engine_base/ProposeModelEngineInitParams.h"
@@ -61,12 +64,14 @@ public:
 
     grpc::Status SetRestart(grpc::ServerContext* context, const EmptyPB* request, EmptyPB* response);
 
-    grpc::Status FreezeServing(grpc::ServerContext* context, const FreezeRequestPB* request, EmptyPB* response);
+    grpc::Status SleepServing(grpc::ServerContext* context, const SleepRequestPB* request, EmptyPB* response);
 
-    grpc::Status ResumeServing(grpc::ServerContext* context, const EmptyPB* request, EmptyPB* response);
+    grpc::Status WakeUpServing(grpc::ServerContext* context, const WakeUpRequestPB* request, EmptyPB* response);
+
+    grpc::Status IsSleeping(grpc::ServerContext* context, const EmptyPB* request, IsSleepingResponsePB* response);
 
     grpc::Status
-    GetFreezeStatus(grpc::ServerContext* context, const EmptyPB* request, FreezeStatusResponsePB* response);
+    GetSleepStatus(grpc::ServerContext* context, const EmptyPB* request, SleepStatusResponsePB* response);
 
     grpc::Status SetLogLevel(grpc::ServerContext* context, const SetLogLevelRequestPB* request, EmptyPB* response);
 
@@ -94,6 +99,7 @@ public:
     }
 
     virtual size_t onflightRequestNum();
+    virtual size_t activeCacheTransferCount();
 
     void stop() {
         (void)engine_->stop();
@@ -104,6 +110,12 @@ public:
     void reportWorkerStatusTime(int64_t request_begin_time_us, int64_t request_after_lb_time_us);
 
     void reportCacheStatusTime(int64_t request_begin_time_us);
+
+    void reportSleepDrainTime(const std::string& mode, int64_t begin_time_us, bool success);
+
+    void reportSleepVmmOpTime(const std::string& operation, const std::string& resource_tag, int64_t begin_time_us);
+
+    void reportSleepMrOpTime(const std::string& operation, int64_t begin_time_us);
 
     ::grpc::Status
     ExecuteFunction(::grpc::ServerContext* context, const ::FunctionRequestPB* request, ::FunctionResponsePB* response);
@@ -118,9 +130,9 @@ protected:
         return admission_gate_ ? admission_gate_->check() : grpc::Status::OK;
     }
 
-    // Wire the freeze/resume FreezeHooks (M3 drain counters, M5 KV memory,
-    // M6 weights, engine quiesce) into engine_->freezeController().
-    void installFreezeHooks();
+    // Wire the sleep/wake_up SleepHooks (M3 drain counters, M5 KV memory,
+    // M6 weights, engine quiesce) into engine_->sleepController().
+    void installSleepHooks();
 
     grpc::Status serializeErrorMsg(const std::string& request_key, ErrorInfo error_info);
     grpc::Status pollStreamOutput(grpc::ServerContext*             context,
@@ -134,12 +146,15 @@ protected:
                                   std::shared_ptr<GenerateStream>&      stream,
                                   const std::shared_ptr<GenerateInput>& input,
                                   GenerateOutputs&                      last_outputs);
+    std::shared_ptr<void> registerAbortableStreamForScope(const std::shared_ptr<GenerateStream>& stream);
+    void                  unregisterAbortableStream(int64_t request_id);
+    size_t                cancelAbortableStreams();
 
 protected:
     std::shared_ptr<EngineBase>           engine_;
     std::shared_ptr<AdmissionGate>        admission_gate_;
     std::shared_ptr<DrainManager>         drain_manager_;
-    std::shared_ptr<TmsBackend>           tms_backend_;
+    std::shared_ptr<VmmBackend>           vmm_backend_;
     std::shared_ptr<MultimodalProcessor>  mm_processor_;
     EngineInitParams                      maga_init_params_;
     ProposeModelEngineInitParams*         propose_maga_init_params_;
@@ -148,6 +163,8 @@ protected:
     std::shared_ptr<RpcServerRuntimeMeta> meta_;
     py::object                            weight_manager_;
     std::shared_ptr<BroadcastManager>     profile_broadcaster_;
+    mutable std::mutex                    abortable_streams_mutex_;
+    std::unordered_map<int64_t, std::weak_ptr<GenerateStream>> abortable_streams_;
 };
 
 }  // namespace rtp_llm

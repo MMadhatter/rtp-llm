@@ -67,6 +67,8 @@ private:
     void                            mayAddFakeStream(std::list<GenerateStreamPtr>& streams);
     absl::Status                    runExecutorProcess(const std::list<GenerateStreamPtr>& streams);
     absl::Status                    releasePendingTpCollectiveForPause(uint64_t pause_epoch);
+    bool                            collectiveSleepQuiesceEnabled() const;
+    absl::Status                    maybeReachCollectiveSleepQuiesce();
     void                            enterPausedState();
     void                            markPauseQuiesced();
 

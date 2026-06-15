@@ -431,6 +431,46 @@ absl::Status NormalEngine::runExecutorProcess(const std::list<GenerateStreamPtr>
     return status;
 }
 
+bool NormalEngine::collectiveSleepQuiesceEnabled() const {
+    return sleep_controller_.effective() && parallelism_config.world_size > 1
+           && (parallelism_config.dp_size > 1 || parallelism_config.ep_size > 1);
+}
+
+absl::Status NormalEngine::maybeReachCollectiveSleepQuiesce() {
+    if (!collectiveSleepQuiesceEnabled()) {
+        return absl::OkStatus();
+    }
+
+    const bool    pending     = pause_.load(std::memory_order_acquire);
+    const int64_t unfinished  = pending && parallelism_config.tp_rank == 0 && scheduler_ ?
+                                    std::max<int64_t>(0, scheduler_->onflightStreams()) :
+                                    0;
+    const int64_t not_pending = pending ? 0 : 1;
+
+    auto state = torch::empty({2}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    auto data  = state.data_ptr<int64_t>();
+    data[0]    = pending ? 1 : 0;
+    data[1]    = unfinished + not_pending;
+
+    auto reduced = execAllReduce({state, ReduceOp::Sum, false, ParallelMode::DP_AND_TP}).buffer;
+    if (reduced.device().is_cuda()) {
+        reduced = reduced.cpu();
+    }
+    auto reduced_data         = reduced.data_ptr<int64_t>();
+    const int64_t pending_sum = reduced_data[0];
+    const int64_t blocked_sum = reduced_data[1];
+
+    if (pending && pending_sum == parallelism_config.world_size && blocked_sum == 0) {
+        const auto pause_epoch = pause_epoch_.load(std::memory_order_acquire);
+        processed_pause_epoch_.store(pause_epoch, std::memory_order_release);
+        RTP_LLM_LOG_INFO("normal engine collective sleep quiesce reached, epoch=%lu, world_size=%ld",
+                         pause_epoch,
+                         parallelism_config.world_size);
+        enterPausedState();
+    }
+    return absl::OkStatus();
+}
+
 absl::Status NormalEngine::releasePendingTpCollectiveForPause(uint64_t pause_epoch) {
     if (parallelism_config.tp_size <= 1 || parallelism_config.tp_rank != 0) {
         return absl::OkStatus();
@@ -468,9 +508,11 @@ absl::Status NormalEngine::pauseAndWaitQuiesced(int64_t timeout_ms) {
         return absl::OkStatus();
     }
 
-    auto status = releasePendingTpCollectiveForPause(pause_epoch);
-    if (!status.ok()) {
-        return status;
+    if (!collectiveSleepQuiesceEnabled()) {
+        auto status = releasePendingTpCollectiveForPause(pause_epoch);
+        if (!status.ok()) {
+            return status;
+        }
     }
 
     std::unique_lock<std::mutex> lock(pause_mutex_);
@@ -540,7 +582,9 @@ NormalEngine::batchEnqueue(const std::vector<std::shared_ptr<GenerateInput>>& in
 
 absl::Status NormalEngine::step() {
     RTP_LLM_PROFILE_SCOPE("engine.normal.step_work");
+    const bool collective_sleep_quiesce = collectiveSleepQuiesceEnabled();
     if (pause_.load(std::memory_order_acquire)
+        && !collective_sleep_quiesce
         && (parallelism_config.tp_size <= 1 || parallelism_config.tp_rank == 0)) {
         enterPausedState();
     }
@@ -551,7 +595,7 @@ absl::Status NormalEngine::step() {
             RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.schedule(reserve_step=%d)", reserve_step_);
             CHECK_AND_ASSIGN(streams, scheduler_->schedule());
         }
-        if (parallelism_config.dp_size > 1) {
+        if (parallelism_config.dp_size > 1 || (collective_sleep_quiesce && parallelism_config.ep_size > 1)) {
             RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_work");
             mayAddFakeStream(streams);
         }
@@ -563,7 +607,7 @@ absl::Status NormalEngine::step() {
         }
     }
 
-    if (pause_.load(std::memory_order_acquire) && parallelism_config.tp_rank == 0) {
+    if (pause_.load(std::memory_order_acquire) && !collective_sleep_quiesce && parallelism_config.tp_rank == 0) {
         enterPausedState();
         return absl::OkStatus();
     }
@@ -593,7 +637,9 @@ absl::Status NormalEngine::step() {
         status = runExecutorProcess(streams);
     }
 
-    if (status.ok() && pause_.load(std::memory_order_acquire)) {
+    if (status.ok() && collective_sleep_quiesce) {
+        status = maybeReachCollectiveSleepQuiesce();
+    } else if (status.ok() && pause_.load(std::memory_order_acquire)) {
         enterPausedState();
     }
 

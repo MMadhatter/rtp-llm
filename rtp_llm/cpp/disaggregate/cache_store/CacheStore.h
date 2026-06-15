@@ -53,7 +53,7 @@ public:
     virtual const std::shared_ptr<MemoryUtil>& getMemoryUtil() const = 0;
 
     // Global in-flight transfer count (store/load tasks + remote store tasks).
-    // Used by DrainManager (M3) to decide drain completion before freeze.
+    // Used by DrainManager (M3) to decide drain completion before sleep.
     virtual size_t activeTransferCount() const {
         return 0;
     }

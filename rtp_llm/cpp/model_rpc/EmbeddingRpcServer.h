@@ -4,7 +4,7 @@
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.grpc.pb.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 #include "rtp_llm/cpp/embedding_engine/EmbeddingEngine.h"
-#include "rtp_llm/cpp/engine_base/freeze/AdmissionGate.h"
+#include "rtp_llm/cpp/engine_base/sleep/AdmissionGate.h"
 #include "rtp_llm/cpp/multimodal_processor/LocalMultimodalProcessor.h"
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/model_rpc/QueryConverter.h"
@@ -32,7 +32,7 @@ public:
     grpc::Status embedding(grpc::ServerContext* context, const EmbeddingInputPB* request, EmbeddingOutputPB* response);
     grpc::Status health(grpc::ServerContext* context, const EmbeddingHealthRequestPB* request, EmptyPB* writer);
 
-    // M4: EmbeddingEngine does not inherit EngineBase (no freezeController()),
+    // M4: EmbeddingEngine does not inherit EngineBase (no sleepController()),
     // so the admission gate is injected by the owner (RtpEmbeddingOp) instead
     // of being built here. Unset gate admits everything (current behavior).
     void setAdmissionGate(const std::shared_ptr<AdmissionGate>& admission_gate) {
