@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include "rtp_llm/cpp/engine_base/freeze/FreezeLifecycleController.h"
+#include "rtp_llm/cpp/engine_base/sleep/SleepLifecycleController.h"
 
 namespace rtp_llm {
 
@@ -21,14 +21,14 @@ namespace rtp_llm {
 // NormalCacheStore::activeTransferCount).
 //
 // Drain policies:
-//   - graceful: waitDrained(timeout_ms) polls until all counters reach zero or
+//   - wait: waitDrained(timeout_ms) polls until all counters reach zero or
 //     the timeout expires. On timeout it returns false and the caller (M1)
 //     stays in DRAINING without releasing GPU resources.
-//   - force: an injected cancel callback is invoked first (the callback owner
+//   - abort: an injected cancel callback is invoked first (the callback owner
 //     is responsible for cancelling non-streaming requests and exempting
 //     streaming ones), then drain is awaited as usual.
 //
-// Acts as the FreezeHooks drain provider for FreezeLifecycleController (M1)
+// Acts as the SleepHooks drain provider for SleepLifecycleController (M1)
 // via installHooks(). Thread-safe.
 class DrainManager {
 public:
@@ -36,7 +36,7 @@ public:
     using CancelFn  = std::function<void()>;
 
     // Classification of a counter source, used to aggregate the two values
-    // surfaced through FreezeStatus (active_request_count /
+    // surfaced through SleepStatus (active_request_count /
     // active_cache_transfer_count). Both kinds participate in drained().
     enum class CounterKind {
         REQUEST,         // frontend_active / rpc_onflight / scheduler onflight streams ...
@@ -56,7 +56,7 @@ public:
     // Remove a counter provider; no-op when the name is unknown.
     void unregisterCounter(const std::string& name);
 
-    // Inject the force-cancel callback. The provider must cancel non-streaming
+    // Inject the abort callback. The provider must cancel non-streaming
     // requests only; streaming exemption is its responsibility. DrainManager
     // just invokes it and keeps waiting for the counters to reach zero.
     void setCancelCallback(CancelFn fn);
@@ -64,13 +64,13 @@ public:
     // True iff every registered counter currently reads zero.
     bool drained() const;
 
-    // Graceful drain: poll until drained or timeout. timeout_ms <= 0 performs a
+    // Wait drain: poll until drained or timeout. timeout_ms <= 0 performs a
     // single immediate check. Returns false on timeout (caller keeps DRAINING).
     bool waitDrained(int64_t timeout_ms);
 
-    // FreezeHooks::drain entry: applies force policy (cancel callback) when
-    // requested, then waits for drain up to opt.drain_timeout_ms.
-    bool drain(const FreezeOptions& opt);
+    // SleepHooks::drain entry: applies abort policy (cancel callback) when
+    // requested, then waits for drain up to opt.timeout_ms.
+    bool drain(const SleepOptions& opt);
 
     // Invoke the injected cancel callback (if any). Called outside the internal
     // lock so the callback may freely query this DrainManager.
@@ -80,9 +80,9 @@ public:
     int64_t activeRequestCount() const;
     int64_t activeCacheTransferCount() const;
 
-    // Wire this manager into M1's FreezeHooks (drain + the two count hooks).
+    // Wire this manager into M1's SleepHooks (drain + the two count hooks).
     // The DrainManager must outlive the controller that holds the hooks.
-    void installHooks(FreezeHooks& hooks);
+    void installHooks(SleepHooks& hooks);
 
     // Wake up waitDrained() pollers early, e.g. when a counter source knows it
     // just dropped to zero. Purely an optimization; polling still converges.

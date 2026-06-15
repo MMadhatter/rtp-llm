@@ -1,4 +1,4 @@
-#include "rtp_llm/cpp/engine_base/freeze/DrainManager.h"
+#include "rtp_llm/cpp/engine_base/sleep/DrainManager.h"
 
 #include <algorithm>
 #include <chrono>
@@ -102,16 +102,16 @@ bool DrainManager::waitDrained(int64_t timeout_ms) {
     }
 }
 
-bool DrainManager::drain(const FreezeOptions& opt) {
-    const bool force = opt.force || opt.mode == "force";
-    RTP_LLM_LOG_INFO("drain manager: start drain, mode=%s force=%d timeout_ms=%ld",
+bool DrainManager::drain(const SleepOptions& opt) {
+    const bool abort = opt.mode == "abort";
+    RTP_LLM_LOG_INFO("drain manager: start drain, mode=%s abort=%d timeout_ms=%ld",
                      opt.mode.c_str(),
-                     static_cast<int>(force),
-                     opt.drain_timeout_ms);
-    if (force) {
+                     static_cast<int>(abort),
+                     opt.timeout_ms);
+    if (abort) {
         forceCancel();
     }
-    return waitDrained(opt.drain_timeout_ms);
+    return waitDrained(opt.timeout_ms);
 }
 
 void DrainManager::forceCancel() {
@@ -121,10 +121,10 @@ void DrainManager::forceCancel() {
         callback = cancel_callback_;
     }
     if (!callback) {
-        RTP_LLM_LOG_WARNING("drain manager: force drain requested but no cancel callback injected");
+        RTP_LLM_LOG_WARNING("drain manager: abort drain requested but no cancel callback injected");
         return;
     }
-    RTP_LLM_LOG_INFO("drain manager: invoking force-cancel callback (streaming requests are exempted by provider)");
+    RTP_LLM_LOG_INFO("drain manager: invoking abort callback (streaming requests are exempted by provider)");
     callback();
     notifyDrainProgress();
 }
@@ -147,8 +147,8 @@ int64_t DrainManager::activeCacheTransferCount() const {
     return sumByKind(CounterKind::CACHE_TRANSFER);
 }
 
-void DrainManager::installHooks(FreezeHooks& hooks) {
-    hooks.drain                    = [this](const FreezeOptions& opt) { return drain(opt); };
+void DrainManager::installHooks(SleepHooks& hooks) {
+    hooks.drain                    = [this](const SleepOptions& opt) { return drain(opt); };
     hooks.activeRequestCount       = [this]() { return activeRequestCount(); };
     hooks.activeCacheTransferCount = [this]() { return activeCacheTransferCount(); };
 }

@@ -80,7 +80,7 @@ class ExceptionType(IntEnum):
     # route error
     ROUTE_ERROR = 8500
 
-    # engine freeze/resume error (M4 AdmissionGate): instance not RUNNING, retryable
+    # engine sleep/wake_up error (AdmissionGate): instance not RUNNING, retryable
     ENGINE_UNAVAILABLE = 8600
 
     # multimodal error

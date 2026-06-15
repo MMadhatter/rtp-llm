@@ -79,7 +79,7 @@ enum class ErrorCode {
     GET_PART_NODE_STATUS_FAILED = 8400,
     GET_ALL_NODE_STATUS_FAILED  = 8401,
 
-    // engine freeze/resume error (M4 AdmissionGate): instance not RUNNING, retryable
+    // engine sleep/wake_up error (M4 AdmissionGate): instance not RUNNING, retryable
     ENGINE_UNAVAILABLE = 8600,
 };
 

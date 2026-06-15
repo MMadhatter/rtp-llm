@@ -1,12 +1,12 @@
 load("//:def.bzl", "copts")
 
 cc_library(
-    name = "freeze",
+    name = "sleep",
     hdrs = [
-        "FreezeLifecycleController.h",
+        "SleepLifecycleController.h",
     ],
     srcs = [
-        "FreezeLifecycleController.cc",
+        "SleepLifecycleController.cc",
     ],
     copts = copts(),
     deps = [
@@ -25,7 +25,7 @@ cc_library(
     ],
     copts = copts(),
     deps = [
-        ":freeze",
+        ":sleep",
         "//rtp_llm/cpp/utils:core_utils",
     ],
     visibility = ["//visibility:public"],
@@ -41,7 +41,7 @@ cc_library(
     ],
     copts = copts(),
     deps = [
-        ":freeze",
+        ":sleep",
         "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_cc_proto",
         "//rtp_llm/cpp/utils:core_utils",
         "//rtp_llm/cpp/utils:error_code",
