@@ -58,7 +58,7 @@ public:
     void   connectorReference(BlockIdxType block_idx);
     void   connectorReference(const BlockIndicesType& block_indices);
 
-    // Freeze/resume (M5): reset all block metadata to the fresh-pool state after the physical
+    // Sleep/wake_up (M5): reset all block metadata to the fresh-pool state after the physical
     // KV memory has been resumed (content discarded). Rebuilds free_block_ids_ to the full set
     // and re-inits every BlockRefCounter, exactly like initFreeBlocks() on a new pool.
     // Does NOT touch block_cache_ (callers clear it separately via BlockCache::clear()) and

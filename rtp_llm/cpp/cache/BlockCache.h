@@ -63,7 +63,7 @@ public:
     };
     EvictResult selectAndEvict(size_t min_blocks);
 
-    // Freeze/resume (M5): drop all entries and bump the cache generation.
+    // Sleep/wake_up (M5): drop all entries and bump the cache generation.
     // After a KV physical-memory pause/resume cycle, every cached block content is invalid
     // (constraint C3), so all prefix-cache entries must be discarded.
     // Minimal generation scheme: clearing empties the cache (any old cache key misses) and

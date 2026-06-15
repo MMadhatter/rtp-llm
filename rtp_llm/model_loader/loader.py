@@ -86,9 +86,9 @@ class ModelLoader:
     @timer_wrapper(description="load weights")
     @torch.inference_mode()
     def load_weights(self, device: str):
-        # Freeze/Resume M6: register every weight GPU allocation (incl. quant
+        # Sleep/wake_up M6: register every weight GPU allocation (incl. quant
         # scales/zeros, dynamic weights and static EPLB buffers) as pausable
-        # cpu-backup memory. No-op unless RTP_LLM_FREEZE_WEIGHTS_SAVER=1.
+        # cpu-backup memory. No-op unless sleep mode is enabled.
         with weights_region():
             if self._load_config.is_ft_style_weight:
                 weights = self._load_from_ft_style(device)
@@ -114,7 +114,7 @@ class ModelLoader:
         if self._weights_info.weight_style == WeightStyle.RTP_LLM_STYLE:
             raise ValueError("load_lora_weights only support non-ft-style weight")
 
-        # Freeze/Resume M6: cover LoRA tensors when loaded directly to GPU.
+        # Sleep/wake_up M6: cover LoRA tensors when loaded directly to GPU.
         with weights_region():
             for id in range(self._load_config.num_layers):
                 result = self._load_layer_lora_weights(adapter_name, id, device)

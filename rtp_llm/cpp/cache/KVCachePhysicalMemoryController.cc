@@ -1,13 +1,14 @@
 #include "rtp_llm/cpp/cache/KVCachePhysicalMemoryController.h"
 
 #include <dlfcn.h>
+#include <unordered_map>
 
 #include "rtp_llm/cpp/utils/Logger.h"
 
 namespace rtp_llm {
 
 // ---------------------------------------------------------------------------
-// TmsBackend
+// VmmBackend
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -19,58 +20,86 @@ FnType probeSymbol(const char* symbol_name) {
     return reinterpret_cast<FnType>(dlsym(RTLD_DEFAULT, symbol_name));
 }
 
+std::mutex                                      g_vmm_tag_stats_mutex;
+std::unordered_map<std::string, VmmTagStats>   g_vmm_tag_stats;
+
 }  // namespace
 
-TmsBackend::TmsBackend() {
-    pause_fn_                  = probeSymbol<TmsTagFn>("tms_pause");
-    resume_fn_                 = probeSymbol<TmsTagFn>("tms_resume");
-    set_current_tag_fn_        = probeSymbol<TmsTagFn>("tms_set_current_tag");
-    set_interesting_region_fn_ = probeSymbol<TmsSetBoolFn>("tms_set_interesting_region");
-    set_enable_cpu_backup_fn_  = probeSymbol<TmsSetBoolFn>("tms_set_enable_cpu_backup");
+void VmmTagStatsRegistry::recordAllocation(const std::string& tag, size_t size_bytes) {
+    if (tag.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_vmm_tag_stats_mutex);
+    auto&                       stats = g_vmm_tag_stats[tag];
+    stats.allocation_count += 1;
+    stats.total_size_bytes += size_bytes;
+    RTP_LLM_LOG_INFO("VMM tag stats: tag=%s known_allocation_count=%zu known_total_size_bytes=%zu",
+                     tag.c_str(),
+                     stats.allocation_count,
+                     stats.total_size_bytes);
+}
+
+VmmTagStats VmmTagStatsRegistry::stats(const std::string& tag) {
+    std::lock_guard<std::mutex> lock(g_vmm_tag_stats_mutex);
+    auto                        iter = g_vmm_tag_stats.find(tag);
+    return iter == g_vmm_tag_stats.end() ? VmmTagStats{} : iter->second;
+}
+
+void VmmTagStatsRegistry::resetForTest() {
+    std::lock_guard<std::mutex> lock(g_vmm_tag_stats_mutex);
+    g_vmm_tag_stats.clear();
+}
+
+VmmBackend::VmmBackend() {
+    pause_fn_                  = probeSymbol<ShimTagFn>("tms_pause");
+    resume_fn_                 = probeSymbol<ShimTagFn>("tms_resume");
+    set_current_tag_fn_        = probeSymbol<ShimTagFn>("tms_set_current_tag");
+    set_interesting_region_fn_ = probeSymbol<ShimSetBoolFn>("tms_set_interesting_region");
+    set_enable_cpu_backup_fn_  = probeSymbol<ShimSetBoolFn>("tms_set_enable_cpu_backup");
 
     if (isAvailable()) {
-        RTP_LLM_LOG_INFO("TmsBackend: torch_memory_saver preload shim detected "
+        RTP_LLM_LOG_INFO("VmmBackend: torch_memory_saver VMM preload shim detected "
                          "(tms_pause/tms_resume resolved, region scoping %s)",
                          (set_current_tag_fn_ && set_interesting_region_fn_) ? "available" : "unavailable");
     } else {
-        RTP_LLM_LOG_INFO("TmsBackend: torch_memory_saver preload shim not detected, backend unavailable");
+        RTP_LLM_LOG_INFO("VmmBackend: torch_memory_saver VMM preload shim not detected, backend unavailable");
     }
 }
 
-bool TmsBackend::isAvailable() const {
+bool VmmBackend::isAvailable() const {
     return pause_fn_ != nullptr && resume_fn_ != nullptr;
 }
 
-std::string TmsBackend::name() const {
-    return "torch_memory_saver";
+std::string VmmBackend::name() const {
+    return "vmm";
 }
 
-bool TmsBackend::pause(const std::string& tag) {
+bool VmmBackend::pause(const std::string& tag) {
     if (!isAvailable()) {
-        RTP_LLM_LOG_ERROR("TmsBackend::pause(tag=%s) failed: shim not available", tag.c_str());
+        RTP_LLM_LOG_ERROR("VmmBackend::pause(tag=%s) failed: shim not available", tag.c_str());
         return false;
     }
     pause_fn_(tag.empty() ? nullptr : tag.c_str());
     return true;
 }
 
-bool TmsBackend::resume(const std::string& tag) {
+bool VmmBackend::resume(const std::string& tag) {
     if (!isAvailable()) {
-        RTP_LLM_LOG_ERROR("TmsBackend::resume(tag=%s) failed: shim not available", tag.c_str());
+        RTP_LLM_LOG_ERROR("VmmBackend::resume(tag=%s) failed: shim not available", tag.c_str());
         return false;
     }
     resume_fn_(tag.empty() ? nullptr : tag.c_str());
     return true;
 }
 
-bool TmsBackend::beginAllocationRegion(const std::string& tag, bool enable_cpu_backup) {
+bool VmmBackend::beginAllocationRegion(const std::string& tag, bool enable_cpu_backup) {
     if (!set_current_tag_fn_ || !set_interesting_region_fn_) {
-        RTP_LLM_LOG_ERROR("TmsBackend::beginAllocationRegion(tag=%s) failed: region symbols not available",
+        RTP_LLM_LOG_ERROR("VmmBackend::beginAllocationRegion(tag=%s) failed: region symbols not available",
                           tag.c_str());
         return false;
     }
     if (enable_cpu_backup && !set_enable_cpu_backup_fn_) {
-        RTP_LLM_LOG_ERROR("TmsBackend::beginAllocationRegion(tag=%s) failed: cpu backup symbol not available",
+        RTP_LLM_LOG_ERROR("VmmBackend::beginAllocationRegion(tag=%s) failed: cpu backup symbol not available",
                           tag.c_str());
         return false;
     }
@@ -82,7 +111,7 @@ bool TmsBackend::beginAllocationRegion(const std::string& tag, bool enable_cpu_b
     return true;
 }
 
-bool TmsBackend::endAllocationRegion() {
+bool VmmBackend::endAllocationRegion() {
     if (!set_interesting_region_fn_) {
         return false;
     }

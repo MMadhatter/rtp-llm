@@ -1,22 +1,23 @@
-"""WeightMemorySaver (Freeze/Resume M6): weight GPU memory pause/resume with CPU backup.
+"""WeightMemorySaver (Sleep/wake_up M6): weight GPU memory pause/resume with CPU backup.
 
 Wraps ``torch_memory_saver`` so that every CUDA allocation that holds model
 weights is registered under the ``tag="weights"`` region with
-``enable_cpu_backup=True``. On engine freeze, :func:`pause_weights` backs the
+``enable_cpu_backup=True``. On engine sleep, :func:`pause_weights` backs the
 weight pages up to host (pinned) memory and releases the physical GPU pages
 while keeping the virtual addresses stable (constraint C2: data_ptr must not
 change because CUDA graphs and the C++ ``weights_`` aliases bake pointers in).
-On resume, :func:`resume_weights` remaps physical pages at the same VA and
+On wake_up, :func:`resume_weights` remaps physical pages at the same VA and
 copies the content back (constraint C4: weight content must be preserved).
 
 Activation
 ----------
 Disabled by default. Enable by setting the environment variable
-``RTP_LLM_FREEZE_WEIGHTS_SAVER=1`` (or legacy
-``RTP_LLM_WEIGHT_MEMORY_SAVER=1``) *and* having ``torch_memory_saver``
-importable (typically via its LD_PRELOAD hook shim, see spike S1). When the
-switch is off or the package is unavailable, every API in this module
-degrades to a no-op so production startup paths are unaffected.
+``ENABLE_SLEEP_MODE=1`` (or programmatically from the parsed runtime config)
+and having ``torch_memory_saver`` importable (typically via its LD_PRELOAD
+hook shim, see spike S1). ``RTP_LLM_WEIGHT_MEMORY_SAVER=1`` is kept as a
+low-level developer override for isolated memory-saver tests. When the switch
+is off or the package is unavailable, every API in this module degrades to a
+no-op so production startup paths are unaffected.
 
 Coverage checklist (weight tensors that must land inside ``weights_region``)
 ----------------------------------------------------------------------------
@@ -57,7 +58,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
-ENV_SWITCH: str = "RTP_LLM_FREEZE_WEIGHTS_SAVER"
+ENV_SWITCH: str = "ENABLE_SLEEP_MODE"
 LEGACY_ENV_SWITCH: str = "RTP_LLM_WEIGHT_MEMORY_SAVER"
 WEIGHTS_TAG: str = "weights"
 
@@ -65,11 +66,31 @@ _lock = threading.RLock()
 _tms: Optional[Any] = None
 _import_attempted: bool = False
 _paused: bool = False
+_enabled_override: Optional[bool] = None
 _region_depth = threading.local()
+
+
+def configure_from_runtime(enable_sleep_mode: bool) -> None:
+    """Mirror parsed RuntimeConfig.enable_sleep_mode into this Python helper.
+
+    CLI arguments in RTP-LLM are bound to config objects and are not written
+    back into os.environ. Weight allocation happens in Python before the C++
+    sleep controller is exercised, so this explicit override keeps
+    ``--enable-sleep-mode`` and ``ENABLE_SLEEP_MODE=1`` equivalent.
+    """
+    global _enabled_override, _tms, _import_attempted, _paused
+    with _lock:
+        _enabled_override = bool(enable_sleep_mode)
+        if not _enabled_override:
+            _tms = None
+            _import_attempted = False
+            _paused = False
 
 
 def is_enabled() -> bool:
     """Whether the feature switch env var is on (does not check importability)."""
+    if _enabled_override is not None:
+        return _enabled_override
     return (
         os.environ.get(ENV_SWITCH, "0") == "1"
         or os.environ.get(LEGACY_ENV_SWITCH, "0") == "1"
@@ -164,7 +185,7 @@ def pause_weights() -> bool:
 
     Returns True if the weights are paused after the call. No-op (warning,
     returns False) when the saver is unavailable; idempotent when already
-    paused. Intended to be called from the M1 freeze sequence *after* the KV
+    paused. Intended to be called from the M1 sleep sequence *after* the KV
     cache pause.
     """
     global _paused
@@ -190,8 +211,8 @@ def resume_weights() -> bool:
 
     Returns True if the weights are resumed (not paused) after the call.
     No-op (warning, returns False) when the saver is unavailable; idempotent
-    when not paused. Intended to be called from the M1 resume sequence
-    *after* the KV cache resume.
+    when not paused. Intended to be called from the M1 wake_up sequence
+    *after* the KV cache physical memory is remapped.
     """
     global _paused
     tms = _get_tms()
@@ -213,9 +234,10 @@ def resume_weights() -> bool:
 
 def _reset_for_testing() -> None:
     """Reset module-level caches/state. Test-only helper."""
-    global _tms, _import_attempted, _paused
+    global _tms, _import_attempted, _paused, _enabled_override
     with _lock:
         _tms = None
         _import_attempted = False
         _paused = False
+        _enabled_override = None
     _region_depth.value = 0

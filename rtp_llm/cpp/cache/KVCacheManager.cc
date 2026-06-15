@@ -83,7 +83,7 @@ bool KVCacheManager::init() {
 }
 
 void KVCacheManager::initKVMemoryController() {
-    kv_memory_controller_ = std::make_shared<KVCachePhysicalMemoryController>(std::make_shared<TmsBackend>());
+    kv_memory_controller_ = std::make_shared<KVCachePhysicalMemoryController>(std::make_shared<VmmBackend>());
     auto block_pool       = allocator_->getBlockPool();
     if (block_pool && block_pool->getBaseAddress() != nullptr) {
         // Attach mode: the KV big buffer was already allocated by BlockPool via torch::empty(kCUDA);
@@ -432,11 +432,11 @@ KVCacheInfo KVCacheManager::getKVCacheInfo(int64_t latest_version, bool need_cac
     return info;
 }
 
-// Freeze/resume (M5)
+// Sleep/wake_up (M5)
 
-bool KVCacheManager::pauseKVCacheMemory() {
+bool KVCacheManager::releaseKVCacheMemoryBacking() {
     if (!kv_memory_controller_) {
-        RTP_LLM_LOG_ERROR("pauseKVCacheMemory failed: kv memory controller not initialized");
+        RTP_LLM_LOG_ERROR("releaseKVCacheMemoryBacking failed: kv memory controller not initialized");
         return false;
     }
     // Caller (M1) guarantees the engine is drained: no in-flight requests, schedulers stopped,
@@ -444,9 +444,9 @@ bool KVCacheManager::pauseKVCacheMemory() {
     return kv_memory_controller_->pausePhysicalMemory();
 }
 
-bool KVCacheManager::resumeKVCacheMemory() {
+bool KVCacheManager::restoreKVCacheMemoryBackingAndResetMetadata() {
     if (!kv_memory_controller_) {
-        RTP_LLM_LOG_ERROR("resumeKVCacheMemory failed: kv memory controller not initialized");
+        RTP_LLM_LOG_ERROR("restoreKVCacheMemoryBackingAndResetMetadata failed: kv memory controller not initialized");
         return false;
     }
     if (!kv_memory_controller_->resumePhysicalMemory()) {
@@ -457,12 +457,13 @@ bool KVCacheManager::resumeKVCacheMemory() {
     // Physical pages are re-mapped at the same VA but the content is garbage (discard mode):
     // wipe all KV metadata so the pool is indistinguishable from a freshly initialized one.
     auto block_pool = allocator_->getBlockPool();
-    RTP_LLM_CHECK_WITH_INFO(block_pool != nullptr, "resumeKVCacheMemory: block pool is null");
+    RTP_LLM_CHECK_WITH_INFO(block_pool != nullptr,
+                            "restoreKVCacheMemoryBackingAndResetMetadata: block pool is null");
     block_pool->resetMetadata();
     if (auto block_cache = block_pool->blockCache()) {
         block_cache->clear();  // drops all prefix entries and bumps generation
     }
-    RTP_LLM_LOG_INFO("resumeKVCacheMemory done: metadata reset, cache generation=%lu",
+    RTP_LLM_LOG_INFO("restoreKVCacheMemoryBackingAndResetMetadata done: metadata reset, cache generation=%lu",
                      block_pool->blockCache() ? block_pool->blockCache()->generation() : 0UL);
     return true;
 }

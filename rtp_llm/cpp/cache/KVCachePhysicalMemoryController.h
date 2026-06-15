@@ -7,7 +7,7 @@
 
 namespace rtp_llm {
 
-// Abstraction over the physical-memory pause/resume mechanism (freeze/resume M5).
+// Abstraction over the physical-memory pause/resume mechanism (sleep/wake_up M5).
 //
 // Contract for all implementations:
 // - pause(tag) releases the physical GPU pages of every allocation tracked under `tag`
@@ -27,7 +27,22 @@ public:
     virtual bool resume(const std::string& tag) = 0;
 };
 
-// Backend backed by torch_memory_saver's LD_PRELOAD hook shim
+struct VmmTagStats {
+    size_t allocation_count = 0;
+    size_t total_size_bytes = 0;
+};
+
+// Application-side observability for allocations that RTP-LLM knows were
+// opened under a VMM tag. torch_memory_saver 0.0.9 exposes no per-tag stats ABI,
+// so this deliberately reports known RTP-LLM regions only.
+class VmmTagStatsRegistry {
+public:
+    static void        recordAllocation(const std::string& tag, size_t size_bytes);
+    static VmmTagStats stats(const std::string& tag);
+    static void        resetForTest();
+};
+
+// VMM backend backed by torch_memory_saver's LD_PRELOAD hook shim
 // (torch_memory_saver_hook_mode_preload*.so, validated by spike S1).
 //
 // The shim intercepts cudaMalloc/cudaFree process-wide and exports a C API. We do not link
@@ -43,9 +58,9 @@ public:
 //   void tms_set_enable_cpu_backup(bool);           // required when enable_cpu_backup=true
 // pause/resume are mandatory for availability; the region/tag symbols enable tagging
 // future allocations (see beginAllocationRegion/endAllocationRegion).
-class TmsBackend: public PhysicalMemoryBackend {
+class VmmBackend: public PhysicalMemoryBackend {
 public:
-    TmsBackend();
+    VmmBackend();
 
     bool        isAvailable() const override;
     std::string name() const override;
@@ -60,17 +75,17 @@ public:
     bool endAllocationRegion();
 
 private:
-    using TmsTagFn     = void (*)(const char*);
-    using TmsSetBoolFn = void (*)(bool);
+    using ShimTagFn     = void (*)(const char*);
+    using ShimSetBoolFn = void (*)(bool);
 
-    TmsTagFn     pause_fn_                  = nullptr;
-    TmsTagFn     resume_fn_                 = nullptr;
-    TmsTagFn     set_current_tag_fn_        = nullptr;
-    TmsSetBoolFn set_interesting_region_fn_ = nullptr;
-    TmsSetBoolFn set_enable_cpu_backup_fn_  = nullptr;
+    ShimTagFn     pause_fn_                  = nullptr;
+    ShimTagFn     resume_fn_                 = nullptr;
+    ShimTagFn     set_current_tag_fn_        = nullptr;
+    ShimSetBoolFn set_interesting_region_fn_ = nullptr;
+    ShimSetBoolFn set_enable_cpu_backup_fn_  = nullptr;
 };
 
-// Controls the physical memory backing the KV cache big buffer (freeze/resume M5).
+// Controls the physical memory backing the KV cache big buffer (sleep/wake_up M5).
 //
 // Attach mode: the buffer itself is allocated by BlockPool via torch::empty(kCUDA) (which the
 // preload shim intercepts at allocation time); the controller only records base_ptr/size and
@@ -80,7 +95,7 @@ private:
 // - basePtr() never changes across pause/resume (VA stability, constraint C2).
 // - pause/resume are idempotent: re-pausing while paused (or re-resuming while running) is a
 //   no-op that does not hit the backend and returns true.
-// - The caller (M1 FreezeLifecycleController sequence) guarantees the engine is drained before
+// - The caller (M1 SleepLifecycleController sequence) guarantees the engine is drained before
 //   pausePhysicalMemory(); after resumePhysicalMemory() the KV content is garbage and the
 //   caller must reset KV metadata (BlockPool::resetMetadata + BlockCache::clear).
 class KVCachePhysicalMemoryController {

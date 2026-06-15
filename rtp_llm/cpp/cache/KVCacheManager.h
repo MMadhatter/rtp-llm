@@ -90,16 +90,17 @@ public:
     size_t                  maxAvailableTokensNum() const;
     KVCacheInfo             getKVCacheInfo(int64_t latest_version, bool need_cache_keys) const;
 
-    // Freeze/resume (M5): physical KV memory pause/resume + metadata reset.
-    // pauseKVCacheMemory: releases the physical pages of the KV big buffer while keeping its VA.
-    //   The caller (M1 FreezeLifecycleController) must guarantee the engine is drained and
+    // Sleep/wake_up (M5): physical KV memory release/restore + metadata reset.
+    // releaseKVCacheMemoryBacking: releases the physical pages of the KV big buffer while keeping its VA.
+    //   The caller (M1 SleepLifecycleController) must guarantee the engine is drained and
     //   MRs are deregistered (M7) before calling.
-    // resumeKVCacheMemory: re-maps physical pages at the same VA (content discarded), then
-    //   resets all KV metadata: BlockPool::resetMetadata + BlockCache::clear (generation++).
+    // restoreKVCacheMemoryBackingAndResetMetadata: re-maps physical pages at the same VA
+    //   (content discarded), then resets all KV metadata: BlockPool::resetMetadata +
+    //   BlockCache::clear (generation++).
     //   device_kv_cache_valid bookkeeping is owned by M1. MemoryBlockCache is
     //   host-backed and survives the device KV reset; drained writes remain reusable.
-    bool pauseKVCacheMemory();
-    bool resumeKVCacheMemory();
+    bool releaseKVCacheMemoryBacking();
+    bool restoreKVCacheMemoryBackingAndResetMetadata();
 
     KVCachePhysicalMemoryControllerPtr kvMemoryController() const {
         return kv_memory_controller_;

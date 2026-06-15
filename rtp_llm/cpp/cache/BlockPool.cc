@@ -43,21 +43,23 @@ void BlockPool::initializeCacheBuffer() {
                                              torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
                                     .pin_memory();
     } else {
-        // Freeze/resume (M5): tag the KV big-buffer allocation so the torch_memory_saver
+        // Sleep/wake_up (M5): tag the KV big-buffer allocation so the torch_memory_saver
         // preload shim (when present) tracks it under "kv_cache" and can later
         // pause/resume its physical pages. Without the shim this is a no-op.
-        TmsBackend tms;
+        VmmBackend vmm_backend;
         const bool tagged =
-            tms.isAvailable() && tms.beginAllocationRegion(KVCachePhysicalMemoryController::kDefaultTag);
+            vmm_backend.isAvailable() && vmm_backend.beginAllocationRegion(KVCachePhysicalMemoryController::kDefaultTag);
         cache_aligned_buffer_ = torch::empty({static_cast<int64_t>(config_.total_size_bytes)},
                                              torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
         if (tagged) {
-            tms.endAllocationRegion();
+            vmm_backend.endAllocationRegion();
         }
         if (tagged) {
-            RTP_LLM_LOG_INFO("KV cache buffer (%zu bytes) allocated under tms tag '%s'",
+            RTP_LLM_LOG_INFO("KV cache buffer (%zu bytes) allocated under VMM tag '%s'",
                              config_.total_size_bytes,
                              KVCachePhysicalMemoryController::kDefaultTag);
+            VmmTagStatsRegistry::recordAllocation(KVCachePhysicalMemoryController::kDefaultTag,
+                                                  config_.total_size_bytes);
         }
     }
     cache_base_ptr_ = cache_aligned_buffer_.data_ptr();

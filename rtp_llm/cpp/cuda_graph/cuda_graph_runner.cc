@@ -13,12 +13,12 @@ namespace rtp_llm {
 
 namespace {
 
-constexpr const char* kCudaGraphTmsTag = "cuda_graph";
+constexpr const char* kCudaGraphVmmTag = "cuda_graph";
 
-class CudaGraphTmsRegionGuard {
+class CudaGraphVmmRegionGuard {
 public:
-    CudaGraphTmsRegionGuard() {
-        if (!tms_.isAvailable()) {
+    CudaGraphVmmRegionGuard() {
+        if (!vmm_backend_.isAvailable()) {
             return;
         }
         cuda_graph::graphEmptyCache();
@@ -26,23 +26,36 @@ public:
         // plan/workspace buffers. VMM pause may recycle the old physical pages,
         // so preserve their content unless every referenced buffer is proven to
         // be deterministically refilled before replay.
-        active_ = tms_.beginAllocationRegion(kCudaGraphTmsTag, true);
+        active_ = vmm_backend_.beginAllocationRegion(kCudaGraphVmmTag, true);
         if (active_) {
-            RTP_LLM_LOG_INFO("CUDA graph allocations are tagged under tms tag '%s'", kCudaGraphTmsTag);
+            pre_reserved_bytes_ = cuda_graph::graphReservedBytes();
+            RTP_LLM_LOG_INFO("CUDA graph allocations are tagged under VMM tag '%s'", kCudaGraphVmmTag);
         }
     }
 
-    ~CudaGraphTmsRegionGuard() {
+    ~CudaGraphVmmRegionGuard() {
         if (active_) {
-            tms_.endAllocationRegion();
+            vmm_backend_.endAllocationRegion();
+            const size_t post_reserved_bytes = cuda_graph::graphReservedBytes();
+            const size_t known_delta_bytes =
+                post_reserved_bytes > pre_reserved_bytes_ ? post_reserved_bytes - pre_reserved_bytes_ : 0;
+            if (known_delta_bytes > 0) {
+                VmmTagStatsRegistry::recordAllocation(kCudaGraphVmmTag, known_delta_bytes);
+            } else {
+                RTP_LLM_LOG_WARNING("CUDA graph VMM tag '%s' recorded zero known reserved-byte delta; "
+                                    "sleep can still pause the tag through torch_memory_saver, but known-byte "
+                                    "metrics cannot validate captured graph allocations for this run",
+                                    kCudaGraphVmmTag);
+            }
         }
     }
 
-    CudaGraphTmsRegionGuard(const CudaGraphTmsRegionGuard&)            = delete;
-    CudaGraphTmsRegionGuard& operator=(const CudaGraphTmsRegionGuard&) = delete;
+    CudaGraphVmmRegionGuard(const CudaGraphVmmRegionGuard&)            = delete;
+    CudaGraphVmmRegionGuard& operator=(const CudaGraphVmmRegionGuard&) = delete;
 
 private:
-    TmsBackend tms_;
+    VmmBackend vmm_backend_;
+    size_t     pre_reserved_bytes_{0};
     bool       active_{false};
 };
 
@@ -641,7 +654,7 @@ void CudaGraphRunner::initCapture() {
     c10::InferenceMode inference_guard(true);
 
     if (enable_cuda_graph_) {
-        CudaGraphTmsRegionGuard tms_region_guard;
+        CudaGraphVmmRegionGuard vmm_region_guard;
         RTP_LLM_LOG_INFO("CUDA graph capture is enabled");
         shared_graph_pool_ = cuda_graph::graphPoolHandle();
         if (is_prefill_cuda_graph_mode_) {
