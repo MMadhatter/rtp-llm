@@ -39,6 +39,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from rtp_llm.models_py.distributed import collective_torch
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather
 from rtp_llm.models_py.modules.dsv4._profiler import record_function_range
 from rtp_llm.ops.compute_ops import rtp_llm_ops
@@ -100,6 +101,11 @@ def _build_cp_full_state_read_cache(
     state_cache: torch.Tensor,
     block_table: torch.Tensor,
     cp_size: int,
+    *,
+    seq_start_per_req: Optional[torch.Tensor] = None,
+    token_count: int = 0,
+    state_tokens_per_block: int = 0,
+    workspace: Optional["PrefillWorkspace"] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Gather CP-sliced fixed-state blocks into a compact full-ring read cache.
 
@@ -118,44 +124,159 @@ def _build_cp_full_state_read_cache(
         raise RuntimeError("CP-sliced DSV4 state-cache read requires CUDA state pools")
 
     bt = block_table.to(device=state_cache.device, dtype=torch.long).contiguous()
-    rows = int(bt.numel())
-    if rows == 0:
+    table_rows = int(bt.numel())
+    if table_rows == 0:
         return state_cache, block_table
 
     local_eb = int(state_cache.shape[1])
     hidden = int(state_cache.shape[2])
-    flat_ids = bt.reshape(-1)
-    valid = flat_ids > 0
-    safe_ids = torch.where(valid, flat_ids, torch.zeros_like(flat_ids))
 
-    local_blocks = state_cache.index_select(0, safe_ids)
-    local_blocks = torch.where(
-        valid.view(rows, 1, 1),
-        local_blocks,
-        torch.zeros((), dtype=state_cache.dtype, device=state_cache.device),
+    needed = _cp_state_read_needed_mask(
+        bt,
+        seq_start_per_req=seq_start_per_req,
+        token_count=token_count,
+        state_tokens_per_block=state_tokens_per_block,
     )
+    if needed is None:
+        flat_ids = bt.reshape(-1)
+        valid = flat_ids > 0
+        needed_ids = flat_ids[valid]
+        inverse = torch.arange(
+            int(needed_ids.numel()), device=bt.device, dtype=torch.long
+        )
+        needed_valid = valid.view_as(bt)
+    else:
+        needed_valid = needed & (bt > 0)
+        needed_ids = bt[needed_valid]
+        if int(needed_ids.numel()) > 0:
+            needed_ids, inverse = torch.unique(
+                needed_ids, sorted=True, return_inverse=True
+            )
+        else:
+            inverse = torch.empty((0,), device=bt.device, dtype=torch.long)
 
-    gathered = all_gather(
-        local_blocks.reshape(rows * local_eb, hidden).contiguous(),
-        group=Group.TP,
-    )
-    full = (
-        gathered.view(cp_size, rows, local_eb, hidden)
-        .permute(1, 0, 2, 3)
-        .reshape(rows, cp_size * local_eb, hidden)
-        .contiguous()
-    )
+    num_blocks = int(needed_ids.numel())
+    read_bt = torch.zeros_like(bt)
+    if num_blocks == 0:
+        read_cache = _cp_state_read_cache_view(
+            workspace,
+            1,
+            cp_size * local_eb,
+            hidden,
+            state_cache.dtype,
+            state_cache.device,
+        )
+        read_cache.zero_()
+        return read_cache, read_bt.to(dtype=block_table.dtype)
 
-    zero = torch.zeros(
-        (1, cp_size * local_eb, hidden),
-        dtype=state_cache.dtype,
-        device=state_cache.device,
-    )
-    read_cache = torch.cat([zero, full], dim=0)
+    read_bt[needed_valid] = (inverse + 1).to(read_bt.dtype)
 
-    compact = torch.arange(1, rows + 1, device=bt.device, dtype=bt.dtype).view_as(bt)
-    read_bt = torch.where(bt > 0, compact, torch.zeros_like(compact))
+    local_blocks = state_cache.index_select(0, needed_ids)
+    local_2d = local_blocks.reshape(num_blocks * local_eb, hidden).contiguous()
+    gathered = _cp_state_read_all_gather(local_2d, cp_size, workspace)
+
+    read_cache = _cp_state_read_cache_view(
+        workspace,
+        num_blocks + 1,
+        cp_size * local_eb,
+        hidden,
+        state_cache.dtype,
+        state_cache.device,
+    )
+    read_cache[0].zero_()
+    dst = read_cache[1:].view(num_blocks, cp_size, local_eb, hidden)
+    src = gathered.view(cp_size, num_blocks, local_eb, hidden)
+    for rank in range(cp_size):
+        dst[:, rank].copy_(src[rank])
     return read_cache, read_bt.to(dtype=block_table.dtype)
+
+
+def _cp_state_read_needed_mask(
+    block_table: torch.Tensor,
+    *,
+    seq_start_per_req: Optional[torch.Tensor],
+    token_count: int,
+    state_tokens_per_block: int,
+) -> Optional[torch.Tensor]:
+    """Return the subset of state block-table cells the prefix read can touch.
+
+    For prefill, raw KV/score covers each request's current chunk. The fused
+    compressor only falls back to the state cache for prefix positions inside
+    the first boundary window, so the required cache region is the suffix
+    ``[seq_start - token_count + 1, seq_start)`` per request.
+
+    ``None`` means the caller should use the conservative full-table path.
+    """
+    if (
+        seq_start_per_req is None
+        or token_count <= 1
+        or state_tokens_per_block <= 0
+        or block_table.dim() != 2
+        or int(block_table.shape[1]) <= 0
+    ):
+        return None
+
+    device = block_table.device
+    B = min(int(block_table.shape[0]), int(seq_start_per_req.numel()))
+    if B <= 0:
+        return torch.zeros_like(block_table, dtype=torch.bool)
+
+    starts = seq_start_per_req[:B].to(device=device, dtype=torch.long).reshape(B)
+    suffix_len = int(token_count) - 1
+    offsets = torch.arange(suffix_len, device=device, dtype=torch.long)
+    positions = starts[:, None] - suffix_len + offsets[None, :]
+    valid = positions >= 0
+
+    max_blocks = int(block_table.shape[1])
+    cols = ((positions.clamp_min(0) // int(state_tokens_per_block)) % max_blocks).to(
+        torch.long
+    )
+    req = torch.arange(B, device=device, dtype=torch.long).view(B, 1).expand_as(cols)
+    needed = torch.zeros_like(block_table, dtype=torch.bool)
+    needed[req[valid], cols[valid]] = True
+    return needed
+
+
+def _cp_state_read_cache_view(
+    workspace: Optional["PrefillWorkspace"],
+    blocks: int,
+    ring_entries: int,
+    hidden: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if workspace is not None and hasattr(workspace, "state_read_cache"):
+        return workspace.state_read_cache(blocks, ring_entries, hidden, dtype)
+    return torch.empty((blocks, ring_entries, hidden), dtype=dtype, device=device)
+
+
+def _cp_state_read_all_gather(
+    local_2d: torch.Tensor,
+    cp_size: int,
+    workspace: Optional["PrefillWorkspace"],
+) -> torch.Tensor:
+    if (
+        workspace is not None
+        and hasattr(workspace, "state_read_gather")
+        and local_2d.is_cuda
+        and torch.distributed.is_initialized()
+    ):
+        gathered = workspace.state_read_gather(
+            cp_size * int(local_2d.shape[0]),
+            int(local_2d.shape[1]),
+            local_2d.dtype,
+        )
+        process_group = collective_torch._get_group(Group.TP)
+        world_size = torch.distributed.get_world_size(process_group)
+        if world_size != int(cp_size):
+            raise RuntimeError(
+                f"CP state-read gather world_size({world_size}) != cp_size({cp_size})"
+            )
+        torch.distributed.all_gather_into_tensor(
+            gathered, local_2d, group=process_group
+        )
+        return gathered
+    return all_gather(local_2d, group=Group.TP)
 
 
 def _cp_sliced_state_read_needed(
@@ -250,6 +371,7 @@ class _CompressorPending:
     out_dim: int
     profile_label: Optional[str] = None
     restored_buf: Optional[torch.Tensor] = None
+    workspace: Optional["PrefillWorkspace"] = None
 
 
 class _CompressorNorm(nn.Module):
@@ -359,6 +481,7 @@ class CompressorFP8(PoolBackedModule):
         self._state_tokens_per_block: int = 0
         self._cp_ctx: Optional[CPContext] = None
         self._cp_gather_stream: Optional[Any] = None
+        self._active_prefill_workspace: Optional["PrefillWorkspace"] = None
         self._kv_cache_sharded: bool = False
         self._profile_label: Optional[str] = None
         # MOEDBG: caller (Attention / IndexerFP8) sets this to a name
@@ -740,6 +863,12 @@ class CompressorFP8(PoolBackedModule):
                         self._state_pool_3d,
                         self._state_block_table,
                         int(self._cp_ctx.cp_size),
+                        seq_start_per_req=(
+                            meta.seq_start_per_req if use_varlen_raw else None
+                        ),
+                        token_count=(1 + int(self.overlap)) * self.compress_ratio,
+                        state_tokens_per_block=self._state_tokens_per_block,
+                        workspace=self._active_prefill_workspace,
                     )
                 )
 
@@ -891,6 +1020,7 @@ class CompressorFP8(PoolBackedModule):
             out_dim=out_dim,
             profile_label=profile_label,
             restored_buf=None,
+            workspace=workspace,
         )
 
     def wait_prefill_gather(self, pending: Optional[_CompressorPending]) -> None:
@@ -950,7 +1080,12 @@ class CompressorFP8(PoolBackedModule):
 
         seq_start = None if meta.is_batched else pending.sp
         with record_function_range("dsv4.fp8.compressor.prefill.launch"):
-            self._launch(kv_flat, score_flat, meta, seq_start=seq_start)
+            prev_workspace = self._active_prefill_workspace
+            self._active_prefill_workspace = pending.workspace
+            try:
+                self._launch(kv_flat, score_flat, meta, seq_start=seq_start)
+            finally:
+                self._active_prefill_workspace = prev_workspace
 
     # ----------------------------------------------------------------------
     # Forward (prefill)
@@ -1076,7 +1211,12 @@ class CompressorFP8(PoolBackedModule):
         # request. Legacy scalar metadata keeps the old ``seq_start`` path.
         seq_start = None if meta.is_batched else sp
         with record_function_range("dsv4.fp8.compressor.prefill.launch"):
-            self._launch(kv_flat, score_flat, meta, seq_start=seq_start)
+            prev_workspace = self._active_prefill_workspace
+            self._active_prefill_workspace = workspace
+            try:
+                self._launch(kv_flat, score_flat, meta, seq_start=seq_start)
+            finally:
+                self._active_prefill_workspace = prev_workspace
         return None
 
     # ----------------------------------------------------------------------

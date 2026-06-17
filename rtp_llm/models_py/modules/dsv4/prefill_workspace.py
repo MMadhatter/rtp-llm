@@ -32,6 +32,8 @@ allocator) and relies on the ``gather_stream.wait_stream`` edge for
 cross-layer ordering. See ``cp._CP_ROLE_*``.
 """
 
+from typing import Optional
+
 import torch
 
 # Default union-buffer alignment. Rounding every per-forward union block up to a
@@ -148,6 +150,8 @@ class PrefillWorkspace:
         union_bytes = max(self._q_bytes, cp_region_bytes)
         union_bytes = ((union_bytes + align - 1) // align) * align
         self._union = torch.empty(union_bytes, dtype=torch.uint8, device=device)
+        self._state_read_gather: Optional[torch.Tensor] = None
+        self._state_read_cache: Optional[torch.Tensor] = None
 
     def prefill_q(self, num_tokens: int) -> torch.Tensor:
         """``[num_tokens, q_dim]`` bf16 view at the front of the union buffer."""
@@ -232,6 +236,50 @@ class PrefillWorkspace:
             dim,
             dtype,
         )
+
+    def state_read_gather(
+        self, rows: int, dim: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Reusable ``[rows, dim]`` CP state-read all-gather scratch.
+
+        This buffer is lazy and separate from the main union region because the
+        state-read cache exists only for continuation-prefill's CP-sliced fixed
+        STATE read path. It is consumed on the default stream before the next
+        layer reuses it, and the whole workspace is freed at prefill-forward
+        exit.
+        """
+        rows = int(rows)
+        dim = int(dim)
+        numel = rows * dim
+        buf = self._state_read_gather
+        if (
+            buf is None
+            or buf.dtype != dtype
+            or buf.device != self._device
+            or int(buf.numel()) < numel
+        ):
+            buf = torch.empty(numel, dtype=dtype, device=self._device)
+            self._state_read_gather = buf
+        return buf[:numel].view(rows, dim)
+
+    def state_read_cache(
+        self, blocks: int, ring_entries: int, hidden: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Reusable compact fake STATE cache ``[blocks, ring_entries, hidden]``."""
+        blocks = int(blocks)
+        ring_entries = int(ring_entries)
+        hidden = int(hidden)
+        numel = blocks * ring_entries * hidden
+        buf = self._state_read_cache
+        if (
+            buf is None
+            or buf.dtype != dtype
+            or buf.device != self._device
+            or int(buf.numel()) < numel
+        ):
+            buf = torch.empty(numel, dtype=dtype, device=self._device)
+            self._state_read_cache = buf
+        return buf[:numel].view(blocks, ring_entries, hidden)
 
     def _cp_view(
         self,
