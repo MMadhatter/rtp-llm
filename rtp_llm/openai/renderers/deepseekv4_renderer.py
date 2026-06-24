@@ -45,6 +45,7 @@ _GRAMMAR_RESPONSE_FORMAT_TYPES = {
 }
 DSML_PREFIX = "<｜DSML｜"
 DSML_TOOL_CALLS_MARKER = f"{DSML_PREFIX}tool_calls>"
+DSML_REASONING_INTERRUPT_MARKERS = (DSML_TOOL_CALLS_MARKER,)
 
 
 def _dsv4_renderer_debug_enabled() -> bool:
@@ -64,13 +65,21 @@ def _preview_text(text: str, limit: int = 512) -> str:
     return f"{text[:half]}...[{len(text)} chars]...{text[-half:]}"
 
 
-def _split_reasoning_before_dsml(text: str) -> Optional[Tuple[str, str]]:
-    idx = text.find(DSML_TOOL_CALLS_MARKER)
-    if idx == -1:
+def _split_reasoning_before_marker(
+    text: str, markers: Tuple[str, ...]
+) -> Optional[Tuple[str, str]]:
+    marker_positions = [text.find(marker) for marker in markers]
+    marker_positions = [idx for idx in marker_positions if idx != -1]
+    if not marker_positions:
         return None
 
+    idx = min(marker_positions)
     reasoning_text = text[:idx].replace("<think>", "").replace("</think>", "").strip()
     return reasoning_text, text[idx:]
+
+
+def _split_reasoning_before_dsml(text: str) -> Optional[Tuple[str, str]]:
+    return _split_reasoning_before_marker(text, DSML_REASONING_INTERRUPT_MARKERS)
 
 
 def _split_content_left_in_reasoning(
@@ -669,7 +678,7 @@ class DeepseekV4Renderer(ReasoningToolBaseRenderer):
 
         think_start = getattr(detector, "think_start_token", "<think>")
         think_end = getattr(detector, "think_end_token", "</think>")
-        dsml_start = DSML_TOOL_CALLS_MARKER
+        interrupt_markers = DSML_REASONING_INTERRUPT_MARKERS
 
         detector._buffer += text
         current_text = detector._buffer
@@ -690,7 +699,7 @@ class DeepseekV4Renderer(ReasoningToolBaseRenderer):
                 detector._dsv4_after_think = False
 
             hold_len = _longest_suffix_prefix(
-                current_text, [think_start, think_end, dsml_start]
+                current_text, [think_start, think_end, *interrupt_markers]
             )
             if hold_len:
                 detector._buffer = current_text[-hold_len:]
@@ -699,8 +708,10 @@ class DeepseekV4Renderer(ReasoningToolBaseRenderer):
             return "", current_text
 
         end_idx = current_text.find(think_end)
-        dsml_idx = current_text.find(dsml_start)
-        if end_idx != -1 and (dsml_idx == -1 or end_idx < dsml_idx):
+        marker_positions = [current_text.find(marker) for marker in interrupt_markers]
+        marker_positions = [idx for idx in marker_positions if idx != -1]
+        interrupt_idx = min(marker_positions) if marker_positions else -1
+        if end_idx != -1 and (interrupt_idx == -1 or end_idx < interrupt_idx):
             reasoning_text = current_text[:end_idx].rstrip()
             normal_text = current_text[end_idx + len(think_end) :].lstrip()
             detector._buffer = ""
@@ -708,7 +719,7 @@ class DeepseekV4Renderer(ReasoningToolBaseRenderer):
             detector._dsv4_after_think = True
             return reasoning_text, normal_text
 
-        if dsml_idx != -1:
+        if interrupt_idx != -1:
             if _dsv4_renderer_debug_enabled():
                 logging.warning(
                     "[DeepSeekV4RendererDebug] implicit_think_end_before_dsml "
@@ -716,17 +727,17 @@ class DeepseekV4Renderer(ReasoningToolBaseRenderer):
                     _preview_text(current_text),
                 )
             reasoning_text = (
-                current_text[:dsml_idx]
+                current_text[:interrupt_idx]
                 .replace(think_start, "")
                 .replace(think_end, "")
                 .strip()
             )
-            normal_text = current_text[dsml_idx:]
+            normal_text = current_text[interrupt_idx:]
             detector._buffer = ""
             detector._in_reasoning = False
             return reasoning_text, normal_text
 
-        hold_len = _longest_suffix_prefix(current_text, [think_end, dsml_start])
+        hold_len = _longest_suffix_prefix(current_text, [think_end, *interrupt_markers])
         if getattr(detector, "stream_reasoning", True):
             if hold_len:
                 reasoning_text = current_text[:-hold_len]
