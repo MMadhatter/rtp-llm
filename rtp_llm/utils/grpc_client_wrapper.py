@@ -115,6 +115,17 @@ class GrpcClientWrapper:
         )
         self.expected_control_address_count = expected_control_address_count
         self._control_address_resolver = control_address_resolver
+        # NOTE: this lock only serializes sleep/wake_up coordination WITHIN this
+        # frontend process. There are multiple frontend server processes (see
+        # start_server.py), each with its own GrpcClientWrapper and its own lock,
+        # so it does NOT provide cross-process mutual exclusion. Cross-process
+        # correctness is enforced by the authoritative backend state machine
+        # (SleepLifecycleController: transition_mutex_ serializes each transition,
+        # sleep_epoch disambiguates, and illegal transitions are rejected with
+        # FAILED_PRECONDITION). Interleaved prepare/commit from two frontends
+        # therefore converge to either idempotent success or a clean precondition
+        # failure — never a corrupt/partially-released state. Do not treat this
+        # lock as the instance-wide lifecycle lock.
         self._lifecycle_lock = asyncio.Lock()
         self._dp_channels: Dict[str, Any] = {}
         self._dp_stubs: Dict[str, Any] = {}
@@ -508,11 +519,27 @@ class GrpcClientWrapper:
                 abort_results = await self._broadcast_control_rpc(
                     "WakeUpServing", pb2.WakeUpRequestPB(), timeout_s=60
                 )
+                abort_failures = [r for r in abort_results if "error" in r]
+                if abort_failures:
+                    # Prepare failed AND the rollback (wake_up abort) also failed on
+                    # some ranks. The instance is now in an unreconciled partial state
+                    # (some ranks may still be DRAINING with admission closed). Surface
+                    # BOTH sets of details and escalate — do NOT let the non-empty
+                    # prepare details short-circuit the abort failure out of the
+                    # response, or the control plane will believe only prepare failed
+                    # and never learn the rollback did not take.
+                    return {
+                        "error": "Failed to prepare sleep and failed to roll back on "
+                        "some control ranks; instance may be in an inconsistent state, "
+                        "issue wake_up or restart the process to recover",
+                        "grpc_status": "FAILED_PRECONDITION",
+                        "details": _error_details(prepare_results)
+                        + _error_details(abort_results),
+                    }
                 return {
-                    "error": "Failed to prepare sleep on some control ranks",
+                    "error": "Failed to prepare sleep on some control ranks (rolled back)",
                     "grpc_status": failures[0].get("grpc_status", "UNKNOWN"),
-                    "details": _error_details(prepare_results)
-                    or _error_details(abort_results),
+                    "details": _error_details(prepare_results),
                 }
 
             commit_results = await self._broadcast_control_rpc(
