@@ -436,7 +436,18 @@ absl::Status NormalEngine::runExecutorProcess(const std::list<GenerateStreamPtr>
 }
 
 bool NormalEngine::collectiveSleepQuiesceEnabled() const {
-    return sleep_controller_.effective() && parallelism_config.world_size > 1
+    // The decision whether step() performs the extra pause-wave all-reduce MUST be
+    // rank-symmetric: if it diverges across ranks, some ranks call execAllReduce
+    // while others don't and the collective deadlocks during *normal* serving, not
+    // just during sleep. So gate it on enabled() (the static enable_sleep_mode launch
+    // config, set in initRuntime() before startLoop() and identical on every rank),
+    // NOT on effective(): effective() folds in runtimeSupported(), a per-rank VMM
+    // availability flag that is set only after the loop thread has started
+    // (LocalRpcServer::installSleepHooks) and may legitimately differ across ranks.
+    // A rank without VMM support still participates in the quiesce collective (safe,
+    // it just no-ops the local memory release); a sleep request there fails cleanly
+    // with DISABLED and the coordinator aborts, rather than hanging the fleet.
+    return sleep_controller_.enabled() && parallelism_config.world_size > 1
            && (parallelism_config.dp_size > 1 || parallelism_config.ep_size > 1);
 }
 
@@ -594,6 +605,15 @@ absl::Status NormalEngine::step() {
     if (pause_.load(std::memory_order_acquire) && !collective_sleep_quiesce
         && (parallelism_config.tp_size <= 1 || parallelism_config.tp_rank == 0)) {
         enterPausedState();
+    }
+
+    // stop() wakes a paused loop by clearing pause_ (via restart()) with running_
+    // already false. Without this guard the woken loop would fall through to a
+    // real schedule()/execute step while the KV backing is still released
+    // (sleeping) -- for TP>1 that empty step also blocks in tpSyncModelInputs
+    // against ranks that have already torn down. Bail out promptly on shutdown.
+    if (!running_.load(std::memory_order_acquire)) {
+        return absl::OkStatus();
     }
 
     list<GenerateStreamPtr> streams;

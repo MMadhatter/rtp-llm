@@ -207,7 +207,8 @@ private:
     std::atomic<int64_t>    sleep_epoch_{0};
     std::atomic<bool>       enabled_{false};
     std::atomic<bool>       runtime_supported_{true};
-    // Lock ordering: transition_mutex_ -> status_mutex_. Never acquire in reverse.
+    // Lock ordering: transition_mutex_ -> hooks_mutex_ -> status_mutex_.
+    // Never acquire in reverse.
     std::mutex transition_mutex_;  // serializes sleep/wake_up + idempotency
 
     std::atomic<KvMemoryState> kv_memory_state_{KvMemoryState::ACTIVE};
@@ -218,7 +219,13 @@ private:
     std::string        last_error_;
     std::string        runtime_disabled_reason_;
 
-    SleepHooks hooks_;
+    // Guards hooks_. Transition paths read hooks_ under transition_mutex_ (which
+    // is mutually exclusive with setHooks), so they do not take this lock; it
+    // exists so status() can read the live-counter hooks off the transition path
+    // without racing a concurrent setHooks (std::function assignment is not
+    // atomic).
+    mutable std::mutex hooks_mutex_;
+    SleepHooks         hooks_;
 };
 
 }  // namespace rtp_llm

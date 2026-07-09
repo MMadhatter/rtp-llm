@@ -49,11 +49,22 @@ void BlockPool::initializeCacheBuffer() {
         VmmBackend vmm_backend;
         const bool tagged = vmm_backend.isAvailable()
                             && vmm_backend.beginAllocationRegion(KVCachePhysicalMemoryController::kDefaultTag);
+        // RAII: the shim's "interesting region" flag is process-global and thread-local.
+        // If torch::empty(kCUDA) throws (e.g. OOM), we MUST still leave the region, or every
+        // subsequent cudaMalloc process-wide gets mis-tagged as "kv_cache" and a later pause
+        // would release unrelated memory. endAllocationRegion() is idempotent enough to run
+        // on the normal path too (guarded by `tagged`).
+        struct AllocationRegionGuard {
+            VmmBackend* backend;
+            bool        active;
+            ~AllocationRegionGuard() {
+                if (active) {
+                    backend->endAllocationRegion();
+                }
+            }
+        } region_guard{&vmm_backend, tagged};
         cache_aligned_buffer_ = torch::empty({static_cast<int64_t>(config_.total_size_bytes)},
                                              torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
-        if (tagged) {
-            vmm_backend.endAllocationRegion();
-        }
         if (tagged) {
             RTP_LLM_LOG_INFO("KV cache buffer (%zu bytes) allocated under VMM tag '%s'",
                              config_.total_size_bytes,

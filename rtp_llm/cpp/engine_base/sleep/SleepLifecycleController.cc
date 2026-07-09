@@ -58,7 +58,11 @@ std::string kvMemoryStateToString(KvMemoryState state) {
 }
 
 void SleepLifecycleController::setHooks(const SleepHooks& hooks) {
-    std::lock_guard<std::mutex> lock(transition_mutex_);
+    // transition_mutex_ excludes concurrent transitions (which read hooks_);
+    // hooks_mutex_ additionally excludes status()'s off-transition counter reads.
+    // Order: transition_mutex_ -> hooks_mutex_.
+    std::lock_guard<std::mutex> transition_lock(transition_mutex_);
+    std::lock_guard<std::mutex> hooks_lock(hooks_mutex_);
     hooks_ = hooks;
 }
 
@@ -196,7 +200,11 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
 
     // --- DRAINING: wait for in-flight requests and cache transfers (M3). ---
     if (!opt.commit_only && hooks_.drain) {
-        if (!hooks_.drain(opt)) {
+        // Route through invokeHookNoThrow like every other hook: a throwing
+        // drain must not escape the transition while transition_mutex_ is held
+        // (it would leave the controller wedged in DRAINING with a poisoned
+        // mutex). An exception is treated as "not drained".
+        if (!invokeHookNoThrow("drain", hooks_.drain, opt)) {
             // Per design: graceful drain timeout keeps DRAINING and does NOT
             // release GPU. The controller stays in DRAINING; control plane can
             // retry sleep (idempotent) or escalate with mode=abort.
@@ -397,11 +405,22 @@ SleepStatus SleepLifecycleController::status() const {
     s.sleep_epoch           = sleep_epoch_.load(std::memory_order_acquire);
     s.kv_memory_state       = kvMemoryStateToString(kv_memory_state_.load(std::memory_order_acquire));
     s.device_kv_cache_valid = device_kv_cache_valid_.load(std::memory_order_acquire);
-    if (hooks_.activeRequestCount) {
-        s.active_request_count = hooks_.activeRequestCount();
+    // Copy the live-counter hooks under hooks_mutex_, then invoke the copies with
+    // the lock released (the hooks reach into engine counters and must not run
+    // under a controller mutex). Off the transition path, so we must not touch
+    // transition_mutex_ here (sleep()/wakeUp() call status() while holding it).
+    std::function<int64_t()> active_request_count_fn;
+    std::function<int64_t()> active_cache_transfer_count_fn;
+    {
+        std::lock_guard<std::mutex> hooks_lock(hooks_mutex_);
+        active_request_count_fn        = hooks_.activeRequestCount;
+        active_cache_transfer_count_fn = hooks_.activeCacheTransferCount;
     }
-    if (hooks_.activeCacheTransferCount) {
-        s.active_cache_transfer_count = hooks_.activeCacheTransferCount();
+    if (active_request_count_fn) {
+        s.active_request_count = active_request_count_fn();
+    }
+    if (active_cache_transfer_count_fn) {
+        s.active_cache_transfer_count = active_cache_transfer_count_fn();
     }
     if (s.state == SleepState::SLEEPING) {
         s.gpu_resource_state = "RELEASED";
