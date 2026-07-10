@@ -62,6 +62,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
 ENV_SWITCH: str = "ENABLE_SLEEP_MODE"
+ENV_LEVEL: str = "SLEEP_MODE_LEVEL"
 LEGACY_ENV_SWITCH: str = "RTP_LLM_WEIGHT_MEMORY_SAVER"
 WEIGHTS_TAG: str = "weights"
 
@@ -70,20 +71,29 @@ _tms: Optional[Any] = None
 _import_attempted: bool = False
 _paused: bool = False
 _enabled_override: Optional[bool] = None
+_level_override: Optional[int] = None
 _region_depth = threading.local()
 
 
-def configure_from_runtime(enable_sleep_mode: bool) -> None:
-    """Mirror parsed RuntimeConfig.enable_sleep_mode into this Python helper.
+def configure_from_runtime(
+    enable_sleep_mode: bool, sleep_mode_level: Optional[int] = None
+) -> None:
+    """Mirror parsed RuntimeConfig sleep fields into this Python helper.
 
     CLI arguments in RTP-LLM are bound to config objects and are not written
     back into os.environ. Weight allocation happens in Python before the C++
     sleep controller is exercised, so this explicit override keeps
-    ``--enable-sleep-mode`` and ``ENABLE_SLEEP_MODE=1`` equivalent.
+    ``--enable-sleep-mode`` / ``--sleep-mode-level`` and the corresponding env
+    vars equivalent. ``sleep_mode_level`` selects whether the weights region is
+    opened with host cpu_backup (level 1) or as discard-only (level 2); it is
+    frozen at allocation time by torch_memory_saver, so it cannot change per
+    /sleep request.
     """
-    global _enabled_override, _tms, _import_attempted, _paused
+    global _enabled_override, _level_override, _tms, _import_attempted, _paused
     with _lock:
         _enabled_override = bool(enable_sleep_mode)
+        if sleep_mode_level is not None:
+            _level_override = int(sleep_mode_level)
         if not _enabled_override:
             _tms = None
             _import_attempted = False
@@ -98,6 +108,32 @@ def is_enabled() -> bool:
         os.environ.get(ENV_SWITCH, "0") == "1"
         or os.environ.get(LEGACY_ENV_SWITCH, "0") == "1"
     )
+
+
+def sleep_mode_level() -> int:
+    """Startup-selected sleep level for this process (1 = host backup, 2 = discard).
+
+    Reads the explicit override first (set via :func:`configure_from_runtime`),
+    then the ``SLEEP_MODE_LEVEL`` env var (mirrored from the parsed runtime
+    config in server_args), defaulting to 1.
+    """
+    if _level_override is not None:
+        return _level_override
+    try:
+        return int(os.environ.get(ENV_LEVEL, "1"))
+    except (TypeError, ValueError):
+        return 1
+
+
+def is_discard_mode() -> bool:
+    """True when sleep mode is on and this process is configured for level 2.
+
+    In discard mode the weights region is opened without host cpu_backup, so a
+    sleep frees GPU *and* host memory; the C++ sleep hooks are responsible for
+    dumping weights to a local-disk raw backup before pause and reloading them
+    (in place) after resume.
+    """
+    return is_enabled() and sleep_mode_level() == 2
 
 
 def _get_tms() -> Optional[Any]:
@@ -211,9 +247,15 @@ def weights_region() -> Iterator[None]:
     except Exception:  # pragma: no cover - defensive, torch is a hard dep
         pass
 
+    # Level 1 backs weights up to pinned host on pause (fast wake, holds host
+    # RAM). Level 2 (discard mode) opens the region without host backup: pause
+    # frees GPU without a host copy and resume remaps blank pages at the same VA;
+    # the sleep hooks dump/reload the weights via a local-disk raw backup. tms
+    # freezes this choice at allocation time, hence it is a startup-level knob.
+    enable_cpu_backup = not is_discard_mode()
     _region_depth.value = 1
     try:
-        with tms.region(tag=WEIGHTS_TAG, enable_cpu_backup=True):
+        with tms.region(tag=WEIGHTS_TAG, enable_cpu_backup=enable_cpu_backup):
             yield
     finally:
         _region_depth.value = 0

@@ -609,7 +609,7 @@ message BatchGenerateOutputsPB {
 
 // Engine sleep/wake_up (distinct from SetPause/SetRestart semantics).
 message SleepRequestPB {
-    int32 level = 1;              // level=0 is defined but unimplemented; MVP supports level=1.
+    int32 level = 1;              // level=0 defined but unimplemented; 1=host backup, 2=discard weights + disk restore (fixed at startup by sleep_mode_level).
     string mode = 2;              // "wait" (default) | "abort"; "keep" is unsupported.
     int64 timeout_ms = 3;
     string reason = 4;

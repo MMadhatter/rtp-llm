@@ -1169,6 +1169,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("warm_up", &RuntimeConfig::warm_up)
         .def_readwrite("warm_up_with_loss", &RuntimeConfig::warm_up_with_loss)
         .def_readwrite("enable_sleep_mode", &RuntimeConfig::enable_sleep_mode)
+        .def_readwrite("sleep_mode_level", &RuntimeConfig::sleep_mode_level)
         .def_readwrite("use_batch_decode_scheduler", &RuntimeConfig::use_batch_decode_scheduler)
         .def_readwrite("model_name", &RuntimeConfig::model_name)
         .def_readwrite("worker_grpc_addrs", &RuntimeConfig::worker_grpc_addrs)
@@ -1199,14 +1200,18 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.model_name,
                                       self.worker_grpc_addrs,
                                       self.worker_addrs,
-                                      self.specify_gpu_arch);
+                                      self.specify_gpu_arch,
+                                      self.sleep_mode_level);
             },
             [](py::tuple t) {
-                if (t.size() != 12 && t.size() != 13)
+                if (t.size() != 12 && t.size() != 13 && t.size() != 14)
                     throw std::runtime_error("Invalid state!");
                 RuntimeConfig c;
                 try {
-                    const bool has_sleep_mode = t.size() == 13;
+                    // Backward compat: size 12 = pre-sleep, 13 = +enable_sleep_mode,
+                    // 14 = +sleep_mode_level (appended at the end).
+                    const bool has_sleep_mode       = t.size() >= 13;
+                    const bool has_level            = t.size() == 14;
                     c.max_generate_batch_size       = t[0].cast<int64_t>();
                     c.max_block_size_per_item       = t[1].cast<int64_t>();
                     c.reserve_runtime_mem_mb        = t[2].cast<int64_t>();
@@ -1221,6 +1226,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.worker_grpc_addrs             = t[9 + offset].cast<std::vector<std::string>>();
                     c.worker_addrs                  = t[10 + offset].cast<std::vector<std::string>>();
                     c.specify_gpu_arch              = t[11 + offset].cast<std::string>();
+                    c.sleep_mode_level              = has_level ? t[12 + offset].cast<int64_t>() : 1;
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("RuntimeConfig unpickle error: ") + e.what());
                 }

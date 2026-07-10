@@ -107,6 +107,49 @@ TEST(SleepLifecycleControllerTest, LevelZeroIsDefinedButUnimplemented) {
     EXPECT_EQ(controller.status().supported_levels, std::vector<int32_t>{1});
 }
 
+TEST(SleepLifecycleControllerTest, DefaultModeRejectsLevelTwo) {
+    SleepLifecycleController controller(true);
+    auto                     opt = gracefulOptions();
+    opt.level                    = 2;
+
+    const auto result = controller.sleep(opt);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.code, SleepResult::Code::INVALID_ARGUMENT);
+    EXPECT_NE(result.message.find("level=2"), std::string::npos);
+    EXPECT_EQ(controller.state(), SleepState::RUNNING);
+    EXPECT_EQ(controller.status().supported_levels, std::vector<int32_t>{1});
+}
+
+TEST(SleepLifecycleControllerTest, DiscardModeSupportsLevelTwo) {
+    SleepLifecycleController controller(true);
+    controller.setDiscardWeights(true);
+
+    EXPECT_TRUE(controller.discardWeights());
+    EXPECT_EQ(controller.status().supported_levels, std::vector<int32_t>{2});
+
+    auto opt          = gracefulOptions();
+    opt.level         = 2;
+    const auto result = controller.sleep(opt);
+    EXPECT_TRUE(result.ok) << result.message;
+    EXPECT_EQ(controller.state(), SleepState::SLEEPING);
+    EXPECT_EQ(controller.activeSleepLevel(), 2);
+}
+
+TEST(SleepLifecycleControllerTest, DiscardModeRejectsLevelOne) {
+    SleepLifecycleController controller(true);
+    controller.setDiscardWeights(true);
+
+    auto opt          = gracefulOptions();
+    opt.level         = 1;
+    const auto result = controller.sleep(opt);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.code, SleepResult::Code::INVALID_ARGUMENT);
+    EXPECT_NE(result.message.find("level=1"), std::string::npos);
+    EXPECT_EQ(controller.state(), SleepState::RUNNING);
+}
+
 TEST(SleepLifecycleControllerTest, WakeUpFromSleepingReachesRunning) {
     SleepLifecycleController controller(true);
     ASSERT_TRUE(controller.sleep(gracefulOptions()).ok);

@@ -453,12 +453,15 @@ class GrpcClientWrapper:
                 return {
                     "error": "sleep level=0 state-preserving sleep is defined but not implemented",
                     "grpc_status": "UNIMPLEMENTED",
-                    "supported_levels": [1],
                     "supported_modes": ["wait", "abort"],
                 }
-            if level != 1:
+            # level 1 (host backup) and level 2 (discard weights) are both valid
+            # requests; the backend is the authority on which one this process
+            # supports (fixed at startup by sleep_mode_level) and returns
+            # INVALID_ARGUMENT on a mismatch.
+            if level not in (1, 2):
                 return {
-                    "error": "sleep level must be 0 or 1",
+                    "error": "sleep level must be 0, 1 or 2",
                     "grpc_status": "INVALID_ARGUMENT",
                 }
             mode = str(req.get("mode", "wait"))
@@ -542,8 +545,12 @@ class GrpcClientWrapper:
                     "details": _error_details(prepare_results),
                 }
 
+            # commit runs the GPU-release hooks; for level-2 that includes dumping
+            # the ~weights-sized raw backup to disk, which can take far longer than
+            # a level-1 tms pause. Reuse the drain-derived headroom so a slow dump
+            # does not spuriously trip the commit deadline.
             commit_results = await self._broadcast_control_rpc(
-                "SleepServing", commit_request, timeout_s=60
+                "SleepServing", commit_request, timeout_s
             )
             failures = [result for result in commit_results if "error" in result]
             if failures:
@@ -620,8 +627,12 @@ class GrpcClientWrapper:
                     "details": _error_details(prepare_results),
                 }
 
+            # commit runs the GPU-restore hooks; for level-2 that includes reloading
+            # the ~weights-sized raw backup from disk (read + H2D copy), which can
+            # take far longer than a level-1 tms resume. Give it the same headroom
+            # as wake prepare so a slow restore does not trip the commit deadline.
             commit_results = await self._broadcast_control_rpc(
-                "WakeUpServing", commit_request, timeout_s=60
+                "WakeUpServing", commit_request, timeout_s=600
             )
             failures = [result for result in commit_results if "error" in result]
             if failures:

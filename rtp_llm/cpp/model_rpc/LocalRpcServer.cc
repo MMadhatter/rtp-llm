@@ -266,7 +266,7 @@ void LocalRpcServer::installSleepHooks() {
     // the physical pages can be recycled by other processes, so graph-owned
     // persistent buffers cannot rely on stale physical contents. Releasing an
     // unknown tag is a harmless no-op.
-    hooks.releaseRestorableGpuMemory = [this, vmm_backend, local_rank](const SleepOptions&) {
+    hooks.releaseRestorableGpuMemory = [this, vmm_backend, local_rank](const SleepOptions& opt) {
         OptionalSleepDeviceGuard device_guard(local_rank);
         if (!vmm_backend->isAvailable()) {
             RTP_LLM_LOG_WARNING("releaseRestorableGpuMemory skipped: VMM backend unavailable");
@@ -278,6 +278,24 @@ void LocalRpcServer::installSleepHooks() {
             reportSleepVmmOpTime("pause", tag, begin_time_us);
             return success;
         };
+        // Level 2 (discard weights): the "weights" region was opened without host
+        // cpu_backup, so pause frees GPU with no host copy. Dump the live weights
+        // to a local-disk raw backup first (idempotent) so wake can reload them.
+        if (opt.level == 2) {
+            if (weight_manager_.is_none()) {
+                RTP_LLM_LOG_WARNING("level-2 sleep: weight_manager unavailable, cannot dump weights");
+                return false;
+            }
+            const auto dump_begin_us = currentTimeUs();
+            try {
+                py::gil_scoped_acquire acquire;
+                weight_manager_.attr("dump_raw_backup")();
+            } catch (const py::error_already_set& e) {
+                RTP_LLM_LOG_WARNING("level-2 sleep: dump_raw_backup failed: %s", e.what());
+                return false;
+            }
+            reportSleepVmmOpTime("dump", "weights", dump_begin_us);
+        }
         bool ok = pause_tag("cuda_graph");
         ok      = pause_tag("weights") && ok;
         return ok;
@@ -298,7 +316,7 @@ void LocalRpcServer::installSleepHooks() {
         reportSleepVmmOpTime("resume", controller->tag(), begin_time_us);
         return success;
     };
-    hooks.restoreRestorableGpuMemory = [this, vmm_backend, local_rank]() {
+    hooks.restoreRestorableGpuMemory = [this, engine, vmm_backend, local_rank]() {
         OptionalSleepDeviceGuard device_guard(local_rank);
         if (!vmm_backend->isAvailable()) {
             return true;
@@ -309,8 +327,27 @@ void LocalRpcServer::installSleepHooks() {
             reportSleepVmmOpTime("resume", tag, begin_time_us);
             return success;
         };
+        // resume("weights") remaps physical pages at the same VA. For level 1 the
+        // tms host cpu_backup already restored the content; for level 2 the pages
+        // come back blank, so reload the weights in place from the disk backup
+        // (copy_ preserves data_ptr, keeping C++ aliases and CUDA graphs valid).
         bool ok = resume_tag("weights");
-        ok      = resume_tag("cuda_graph") && ok;
+        if (ok && engine->sleepController().activeSleepLevel() == 2) {
+            if (weight_manager_.is_none()) {
+                RTP_LLM_LOG_WARNING("level-2 wake: weight_manager unavailable, cannot restore weights");
+                return false;
+            }
+            const auto restore_begin_us = currentTimeUs();
+            try {
+                py::gil_scoped_acquire acquire;
+                weight_manager_.attr("restore_raw_backup")();
+            } catch (const py::error_already_set& e) {
+                RTP_LLM_LOG_WARNING("level-2 wake: restore_raw_backup failed: %s", e.what());
+                return false;
+            }
+            reportSleepVmmOpTime("restore", "weights", restore_begin_us);
+        }
+        ok = resume_tag("cuda_graph") && ok;
         return ok;
     };
     hooks.registerMr = [this, engine, local_rank]() {

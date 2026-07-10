@@ -119,6 +119,18 @@ bool SleepLifecycleController::enabled() const {
     return enabled_.load(std::memory_order_acquire);
 }
 
+void SleepLifecycleController::setDiscardWeights(bool discard) {
+    discard_weights_.store(discard, std::memory_order_release);
+}
+
+bool SleepLifecycleController::discardWeights() const {
+    return discard_weights_.load(std::memory_order_acquire);
+}
+
+int32_t SleepLifecycleController::activeSleepLevel() const {
+    return active_sleep_level_.load(std::memory_order_acquire);
+}
+
 void SleepLifecycleController::setRuntimeSupport(bool supported, const std::string& disabled_reason) {
     runtime_supported_.store(supported, std::memory_order_release);
     {
@@ -159,13 +171,22 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
     if (opt.prepare_only && opt.commit_only) {
         return SleepResult::invalidArgument("sleep rejected: prepare_only and commit_only cannot both be true");
     }
+    // torch_memory_saver binds the weights region's cpu_backup at model-load
+    // time, so this process supports exactly one non-zero level, selected at
+    // startup: 2 (discard weights) when sleep_mode_level=2, otherwise 1 (host
+    // backup). A request must match it.
+    const int32_t configured_level = discard_weights_.load(std::memory_order_acquire) ? 2 : 1;
     if (opt.level == 0) {
         return SleepResult::unimplemented(
-            "sleep rejected: level=0 state-preserving sleep is defined but not implemented; supported_levels=[1]");
+            "sleep rejected: level=0 state-preserving sleep is defined but not implemented; supported_levels=["
+            + std::to_string(configured_level) + "]");
     }
-    if (opt.level != 1) {
-        return SleepResult::invalidArgument("sleep rejected: unknown level=" + std::to_string(opt.level)
-                                            + "; supported_levels=[1], defined_unimplemented_levels=[0]");
+    if (opt.level != configured_level) {
+        return SleepResult::invalidArgument(
+            "sleep rejected: level=" + std::to_string(opt.level)
+            + " does not match this process's startup sleep_mode_level=" + std::to_string(configured_level)
+            + " (torch_memory_saver fixes the weights backup mode at load time); supported_levels=["
+            + std::to_string(configured_level) + "]");
     }
     if (opt.mode != "wait" && opt.mode != "abort") {
         return SleepResult::invalidArgument("sleep rejected: mode must be \"wait\" or \"abort\"");
@@ -193,6 +214,9 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
     if (current == SleepState::RUNNING) {
         sleep_epoch_.fetch_add(1, std::memory_order_acq_rel);
         engine_quiesced_.store(false, std::memory_order_release);
+        // Record the level of this sleep so the wake_up restore hook knows
+        // whether to reload discarded weights (level 2) or not (level 1).
+        active_sleep_level_.store(opt.level, std::memory_order_release);
         if (!transitionLocked(SleepState::RUNNING, SleepState::DRAINING)) {
             return SleepResult::failedPrecondition(status().last_error);
         }
@@ -396,9 +420,12 @@ SleepResult SleepLifecycleController::wakeUp(const WakeUpOptions& opt) {
 
 SleepStatus SleepLifecycleController::status() const {
     SleepStatus s;
-    s.sleep_mode_enabled    = enabled();
-    s.effective             = effective();
-    s.supported_levels      = s.effective ? std::vector<int32_t>{1} : std::vector<int32_t>{};
+    s.sleep_mode_enabled = enabled();
+    s.effective          = effective();
+    // This process supports exactly one non-zero level, fixed at startup by
+    // sleep_mode_level (2 = discard weights, else 1); see sleep() gate.
+    const int32_t configured_level = discard_weights_.load(std::memory_order_acquire) ? 2 : 1;
+    s.supported_levels             = s.effective ? std::vector<int32_t>{configured_level} : std::vector<int32_t>{};
     s.supported_modes       = s.effective ? std::vector<std::string>{"wait", "abort"} : std::vector<std::string>{};
     s.disabled_reason       = s.effective ? "" : disabledReason();
     s.state                 = state_.load(std::memory_order_acquire);

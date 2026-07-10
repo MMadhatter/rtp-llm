@@ -21,6 +21,9 @@ def register_sleep_routes(app: FastAPI, grpc_client: Any) -> None:
     # request format (all fields optional):
     #   {"level": 1, "mode": "wait"|"abort", "timeout_ms": 30000, "reason": "...", "tags": []}
     # level=0 is a defined state-preserving sleep level, but is currently unimplemented.
+    # level=1 (host backup) and level=2 (discard weights + disk restore) are both
+    # accepted here; which one this process supports is fixed at startup by
+    # sleep_mode_level, and the backend returns INVALID_ARGUMENT on a mismatch.
     @app.post("/sleep")
     async def sleep(req: Optional[Dict[Any, Any]] = Body(None)):
         req = req or {}
@@ -39,10 +42,10 @@ def register_sleep_routes(app: FastAPI, grpc_client: Any) -> None:
                 status_code=400,
                 content={"error": "sleep level and timeout_ms must be integers"},
             )
-        if level not in (0, 1):
+        if level not in (0, 1, 2):
             return ORJSONResponse(
                 status_code=400,
-                content={"error": "sleep level must be 0 or 1"},
+                content={"error": "sleep level must be 0, 1 or 2"},
             )
         mode = req.get("mode", "wait")
         if mode not in ("wait", "abort"):

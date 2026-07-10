@@ -159,6 +159,18 @@ public:
     void setEnabled(bool enabled);
     bool enabled() const;
 
+    // Startup-selected sleep level for this process (see RuntimeConfig
+    // sleep_mode_level). Must be called before sleep()/wakeUp(). level==2 is the
+    // discard-weights mode: the weights VMM region was opened without host
+    // cpu_backup, so sleep frees GPU+host and wake reloads from a disk backup.
+    // This is fixed at model-load time by torch_memory_saver and cannot change
+    // per request, so a /sleep request's level must match it.
+    void setDiscardWeights(bool discard);
+    bool discardWeights() const;
+    // Level captured on the RUNNING->DRAINING transition of the active sleep,
+    // read by the wake_up restore hook to decide whether to reload weights.
+    int32_t activeSleepLevel() const;
+
     // Runtime capability gate. enable_sleep_mode may be set while a required
     // implementation detail (for example the torch_memory_saver preload shim)
     // is unavailable; in that case status().effective is false so the control
@@ -207,6 +219,10 @@ private:
     std::atomic<int64_t>    sleep_epoch_{0};
     std::atomic<bool>       enabled_{false};
     std::atomic<bool>       runtime_supported_{true};
+    // True when this process was started in discard-weights (level 2) mode.
+    std::atomic<bool> discard_weights_{false};
+    // Level of the in-progress/last sleep, captured at RUNNING->DRAINING.
+    std::atomic<int32_t> active_sleep_level_{0};
     // Lock ordering: transition_mutex_ -> hooks_mutex_ -> status_mutex_.
     // Never acquire in reverse.
     std::mutex transition_mutex_;  // serializes sleep/wake_up + idempotency
