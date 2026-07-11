@@ -1,8 +1,13 @@
 #include <algorithm>
 #include <memory>
 #include <chrono>
+#include <cstdio>
+#include <fstream>
 #include <optional>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 #include <unistd.h>
 #include <c10/core/InferenceMode.h>
 #if USING_CUDA
@@ -80,6 +85,76 @@ bool synchronizeSleepDevice(const char* stage) {
     (void)stage;
 #endif
     return true;
+}
+
+// Parse selected "Key:  <value> kB" lines from a /proc file (/proc/self/status or
+// /proc/meminfo). Returns MiB for each requested key; a key that is missing (or the
+// file unreadable) stays -1. Best-effort: never throws.
+std::unordered_map<std::string, long> readProcMemKb(const char* path, const std::vector<std::string>& keys) {
+    std::unordered_map<std::string, long> out;
+    for (const auto& k : keys) {
+        out[k] = -1;
+    }
+    std::ifstream fin(path);
+    if (!fin.is_open()) {
+        return out;
+    }
+    std::string line;
+    while (std::getline(fin, line)) {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, colon);
+        auto              it  = out.find(key);
+        if (it == out.end()) {
+            continue;
+        }
+        // value is like "  12345 kB"; extract the first integer -> MiB.
+        long value_kb = 0;
+        if (sscanf(line.c_str() + colon + 1, "%ld", &value_kb) == 1) {
+            it->second = value_kb / 1024;
+        }
+    }
+    return out;
+}
+
+// Log a detailed one-line memory snapshot (GPU + process pinned/RSS + system) tagged by
+// `phase`, so a full sleep/wake cycle leaves a grep-able "[SleepMem]" trail in engine.log.
+// Runs only on the sleep/wake hook path (already gated by sleep mode). No config toggle.
+// - GPU: getGpuExecStatus() (cudaMemGetInfo on the current device; hip on ROCm).
+// - process /proc/self/status: VmRSS (resident), VmHWM (peak), VmLck (mlock'd),
+//   VmPin (kernel-pinned pages, e.g. RDMA ibv_reg_mr).
+// - system /proc/meminfo: MemAvailable (reclaim-aware; the ONLY signal for cudaHostAlloc
+//   pinned host RAM such as level-1 weight backup / memory-cache buffer), MemFree,
+//   Mlocked, Cached.
+void logSleepMemorySnapshot(const std::string& phase, int local_rank) {
+    size_t gpu_used_mb = 0, gpu_free_mb = 0, gpu_total_mb = 0;
+    {
+        OptionalSleepDeviceGuard device_guard(local_rank);
+        const auto               mem = getGpuExecStatus().device_memory_status;
+        gpu_used_mb                  = mem.used_bytes / 1024 / 1024;
+        gpu_free_mb                  = mem.free_bytes / 1024 / 1024;
+        gpu_total_mb                 = (mem.used_bytes + mem.free_bytes) / 1024 / 1024;
+    }
+    const auto proc = readProcMemKb("/proc/self/status", {"VmRSS", "VmHWM", "VmLck", "VmPin"});
+    const auto sys  = readProcMemKb("/proc/meminfo", {"MemAvailable", "MemFree", "Mlocked", "Cached"});
+    RTP_LLM_LOG_INFO("[SleepMem][%s] rank=%d gpu_used=%zuMiB gpu_free=%zuMiB gpu_total=%zuMiB "
+                     "| proc VmRSS=%ldMiB VmHWM=%ldMiB VmLck=%ldMiB VmPin=%ldMiB "
+                     "| sys MemAvailable=%ldMiB MemFree=%ldMiB Mlocked=%ldMiB Cached=%ldMiB",
+                     phase.c_str(),
+                     local_rank,
+                     gpu_used_mb,
+                     gpu_free_mb,
+                     gpu_total_mb,
+                     proc.at("VmRSS"),
+                     proc.at("VmHWM"),
+                     proc.at("VmLck"),
+                     proc.at("VmPin"),
+                     sys.at("MemAvailable"),
+                     sys.at("MemFree"),
+                     sys.at("Mlocked"),
+                     sys.at("Cached"));
 }
 
 grpc::Status sleepResultToGrpcStatus(const SleepResult& result) {
@@ -233,6 +308,8 @@ void LocalRpcServer::installSleepHooks() {
             reportSleepMrOpTime("dereg", begin_time_us);
             return success;
         };
+        // Baseline before any resource is dropped: MR-pinned (VmPin) + KV + weights all live.
+        logSleepMemorySnapshot("sleep/RUNNING", local_rank);
         if (!synchronizeSleepDevice("before_dereg_mr")) {
             return finish(false);
         }
@@ -242,6 +319,8 @@ void LocalRpcServer::installSleepHooks() {
         if (!synchronizeSleepDevice("after_dereg_mr")) {
             return finish(false);
         }
+        // MR deregistered: VmPin should have collapsed relative to the baseline above.
+        logSleepMemorySnapshot("sleep/after_dereg_mr", local_rank);
         return finish(true);
     };
     hooks.releaseKvMemoryBacking = [this, engine, local_rank](const SleepOptions&) {
@@ -268,6 +347,9 @@ void LocalRpcServer::installSleepHooks() {
         const auto begin_time_us = currentTimeUs();
         const bool success       = cache_manager->releaseKVCacheMemoryBacking();
         reportSleepVmmOpTime("pause", controller->tag(), begin_time_us);
+        // Memory-cache pinned host buffer + GPU KV released here: watch sys MemAvailable
+        // (host pinned) rise and gpu_free rise.
+        logSleepMemorySnapshot("sleep/after_kv_release", local_rank);
         return success;
     };
     // M6: weights are tagged by rtp_llm/model_loader/weight_memory_saver.py under
@@ -308,6 +390,8 @@ void LocalRpcServer::installSleepHooks() {
         }
         bool ok = pause_tag("cuda_graph");
         ok      = pause_tag("weights") && ok;
+        // Terminal sleep state: weights + cuda_graph GPU memory released (level-2 dumped to disk).
+        logSleepMemorySnapshot("sleep/SLEEPING", local_rank);
         return ok;
     };
     hooks.restoreKvMemoryBackingAndResetMetadata = [this, engine, local_rank]() {
@@ -332,6 +416,7 @@ void LocalRpcServer::installSleepHooks() {
         const auto begin_time_us = currentTimeUs();
         const bool success       = cache_manager->restoreKVCacheMemoryBackingAndResetMetadata();
         reportSleepVmmOpTime("resume", controller->tag(), begin_time_us);
+        logSleepMemorySnapshot("wake/after_kv_restore", local_rank);
         return success;
     };
     hooks.restoreRestorableGpuMemory = [this, engine, vmm_backend, local_rank]() {
@@ -366,6 +451,8 @@ void LocalRpcServer::installSleepHooks() {
             reportSleepVmmOpTime("restore", "weights", restore_begin_us);
         }
         ok = resume_tag("cuda_graph") && ok;
+        // Weights (level-1 host restore / level-2 disk reload) + cuda_graph GPU memory back.
+        logSleepMemorySnapshot("wake/after_weights_restore", local_rank);
         return ok;
     };
     hooks.registerMr = [this, engine, local_rank]() {
@@ -384,6 +471,8 @@ void LocalRpcServer::installSleepHooks() {
         // Internal RDMA backends must publish refreshed rkey/lkey/epoch here
         // before the engine loop restarts. The open-source CacheStore path has
         // no peer-visible MR epoch ABI; regUserMr() is the available boundary.
+        // Fully restored: MR re-registered, VmPin should be back at the baseline.
+        logSleepMemorySnapshot("wake/RUNNING", local_rank);
         return finish(true);
     };
     hooks.restartEngine = [engine]() {
