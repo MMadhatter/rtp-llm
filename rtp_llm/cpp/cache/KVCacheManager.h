@@ -102,6 +102,14 @@ public:
     bool releaseKVCacheMemoryBacking();
     bool restoreKVCacheMemoryBackingAndResetMetadata();
 
+    // Sleep/wake_up (M7): discard / reallocate the host memory-cache (enable_memory_cache)
+    // pinned buffer. This tier is plain pinned host RAM (not under any VMM tag, not MR-
+    // registered), so it needs an explicit free + reallocate independent of the GPU KV
+    // VMM pause/resume above. Delegates to the connector coordinator; no-op when the
+    // memory cache is disabled. Runs on every sleep level.
+    bool releaseMemoryCacheBacking();
+    bool restoreMemoryCacheBacking();
+
     KVCachePhysicalMemoryControllerPtr kvMemoryController() const {
         return kv_memory_controller_;
     }

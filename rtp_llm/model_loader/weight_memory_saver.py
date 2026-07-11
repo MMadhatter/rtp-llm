@@ -125,17 +125,6 @@ def sleep_mode_level() -> int:
         return 1
 
 
-def is_discard_mode() -> bool:
-    """True when sleep mode is on and this process is configured for level 2.
-
-    In discard mode the weights region is opened without host cpu_backup, so a
-    sleep frees GPU *and* host memory; the C++ sleep hooks are responsible for
-    dumping weights to a local-disk raw backup before pause and reloading them
-    (in place) after resume.
-    """
-    return is_enabled() and sleep_mode_level() == 2
-
-
 def _get_tms() -> Optional[Any]:
     """Lazily import and cache the torch_memory_saver singleton.
 
@@ -248,11 +237,11 @@ def weights_region() -> Iterator[None]:
         pass
 
     # Level 1 backs weights up to pinned host on pause (fast wake, holds host
-    # RAM). Level 2 (discard mode) opens the region without host backup: pause
-    # frees GPU without a host copy and resume remaps blank pages at the same VA;
-    # the sleep hooks dump/reload the weights via a local-disk raw backup. tms
-    # freezes this choice at allocation time, hence it is a startup-level knob.
-    enable_cpu_backup = not is_discard_mode()
+    # RAM). Level 2 opens the region without host backup: pause frees GPU without
+    # a host copy and resume remaps blank pages at the same VA; the sleep hooks
+    # dump/reload the weights via a local-disk raw backup. tms freezes this
+    # choice at allocation time, hence it is a startup-level knob.
+    enable_cpu_backup = sleep_mode_level() != 2
     _region_depth.value = 1
     try:
         with tms.region(tag=WEIGHTS_TAG, enable_cpu_backup=enable_cpu_backup):

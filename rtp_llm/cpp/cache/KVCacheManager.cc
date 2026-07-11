@@ -467,6 +467,20 @@ bool KVCacheManager::restoreKVCacheMemoryBackingAndResetMetadata() {
     return true;
 }
 
+bool KVCacheManager::releaseMemoryCacheBacking() {
+    if (!coordinator_) {
+        return true;  // no connector coordinator -> memory cache not enabled
+    }
+    return coordinator_->releaseMemoryCacheBacking();
+}
+
+bool KVCacheManager::restoreMemoryCacheBacking() {
+    if (!coordinator_) {
+        return true;
+    }
+    return coordinator_->restoreMemoryCacheBacking();
+}
+
 // 系统资源管理
 
 void KVCacheManager::regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store) {

@@ -4,6 +4,7 @@ import glob
 import logging
 import os
 import re
+import shutil
 import threading
 from collections import OrderedDict
 from typing import Any, Mapping
@@ -303,27 +304,42 @@ class WeightManager:
     def _l2_backup_dir(self) -> str:
         """Resolve the per-process local-disk directory for level-2 raw backups.
 
-        Defaults to ``/tmp/rtp_llm_sleep_l2/<pid>`` (local NVMe on typical
-        deployments). ``SLEEP_L2_BACKUP_DIR`` overrides it. Warns when the path
-        resolves onto a tmpfs/ramfs mount, since that keeps the weights in host
-        RAM and defeats the point of discarding them.
+        The base comes from ``--sleep_l2_backup_dir`` / ``SLEEP_L2_BACKUP_DIR``
+        (should be local NVMe/SSD; the dump can be hundreds of GB or, for very
+        large models, ~1 TB). When unset it falls back to ``/tmp/rtp_llm_sleep_l2``
+        with a warning. A per-``<pid>`` subdirectory is always appended so
+        co-located instances (prefill + decode on one node, or multiple rank
+        workers sharing one configured base) never collide — their live tensors
+        differ but the rank tag can be identical. The whole per-pid dir is
+        discarded after a successful wake (see :meth:`restore_raw_backup`), so no
+        permanent copy is left on disk.
+
+        Warns when the path resolves onto a tmpfs/ramfs mount, since that keeps
+        the weights in host RAM and defeats the point of discarding them.
         """
         base = os.environ.get("SLEEP_L2_BACKUP_DIR", "").strip()
         if not base:
-            base = f"/tmp/rtp_llm_sleep_l2/{os.getpid()}"
+            base = "/tmp/rtp_llm_sleep_l2"
+            logging.warning(
+                "SLEEP_L2_BACKUP_DIR is not set; falling back to %s for level-2 "
+                "weight backup. Point --sleep_l2_backup_dir at a local NVMe/SSD "
+                "path with enough free space (dump size ~= weight size).",
+                base,
+            )
+        out_dir = os.path.join(base, str(os.getpid()))
         try:
-            fstype = self._filesystem_type(base)
+            fstype = self._filesystem_type(out_dir)
             if fstype in ("tmpfs", "ramfs"):
                 logging.warning(
-                    "SLEEP_L2_BACKUP_DIR=%s resolves to a %s (RAM-backed) mount; "
-                    "level-2 weight backup will consume host RAM instead of disk, "
+                    "level-2 backup dir %s resolves to a %s (RAM-backed) mount; "
+                    "the weight backup will consume host RAM instead of disk, "
                     "defeating weight discard. Point it at local NVMe/SSD.",
-                    base,
+                    out_dir,
                     fstype,
                 )
         except Exception:  # pragma: no cover - best-effort diagnostics only
             pass
-        return base
+        return out_dir
 
     @staticmethod
     def _filesystem_type(path: str) -> str | None:
@@ -510,6 +526,13 @@ class WeightManager:
             len(files),
             out_dir,
         )
+        # Backup is use-once: discard it after a successful restore. Weights can be
+        # hundreds of GB (up to ~1TB for very large models), so leaving a permanent
+        # on-disk copy is not acceptable. The next /sleep re-dumps from the live GPU
+        # tensors. Reached only on success (the loop raises on any shape/dtype
+        # mismatch), so we never delete a backup we failed to fully apply.
+        shutil.rmtree(out_dir, ignore_errors=True)
+        logging.info("restore_raw_backup: discarded use-once backup dir %s", out_dir)
 
     def _resolve_live_tensor(
         self, key: str, layer_prefix: str, global_prefix: str

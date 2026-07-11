@@ -105,6 +105,30 @@ void KVCacheMemoryConnector::initBlockPool() {
     RTP_LLM_CHECK_WITH_INFO(block_pool_ != nullptr, "init block pool failed, create block pool failed");
 }
 
+bool KVCacheMemoryConnector::releaseMemoryCacheBacking() {
+    std::lock_guard<std::mutex> lock(malloc_mutex_);
+    if (!block_pool_) {
+        return true;
+    }
+    // The cache-key -> block index LRU points into the buffer we are about to free.
+    block_cache_ = std::make_shared<MemoryBlockCache>();
+    block_pool_->releaseHostBuffer();
+    RTP_LLM_LOG_INFO("memory cache backing released for sleep");
+    return true;
+}
+
+bool KVCacheMemoryConnector::restoreMemoryCacheBacking() {
+    std::lock_guard<std::mutex> lock(malloc_mutex_);
+    if (!block_pool_) {
+        return true;
+    }
+    block_pool_->reallocateHostBuffer();
+    // Start from an empty cache: the previous host KV contents were discarded.
+    block_cache_ = std::make_shared<MemoryBlockCache>();
+    RTP_LLM_LOG_INFO("memory cache backing restored on wake");
+    return true;
+}
+
 std::shared_ptr<AsyncMatchContext> KVCacheMemoryConnector::asyncMatch(const std::shared_ptr<KVCacheResource>& resource,
                                                                       const std::shared_ptr<Meta>&            meta) {
     RTP_LLM_PROFILE_FUNCTION();

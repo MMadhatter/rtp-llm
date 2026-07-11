@@ -250,9 +250,19 @@ void LocalRpcServer::installSleepHooks() {
         if (!cache_manager) {
             return true;
         }
+        // Host memory-cache tier (enable_memory_cache): a pinned host buffer that is NOT
+        // under any VMM tag and NOT MR-registered, so the VMM pause below cannot free it.
+        // Discard it explicitly here (no-op when the memory cache is disabled). Runs on
+        // every sleep level; in-flight H2D/D2H copies were already drained (connector_inflight).
+        const auto mc_begin_us = currentTimeUs();
+        if (!cache_manager->releaseMemoryCacheBacking()) {
+            RTP_LLM_LOG_WARNING("releaseKvMemoryBacking: releaseMemoryCacheBacking failed");
+            return false;
+        }
+        reportSleepVmmOpTime("release", "memory_cache", mc_begin_us);
         auto controller = cache_manager->kvMemoryController();
         if (!controller || !controller->backendAvailable()) {
-            RTP_LLM_LOG_WARNING("releaseKvMemoryBacking skipped: VMM backend unavailable");
+            RTP_LLM_LOG_WARNING("releaseKvMemoryBacking skipped VMM pause: backend unavailable");
             return true;
         }
         const auto begin_time_us = currentTimeUs();
@@ -306,6 +316,14 @@ void LocalRpcServer::installSleepHooks() {
         if (!cache_manager) {
             return true;
         }
+        // Reallocate the host memory-cache pinned buffer first (mirrors the sleep-side
+        // release order). Independent of the GPU KV VMM resume below; no-op when disabled.
+        const auto mc_begin_us = currentTimeUs();
+        if (!cache_manager->restoreMemoryCacheBacking()) {
+            RTP_LLM_LOG_WARNING("restoreKvMemoryBackingAndResetMetadata: restoreMemoryCacheBacking failed");
+            return false;
+        }
+        reportSleepVmmOpTime("reallocate", "memory_cache", mc_begin_us);
         auto controller = cache_manager->kvMemoryController();
         if (!controller || !controller->isPaused()) {
             return true;  // pause was skipped (no shim); keep metadata untouched

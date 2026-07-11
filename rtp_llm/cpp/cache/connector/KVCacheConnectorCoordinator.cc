@@ -375,4 +375,18 @@ std::vector<CacheKeyType> KVCacheConnectorCoordinator::memoryCacheKeys() const {
     return memory_connector_->cacheKeys();
 }
 
+bool KVCacheConnectorCoordinator::releaseMemoryCacheBacking() {
+    if (!memory_connector_) {
+        return true;
+    }
+    return memory_connector_->releaseMemoryCacheBacking();
+}
+
+bool KVCacheConnectorCoordinator::restoreMemoryCacheBacking() {
+    if (!memory_connector_) {
+        return true;
+    }
+    return memory_connector_->restoreMemoryCacheBacking();
+}
+
 }  // namespace rtp_llm

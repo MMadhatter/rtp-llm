@@ -58,6 +58,11 @@ public:
     virtual bool              executeFunction(const FunctionRequestPB& request, FunctionResponsePB& response);
     std::vector<CacheKeyType> memoryCacheKeys() const;
 
+    // Sleep/wake_up (M7): discard / reallocate the host memory-cache pinned buffer.
+    // Delegates to memory_connector_ when the memory cache is enabled; otherwise no-op.
+    bool releaseMemoryCacheBacking();
+    bool restoreMemoryCacheBacking();
+
     uint32_t convertToGlobalLayerId(int model_id, int layer_id) const override {
         return allocator_->convertToGlobalLayerId(model_id, layer_id);
     }

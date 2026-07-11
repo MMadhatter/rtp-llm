@@ -507,5 +507,11 @@ def setup_args() -> PyEnvConfigs:
     os.environ["SLEEP_MODE_LEVEL"] = str(
         getattr(parsed_args, "sleep_mode_level", 1) or 1
     )
+    # Level-2 disk backup root is read by weight_manager at sleep/wake time. Only
+    # mirror when non-empty so an unset CLI arg does not clobber a directly-set
+    # SLEEP_L2_BACKUP_DIR env (weight_manager falls back to /tmp with a warning).
+    _l2_dir = getattr(parsed_args, "sleep_l2_backup_dir", "") or ""
+    if _l2_dir:
+        os.environ["SLEEP_L2_BACKUP_DIR"] = _l2_dir
 
     return py_env_configs
