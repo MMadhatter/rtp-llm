@@ -12,9 +12,11 @@
 #include <c10/core/InferenceMode.h>
 #if USING_CUDA
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime_api.h>
 #elif USING_ROCM
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <hip/hip_runtime.h>
 #endif
 #include "autil/EnvUtil.h"
@@ -130,16 +132,31 @@ std::unordered_map<std::string, long> readProcMemKb(const char* path, const std:
 //   Mlocked, Cached.
 void logSleepMemorySnapshot(const std::string& phase, int local_rank) {
     size_t gpu_used_mb = 0, gpu_free_mb = 0, gpu_total_mb = 0;
+    // torch caching-allocator counters. NOTE: under torch_memory_saver these track the
+    // VIRTUAL address reservation, not physical residency -- on VMM pause the physical
+    // pages are freed but the VA (and torch's block bookkeeping) stay, so torch_reserved/
+    // torch_alloc hold ~constant across a sleep while gpu_used (cudaMemGetInfo, physical)
+    // collapses. Do NOT compute a "non-torch floor" as gpu_used-torch_reserved. They are
+    // still useful signals: (torch_reserved - torch_alloc) is the reclaimable free-cache
+    // headroom (what emptyCache can return), and a drop in torch_alloc means tensors were
+    // actually freed (not merely VMM-paused). -1 when the stats are unavailable.
+    long torch_reserved_mb = -1, torch_alloc_mb = -1;
     {
         OptionalSleepDeviceGuard device_guard(local_rank);
         const auto               mem = getGpuExecStatus().device_memory_status;
         gpu_used_mb                  = mem.used_bytes / 1024 / 1024;
         gpu_free_mb                  = mem.free_bytes / 1024 / 1024;
         gpu_total_mb                 = (mem.used_bytes + mem.free_bytes) / 1024 / 1024;
+#if USING_CUDA || USING_ROCM
+        const auto stats  = c10::cuda::CUDACachingAllocator::getDeviceStats(at::cuda::current_device());
+        torch_reserved_mb = stats.reserved_bytes[0].current / 1024 / 1024;
+        torch_alloc_mb    = stats.allocated_bytes[0].current / 1024 / 1024;
+#endif
     }
     const auto proc = readProcMemKb("/proc/self/status", {"VmRSS", "VmHWM", "VmLck", "VmPin"});
     const auto sys  = readProcMemKb("/proc/meminfo", {"MemAvailable", "MemFree", "Mlocked", "Cached"});
     RTP_LLM_LOG_INFO("[SleepMem][%s] rank=%d gpu_used=%zuMiB gpu_free=%zuMiB gpu_total=%zuMiB "
+                     "torch_reserved=%ldMiB torch_alloc=%ldMiB "
                      "| proc VmRSS=%ldMiB VmHWM=%ldMiB VmLck=%ldMiB VmPin=%ldMiB "
                      "| sys MemAvailable=%ldMiB MemFree=%ldMiB Mlocked=%ldMiB Cached=%ldMiB",
                      phase.c_str(),
@@ -147,6 +164,8 @@ void logSleepMemorySnapshot(const std::string& phase, int local_rank) {
                      gpu_used_mb,
                      gpu_free_mb,
                      gpu_total_mb,
+                     torch_reserved_mb,
+                     torch_alloc_mb,
                      proc.at("VmRSS"),
                      proc.at("VmHWM"),
                      proc.at("VmLck"),
@@ -390,6 +409,20 @@ void LocalRpcServer::installSleepHooks() {
         }
         bool ok = pause_tag("cuda_graph");
         ok      = pause_tag("weights") && ok;
+        // The engine is only paused (not torn down): the still-alive executor's transient
+        // buffers (activations, attention/cuBLAS workspaces, sampler) can linger in the torch
+        // device caching allocator as reserved-but-free blocks, which cudaMemGetInfo still
+        // counts as used. Return them to the driver; the allocator transparently re-grows on
+        // wake. Only frees FREE cached blocks -- it does not touch the VMM-tagged weights/kv/
+        // cuda_graph regions (paused above via torch_memory_saver, still torch-"allocated").
+        // Yield is workload-dependent: near-zero once the engine is quiesced (transient pools
+        // already returned), larger when big prefill/capture pools were left cached.
+#if USING_CUDA || USING_ROCM
+        {
+            OptionalSleepDeviceGuard empty_cache_guard(local_rank);
+            c10::cuda::CUDACachingAllocator::emptyCache();
+        }
+#endif
         // Terminal sleep state: weights + cuda_graph GPU memory released (level-2 dumped to disk).
         logSleepMemorySnapshot("sleep/SLEEPING", local_rank);
         return ok;
