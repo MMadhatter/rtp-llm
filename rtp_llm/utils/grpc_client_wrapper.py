@@ -46,26 +46,6 @@ def _report_metric_if_ready(metric: Any, value: float) -> None:
     kmonitor.report(metric, value)
 
 
-def _report_lifecycle_action_metrics(
-    action: str, start_time_ms: float, result: Dict[str, Any]
-) -> None:
-    duration_ms = time.time() * 1000 - start_time_ms
-    if action == "sleep":
-        qps_metric = AccMetrics.SLEEP_QPS_METRIC
-        success_metric = AccMetrics.SLEEP_SUCCESS_QPS_METRIC
-        error_metric = AccMetrics.SLEEP_ERROR_QPS_METRIC
-        rt_metric = GaugeMetrics.SLEEP_RT_METRIC
-    else:
-        qps_metric = AccMetrics.WAKE_UP_QPS_METRIC
-        success_metric = AccMetrics.WAKE_UP_SUCCESS_QPS_METRIC
-        error_metric = AccMetrics.WAKE_UP_ERROR_QPS_METRIC
-        rt_metric = GaugeMetrics.WAKE_UP_RT_METRIC
-
-    _report_metric_if_ready(qps_metric, 1)
-    _report_metric_if_ready(rt_metric, duration_ms)
-    _report_metric_if_ready(error_metric if "error" in result else success_metric, 1)
-
-
 def _report_sleep_status_metrics(status: Dict[str, Any]) -> None:
     if "error" in status:
         return
@@ -423,7 +403,19 @@ class GrpcClientWrapper:
         start_time = time.time() * 1000
         async with self._lifecycle_lock:
             result = await self._sleep_serving_locked(req)
-        _report_lifecycle_action_metrics("sleep", start_time, result)
+        # sleep is a rare control-plane action: the synchronous response is the
+        # authoritative outcome and a failure is handled as an incident, so a
+        # single grep-able log line per call is the useful signal (no QPS metric).
+        duration_ms = time.time() * 1000 - start_time
+        if "error" in result:
+            logging.warning(
+                "sleep action failed in %.0fms: %s (grpc_status=%s)",
+                duration_ms,
+                result.get("error"),
+                result.get("grpc_status", "UNKNOWN"),
+            )
+        else:
+            logging.info("sleep action completed ok in %.0fms", duration_ms)
         return result
 
     async def _sleep_serving_locked(self, req: Any) -> Dict[str, Any]:
@@ -583,7 +575,16 @@ class GrpcClientWrapper:
         start_time = time.time() * 1000
         async with self._lifecycle_lock:
             result = await self._wake_up_serving_locked(req)
-        _report_lifecycle_action_metrics("wake_up", start_time, result)
+        duration_ms = time.time() * 1000 - start_time
+        if "error" in result:
+            logging.warning(
+                "wake_up action failed in %.0fms: %s (grpc_status=%s)",
+                duration_ms,
+                result.get("error"),
+                result.get("grpc_status", "UNKNOWN"),
+            )
+        else:
+            logging.info("wake_up action completed ok in %.0fms", duration_ms)
         return result
 
     async def _wake_up_serving_locked(self, req: Any = None) -> Dict[str, Any]:
