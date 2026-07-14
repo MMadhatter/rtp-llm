@@ -485,6 +485,19 @@ absl::Status NormalEngine::maybeReachCollectiveSleepQuiesce() {
         RTP_LLM_LOG_INFO("normal engine collective sleep quiesce reached, epoch=%lu, world_size=%ld",
                          pause_epoch,
                          parallelism_config.world_size);
+        // CPU consensus above only proves no rank will enqueue new work; it does NOT prove the
+        // GPU is idle. This step's runExecutorProcess() launched a (fake-MoE) forward whose
+        // EP dispatch/combine is still async-retiring; for internode DeepEP the cross-node
+        // combine has a real RDMA tail. All ranks reach this branch in the same step (consensus
+        // is derived from the shared all-reduce), so draining here is symmetric and cannot hang.
+        // Combined with the coordinator's two-phase protocol (commit is sent only after every
+        // rank's prepare/quiesce returns, i.e. after this sync), it guarantees no rank tears down
+        // its MR / unmaps weight pages while a peer's collective still references them -- which
+        // is what otherwise poisons the CUDA context and makes torch_memory_saver's cuMemUnmap
+        // return a sticky CUDA 999 and abort the whole fleet.
+#if USING_CUDA
+        cudaDeviceSynchronize();
+#endif
         enterPausedState();
     }
     return absl::OkStatus();
