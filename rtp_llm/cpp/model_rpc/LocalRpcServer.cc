@@ -141,7 +141,12 @@ void logSleepMemorySnapshot(const std::string& phase, int local_rank) {
     // headroom (what emptyCache can return), and a drop in torch_alloc means tensors were
     // actually freed (not merely VMM-paused). -1 when the stats are unavailable.
     long torch_reserved_mb = -1, torch_alloc_mb = -1;
-    {
+    // Best-effort observability only: getGpuExecStatus()/getDeviceStats() can throw
+    // c10::Error. This runs INSIDE the sleep/wake release/restore hooks (via
+    // invokeHookNoThrow), so a throw here would be mistaken for a hook failure and push
+    // the controller to the terminal ERROR state on an otherwise-successful sleep. Swallow
+    // it: leave the fields at their sentinels and still log what we have.
+    try {
         OptionalSleepDeviceGuard device_guard(local_rank);
         const auto               mem = getGpuExecStatus().device_memory_status;
         gpu_used_mb                  = mem.used_bytes / 1024 / 1024;
@@ -152,6 +157,8 @@ void logSleepMemorySnapshot(const std::string& phase, int local_rank) {
         torch_reserved_mb = stats.reserved_bytes[0].current / 1024 / 1024;
         torch_alloc_mb    = stats.allocated_bytes[0].current / 1024 / 1024;
 #endif
+    } catch (const std::exception& e) {
+        RTP_LLM_LOG_WARNING("[SleepMem][%s] GPU stat snapshot failed (ignored): %s", phase.c_str(), e.what());
     }
     const auto proc = readProcMemKb("/proc/self/status", {"VmRSS", "VmHWM", "VmLck", "VmPin"});
     const auto sys  = readProcMemKb("/proc/meminfo", {"MemAvailable", "MemFree", "Mlocked", "Cached"});

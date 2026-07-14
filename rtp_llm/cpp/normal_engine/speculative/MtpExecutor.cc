@@ -789,11 +789,20 @@ absl::Status MtpExecutor::processForPause() {
     // Drive an empty synchronized step tagged as a pause wave. pause_signal_requested_
     // makes the skip-run branch set model_input.is_fake_stream on this rank; the flag
     // is broadcast to worker ranks via tpSyncModelInputs (see prefillStep/decodeStep).
+    //
+    // process() reaches THROW_IF_STATUS_ERROR in prefillStep/decodeStep, so a step
+    // failure during quiesce THROWS rather than returns. Reset the flag via RAII so a
+    // throw cannot leave it stuck true -- otherwise every later idle skip-run step on
+    // rank0 would spuriously tag is_fake_stream and self-pause the engine mid-serving.
+    struct ResetGuard {
+        std::atomic<bool>& flag;
+        ~ResetGuard() {
+            flag.store(false, std::memory_order_release);
+        }
+    } reset_guard{pause_signal_requested_};
     pause_signal_requested_.store(true, std::memory_order_release);
     std::list<GenerateStreamPtr> empty_streams;
-    auto                         status = process(empty_streams);
-    pause_signal_requested_.store(false, std::memory_order_release);
-    return status;
+    return process(empty_streams);
 }
 
 bool MtpExecutor::consumeLastPauseSignal() {
