@@ -390,23 +390,9 @@ void LocalRpcServer::installSleepHooks() {
             return success;
         };
         // Level 2 (discard weights): the "weights" region was opened without host
-        // cpu_backup, so pause frees GPU with no host copy. Dump the live weights
-        // to a local-disk raw backup first (idempotent) so wake can reload them.
-        if (opt.level == 2) {
-            if (weight_manager_.is_none()) {
-                RTP_LLM_LOG_WARNING("level-2 sleep: weight_manager unavailable, cannot dump weights");
-                return false;
-            }
-            const auto dump_begin_us = currentTimeUs();
-            try {
-                py::gil_scoped_acquire acquire;
-                weight_manager_.attr("dump_raw_backup")();
-            } catch (const py::error_already_set& e) {
-                RTP_LLM_LOG_WARNING("level-2 sleep: dump_raw_backup failed: %s", e.what());
-                return false;
-            }
-            reportSleepVmmOpTime("dump", "weights", dump_begin_us);
-        }
+        // cpu_backup, so pause frees GPU with no host copy and nothing is written
+        // anywhere. Wake reloads the weights in place from the model loader
+        // (see restoreRestorableGpuMemory below), so sleep just pauses the region.
         bool ok = pause_tag("cuda_graph");
         ok      = pause_tag("weights") && ok;
         // The engine is only paused (not torn down): the still-alive executor's transient
@@ -423,7 +409,7 @@ void LocalRpcServer::installSleepHooks() {
             c10::cuda::CUDACachingAllocator::emptyCache();
         }
 #endif
-        // Terminal sleep state: weights + cuda_graph GPU memory released (level-2 dumped to disk).
+        // Terminal sleep state: weights + cuda_graph GPU memory released (level-2 keeps no backup).
         logSleepMemorySnapshot("sleep/SLEEPING", local_rank);
         return ok;
     };
@@ -465,26 +451,28 @@ void LocalRpcServer::installSleepHooks() {
         };
         // resume("weights") remaps physical pages at the same VA. For level 1 the
         // tms host cpu_backup already restored the content; for level 2 the pages
-        // come back blank, so reload the weights in place from the disk backup
-        // (copy_ preserves data_ptr, keeping C++ aliases and CUDA graphs valid).
+        // come back blank, so reload the weights in place from the model loader
+        // (streams the original checkpoint through prepare_weights() and copy_ s
+        // into the live tensors -- preserves data_ptr, keeping C++ aliases and
+        // CUDA graphs valid). No on-disk backup is involved.
         bool ok = resume_tag("weights");
         if (ok && engine->sleepController().activeSleepLevel() == 2) {
             if (weight_manager_.is_none()) {
-                RTP_LLM_LOG_WARNING("level-2 wake: weight_manager unavailable, cannot restore weights");
+                RTP_LLM_LOG_WARNING("level-2 wake: weight_manager unavailable, cannot reload weights");
                 return false;
             }
-            const auto restore_begin_us = currentTimeUs();
+            const auto reload_begin_us = currentTimeUs();
             try {
                 py::gil_scoped_acquire acquire;
-                weight_manager_.attr("restore_raw_backup")();
+                weight_manager_.attr("reload_weights_from_loader")();
             } catch (const py::error_already_set& e) {
-                RTP_LLM_LOG_WARNING("level-2 wake: restore_raw_backup failed: %s", e.what());
+                RTP_LLM_LOG_WARNING("level-2 wake: reload_weights_from_loader failed: %s", e.what());
                 return false;
             }
-            reportSleepVmmOpTime("restore", "weights", restore_begin_us);
+            reportSleepVmmOpTime("reload", "weights", reload_begin_us);
         }
         ok = resume_tag("cuda_graph") && ok;
-        // Weights (level-1 host restore / level-2 disk reload) + cuda_graph GPU memory back.
+        // Weights (level-1 host restore / level-2 loader reload) + cuda_graph GPU memory back.
         logSleepMemorySnapshot("wake/after_weights_restore", local_rank);
         return ok;
     };

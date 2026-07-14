@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-import glob
 import logging
-import os
 import re
-import shutil
 import threading
-from collections import OrderedDict
 from typing import Any, Mapping
 
-import safetensors.torch
 import torch
 
 from rtp_llm.model_loader.loader import ModelLoader
@@ -281,268 +276,107 @@ class WeightManager:
             self._working_stream.synchronize()
 
     # ------------------------------------------------------------------
-    # Sleep level 2 (discard weights) raw disk backup / restore.
+    # Sleep level 2 (discard weights): in-place reload from the model loader.
     #
     # In level-2 sleep the weights region is opened without torch_memory_saver
     # host cpu_backup, so ``pause("weights")`` frees GPU *and* host memory and
-    # ``resume("weights")`` remaps blank pages at the same virtual address. To
-    # bring the *same* weights back on wake, the C++ sleep hooks call
-    # :meth:`dump_raw_backup` once before the first pause and
-    # :meth:`restore_raw_backup` after every resume.
+    # ``resume("weights")`` remaps blank pages at the same virtual address. Sleep
+    # itself writes nothing — there is no on-disk backup. To bring the *same*
+    # weights back on wake, the C++ wake hook calls
+    # :meth:`reload_weights_from_loader` after resume.
     #
-    # These operate on the already-processed live GPU tensors (post dequant /
-    # MoE fusion / TP split), so dump is contiguous bytes and restore is an
-    # in-place ``copy_`` — no re-run of the loader pipeline, and the tensors'
-    # ``data_ptr`` (aliased by the C++ engine and baked into CUDA graphs) is
-    # preserved. Scope: the base ``ModelWeights`` only; LoRA adapters,
-    # multimodal ViT, and C++-side dynamic EPLB expert buffers are out of scope
-    # for v1 (see weight_memory_saver.py coverage checklist).
+    # The reload re-runs the loader's per-tensor pipeline
+    # (:meth:`ModelLoader.prepare_weights`) from the original checkpoint. It
+    # yields already-processed tensors (post dequant / MoE fusion / TP split),
+    # matching the live layout exactly, and each is ``copy_``-ed in place into
+    # the existing GPU storage — preserving every tensor's ``data_ptr`` (aliased
+    # by the C++ engine and baked into captured CUDA graphs). ``prepare_weights``
+    # is a generator, so only a bounded amount of processed weight is
+    # materialized at a time (no 2x-weights GPU peak) and nothing hits disk.
+    # Scope: the base ``ModelWeights`` only; LoRA adapters, multimodal ViT, and
+    # C++-side dynamic EPLB expert buffers are out of scope for v1 (see
+    # weight_memory_saver.py coverage checklist).
     # ------------------------------------------------------------------
 
-    _L2_BACKUP_COMPLETE_SUFFIX = ".complete"
+    def _live_weight_keys(self) -> set[tuple[int | None, str]]:
+        """Every (layer_id, name) tracked in the live ModelWeights.
 
-    def _l2_backup_dir(self) -> str:
-        """Resolve the per-process local-disk directory for level-2 raw backups.
-
-        The base comes from ``--sleep_l2_backup_dir`` / ``SLEEP_L2_BACKUP_DIR``
-        (should be local NVMe/SSD; the dump can be hundreds of GB or, for very
-        large models, ~1 TB). When unset it falls back to ``/tmp/rtp_llm_sleep_l2``
-        with a warning. A per-``<pid>`` subdirectory is always appended so
-        co-located instances (prefill + decode on one node, or multiple rank
-        workers sharing one configured base) never collide — their live tensors
-        differ but the rank tag can be identical. The whole per-pid dir is
-        discarded after a successful wake (see :meth:`restore_raw_backup`), so no
-        permanent copy is left on disk.
-
-        Warns when the path resolves onto a tmpfs/ramfs mount, since that keeps
-        the weights in host RAM and defeats the point of discarding them.
+        layer_id is None for global weights. Used by
+        :meth:`reload_weights_from_loader` to assert full coverage.
         """
-        base = os.environ.get("SLEEP_L2_BACKUP_DIR", "").strip()
-        if not base:
-            base = "/tmp/rtp_llm_sleep_l2"
-            logging.warning(
-                "SLEEP_L2_BACKUP_DIR is not set; falling back to %s for level-2 "
-                "weight backup. Point --sleep_l2_backup_dir at a local NVMe/SSD "
-                "path with enough free space (dump size ~= weight size).",
-                base,
-            )
-        out_dir = os.path.join(base, str(os.getpid()))
-        try:
-            fstype = self._filesystem_type(out_dir)
-            if fstype in ("tmpfs", "ramfs"):
-                logging.warning(
-                    "level-2 backup dir %s resolves to a %s (RAM-backed) mount; "
-                    "the weight backup will consume host RAM instead of disk, "
-                    "defeating weight discard. Point it at local NVMe/SSD.",
-                    out_dir,
-                    fstype,
-                )
-        except Exception:  # pragma: no cover - best-effort diagnostics only
-            pass
-        return out_dir
+        keys: set[tuple[int | None, str]] = set()
+        for layer_id, layer_dict in enumerate(self._weights.weights):
+            for name in layer_dict:
+                keys.add((layer_id, name))
+        for name in self._weights.global_weights:
+            keys.add((None, name))
+        return keys
 
-    @staticmethod
-    def _filesystem_type(path: str) -> str | None:
-        """Best-effort filesystem type for ``path`` via /proc/mounts (longest prefix)."""
-        abs_path = os.path.abspath(path)
-        # Walk up to the nearest existing ancestor (the dir may not exist yet).
-        probe = abs_path
-        while probe and not os.path.exists(probe):
-            parent = os.path.dirname(probe)
-            if parent == probe:
-                break
-            probe = parent
-        best_mount = ""
-        best_type: str | None = None
-        try:
-            with open("/proc/mounts", "r") as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) < 3:
-                        continue
-                    mount_point, fstype = parts[1], parts[2]
-                    if (
-                        probe == mount_point
-                        or probe.startswith(mount_point.rstrip("/") + "/")
-                    ) and len(mount_point) >= len(best_mount):
-                        best_mount = mount_point
-                        best_type = fstype
-        except FileNotFoundError:
-            return None
-        return best_type
+    def reload_weights_from_loader(self) -> None:
+        """Reload weights in place from the model loader (level-2 wake).
 
-    def _l2_rank_tag(self) -> tuple[int, int, int]:
-        config = self._weights_loader.get_load_config()
-        return int(config.tp_rank), int(config.dp_rank), int(config.ep_rank)
-
-    def _l2_marker_path(self, out_dir: str, tp: int, dp: int, ep: int) -> str:
-        return os.path.join(
-            out_dir,
-            f"rank_{tp:02d}_{dp:02d}_{ep:02d}{self._L2_BACKUP_COMPLETE_SUFFIX}",
-        )
-
-    def _l2_file_prefix(self, out_dir: str, tp: int, dp: int, ep: int) -> str:
-        return f"{out_dir}/model-{tp:02d}-{dp:02d}-{ep:02d}-part-"
-
-    def dump_raw_backup(self) -> None:
-        """Serialize the live GPU weights to a local-disk raw backup (idempotent).
-
-        Called once before the first level-2 ``pause("weights")``. Skips if a
-        rank-scoped ``.complete`` marker already exists. Weights are written as
-        rank-prefixed keys (matching ``ModelWeights.layer_weight_prefix`` /
-        ``global_weight_prefix``) into ~6 GB safetensors partitions, staged
-        through pageable host memory one tensor at a time.
+        Called after ``resume("weights")`` has remapped blank pages at the
+        original VA. Streams the loader's processed tensors from the original
+        checkpoint and ``copy_`` s each into the matching live GPU tensor,
+        preserving ``data_ptr`` so C++ aliases and captured CUDA graphs stay
+        valid. Raises on any shape/dtype mismatch or if some live weight is
+        never covered, so a failed reload propagates to the caller (C++ hook ->
+        ERROR) instead of leaving blank-page garbage behind.
         """
-        tp, dp, ep = self._l2_rank_tag()
-        out_dir = self._l2_backup_dir()
-        marker = self._l2_marker_path(out_dir, tp, dp, ep)
-        if os.path.exists(marker):
-            logging.info(
-                "dump_raw_backup: backup already complete at %s, skip", out_dir
-            )
-            return
-
-        os.makedirs(out_dir, exist_ok=True)
-        layer_prefix = ModelWeights.layer_weight_prefix(tp, dp, ep)
-        global_prefix = ModelWeights.global_weight_prefix(tp, dp, ep)
-        file_prefix = self._l2_file_prefix(out_dir, tp, dp, ep)
-        max_size = 6 * 1024**3  # 6GB partitions, mirroring dump_weight_as_ft_style
-
-        part_idx = 0
-        current_size = 0
-        current_dict: "OrderedDict[str, torch.Tensor]" = OrderedDict()
-        total_bytes = 0
-
-        def flush(force: bool) -> None:
-            nonlocal part_idx, current_size, current_dict
-            if not current_dict:
-                return
-            if not force and current_size < max_size:
-                return
-            filename = f"{file_prefix}{part_idx:05d}.safetensors"
-            safetensors.torch.save_file(current_dict, filename)
-            logging.info(
-                "dump_raw_backup: saved partition %d (%.2f GB) -> %s",
-                part_idx,
-                current_size / 1024**3,
-                filename,
-            )
-            current_dict = OrderedDict()
-            part_idx += 1
-            current_size = 0
-
-        with self._lock:
-            with torch.cuda.stream(self._working_stream), torch.inference_mode():
-                for layer_id, layer_dict in enumerate(self._weights.weights):
-                    for name, tensor in layer_dict.items():
-                        key = f"{layer_prefix}{layer_id}.{name}"
-                        current_dict[key] = tensor.detach().cpu().contiguous()
-                        nbytes = tensor.numel() * tensor.element_size()
-                        current_size += nbytes
-                        total_bytes += nbytes
-                        flush(force=False)
-                for name, tensor in self._weights.global_weights.items():
-                    key = f"{global_prefix}{name}"
-                    current_dict[key] = tensor.detach().cpu().contiguous()
-                    nbytes = tensor.numel() * tensor.element_size()
-                    current_size += nbytes
-                    total_bytes += nbytes
-                    flush(force=False)
-                flush(force=True)
-                self._working_stream.synchronize()
-
-        # Marker written last so a crashed/partial dump is not treated as valid.
-        with open(marker, "w") as f:
-            f.write(f"parts={part_idx} bytes={total_bytes}\n")
-        logging.info(
-            "dump_raw_backup: complete rank(%02d,%02d,%02d) %d parts, %.2f GB at %s",
-            tp,
-            dp,
-            ep,
-            part_idx,
-            total_bytes / 1024**3,
-            out_dir,
-        )
-
-    def restore_raw_backup(self) -> None:
-        """Reload the raw disk backup in place into the existing GPU tensors.
-
-        Called after ``resume("weights")`` (which has remapped blank pages at
-        the original VA). For each stored tensor, validates shape/dtype against
-        the live tensor and ``copy_`` s the bytes back — preserving ``data_ptr``
-        so C++ aliases and captured CUDA graphs remain valid.
-        """
-        tp, dp, ep = self._l2_rank_tag()
-        out_dir = self._l2_backup_dir()
-        marker = self._l2_marker_path(out_dir, tp, dp, ep)
-        if not os.path.exists(marker):
-            raise FileNotFoundError(
-                f"restore_raw_backup: no completed level-2 backup found at {marker}. "
-                "Was dump_raw_backup run on sleep?"
-            )
-        layer_prefix = ModelWeights.layer_weight_prefix(tp, dp, ep)
-        global_prefix = ModelWeights.global_weight_prefix(tp, dp, ep)
-        files = sorted(
-            glob.glob(f"{self._l2_file_prefix(out_dir, tp, dp, ep)}*.safetensors")
-        )
-        if not files:
-            raise FileNotFoundError(
-                f"restore_raw_backup: marker present but no partitions matched "
-                f"{self._l2_file_prefix(out_dir, tp, dp, ep)}*.safetensors"
-            )
-
+        device = str(self._device)
+        pending = self._live_weight_keys()
+        expected = len(pending)
         restored = 0
+        seen = 0
         with self._lock:
             with torch.cuda.stream(self._working_stream), torch.inference_mode():
-                for filename in files:
-                    state = safetensors.torch.load_file(filename, device="cpu")
-                    for key, cpu_tensor in state.items():
-                        ori = self._resolve_live_tensor(
-                            key, layer_prefix, global_prefix
+                for layer_id, name, tensor in self._weights_loader.prepare_weights(
+                    device
+                ):
+                    seen += 1
+                    if layer_id is not None:
+                        ori = (
+                            self._weights.weights[layer_id].get(name)
+                            if 0 <= layer_id < len(self._weights.weights)
+                            else None
                         )
-                        if ori is None:
-                            logging.warning(
-                                "restore_raw_backup: key %s has no live tensor, skip",
-                                key,
-                            )
-                            continue
-                        if (
-                            ori.shape != cpu_tensor.shape
-                            or ori.dtype != cpu_tensor.dtype
-                        ):
-                            raise ValueError(
-                                f"restore_raw_backup: mismatch for {key}: live "
-                                f"{tuple(ori.shape)}/{ori.dtype} vs backup "
-                                f"{tuple(cpu_tensor.shape)}/{cpu_tensor.dtype}"
-                            )
-                        # Direct H2D copy into the existing storage (no GPU temp).
-                        ori.copy_(cpu_tensor)
-                        restored += 1
-                    del state
+                    else:
+                        ori = self._weights.global_weights.get(name)
+                    if ori is None:
+                        # The loader can yield tensors not tracked in the live
+                        # ModelWeights (e.g. misc weights); nothing to reload in
+                        # place for those. Live-weight coverage is asserted below.
+                        logging.debug(
+                            "reload_weights_from_loader: loader tensor "
+                            "(layer=%s, name=%s) has no live tensor, skip",
+                            layer_id,
+                            name,
+                        )
+                        del tensor
+                        continue
+                    if ori.shape != tensor.shape or ori.dtype != tensor.dtype:
+                        raise ValueError(
+                            f"reload_weights_from_loader: mismatch for {name}: live "
+                            f"{tuple(ori.shape)}/{ori.dtype} vs loader "
+                            f"{tuple(tensor.shape)}/{tensor.dtype}"
+                        )
+                    # In-place copy into the existing storage: data_ptr is
+                    # preserved so C++ aliases and captured graphs stay valid.
+                    ori.copy_(tensor)
+                    pending.discard((layer_id, name))
+                    del tensor
+                    restored += 1
                 self._working_stream.synchronize()
+        if pending:
+            sample = sorted(str(k) for k in pending)[:10]
+            raise RuntimeError(
+                f"reload_weights_from_loader: {len(pending)} of {expected} live "
+                f"weights were not reloaded (would remain blank pages), e.g. {sample}"
+            )
         logging.info(
-            "restore_raw_backup: restored %d tensors from %d parts at %s",
+            "reload_weights_from_loader: reloaded %d/%d live tensors in place "
+            "from checkpoint (%d loader tensors seen)",
             restored,
-            len(files),
-            out_dir,
+            expected,
+            seen,
         )
-        # Backup is use-once: discard it after a successful restore. Weights can be
-        # hundreds of GB (up to ~1TB for very large models), so leaving a permanent
-        # on-disk copy is not acceptable. The next /sleep re-dumps from the live GPU
-        # tensors. Reached only on success (the loop raises on any shape/dtype
-        # mismatch), so we never delete a backup we failed to fully apply.
-        shutil.rmtree(out_dir, ignore_errors=True)
-        logging.info("restore_raw_backup: discarded use-once backup dir %s", out_dir)
-
-    def _resolve_live_tensor(
-        self, key: str, layer_prefix: str, global_prefix: str
-    ) -> torch.Tensor | None:
-        if key.startswith(layer_prefix):
-            rest = key[len(layer_prefix) :]  # "{layer_id}.{name}"
-            layer_id_str, _, name = rest.partition(".")
-            layer_id = int(layer_id_str)
-            return self._weights.weights[layer_id].get(name)
-        if key.startswith(global_prefix):
-            name = key[len(global_prefix) :]
-            return self._weights.global_weights.get(name)
-        return None
