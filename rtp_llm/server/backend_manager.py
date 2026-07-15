@@ -151,6 +151,56 @@ class BackendManager(object):
             self.engine.task_type,
         )
 
+        self._register_deep_sleep_collectives(engine_config, model_config)
+
+    def _register_deep_sleep_collectives(self, engine_config, model_config):
+        """Register the level-3 deep-sleep collectives (destroy/rebuild pairs).
+
+        Around a CUDA checkpoint the C++ hooks call collective_lifecycle.run_teardown()
+        before checkpoint and run_rebuild() on wake; those iterate the participants
+        registered here. Register in DEPENDENCY order -- NCCL process group first
+        (DeepEP rendezvous runs on it), DeepEP second -- so teardown runs DeepEP->PG
+        and rebuild runs PG->DeepEP automatically. Only the collectives this process
+        actually initialized (see start()) are registered, and each rebuild captures
+        the exact init configs used at startup. Harmless when level-3 is not in use --
+        the participants are only ever driven by the level-3 sleep/wake path.
+        """
+        from rtp_llm.models_py.distributed.collective_lifecycle import (
+            register_collective,
+        )
+        from rtp_llm.models_py.distributed.collective_torch import (
+            destroy_distributed_environment,
+        )
+
+        if engine_config.parallelism_config.world_size > 1:
+            register_collective(
+                "process_group",
+                teardown=destroy_distributed_environment,
+                rebuild=lambda: init_distributed_environment(
+                    engine_config.parallelism_config,
+                    nccl_comm_config=self._distributed_server.get_nccl_comm_config(),
+                    nccl_init_port=self._distributed_server.get_nccl_init_port(),
+                    backend="nccl",
+                    timeout=self.py_env_configs.distribute_config.dist_comm_timeout,
+                ),
+            )
+        if (
+            model_config.expert_num > 0
+            and engine_config.parallelism_config.world_size > 1
+            and not engine_config.moe_config.use_all_gather
+            and engine_config.moe_config.use_deepep_moe
+        ):
+            from rtp_llm.models_py.distributed.deepep_wrapper import (
+                destroy_deepep_wrapper,
+                init_deepep_wrapper,
+            )
+
+            register_collective(
+                "deepep",
+                teardown=destroy_deepep_wrapper,
+                rebuild=lambda: init_deepep_wrapper(engine_config, model_config),
+            )
+
     def serve_forever(self):
         """Enter service loop to keep the process alive until shutdown is requested"""
         # freeze all current tracked objects to reduce gc cost

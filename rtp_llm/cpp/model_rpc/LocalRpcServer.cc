@@ -213,6 +213,9 @@ void fillSleepStatusPb(const SleepStatus& status, SleepStatusResponsePB* respons
     response->set_sleep_mode_enabled(status.sleep_mode_enabled);
     response->set_effective(status.effective);
     response->set_disabled_reason(status.disabled_reason);
+    // Report this backend rank's pid so the level-3 deep-sleep coordinator can
+    // target cuCheckpointProcess* on the local backend process.
+    response->set_process_id(static_cast<int32_t>(getpid()));
     for (const auto level : status.supported_levels) {
         response->add_supported_levels(level);
     }
@@ -349,7 +352,7 @@ void LocalRpcServer::installSleepHooks() {
         logSleepMemorySnapshot("sleep/after_dereg_mr", local_rank);
         return finish(true);
     };
-    hooks.releaseKvMemoryBacking = [this, engine, local_rank](const SleepOptions&) {
+    hooks.releaseKvMemoryBacking = [this, engine, local_rank](const SleepOptions& opt) {
         OptionalSleepDeviceGuard device_guard(local_rank);
         auto                     cache_manager = engine->getCacheManager();
         if (!cache_manager) {
@@ -411,8 +414,12 @@ void LocalRpcServer::installSleepHooks() {
         // Yield is workload-dependent: near-zero once the engine is quiesced (transient pools
         // already returned), larger when big prefill/capture pools were left cached.
 #if USING_CUDA || USING_ROCM
-        {
-            OptionalSleepDeviceGuard empty_cache_guard(local_rank);
+        // Level 3 immediately checkpoints the whole process after this hook.
+        // The checkpoint driver releases all remaining device allocations, so
+        // emptyCache is redundant there. It can also attempt to free allocator
+        // blocks whose graph/NCCL resources were just invalidated and report
+        // cudaErrorInvalidValue before the checkpoint is reached.
+        if (opt.level != 3) {
             c10::cuda::CUDACachingAllocator::emptyCache();
         }
 #endif
@@ -450,22 +457,22 @@ void LocalRpcServer::installSleepHooks() {
         if (!vmm_backend->isAvailable()) {
             return true;
         }
-        auto resume_tag = [this, vmm_backend](const std::string& tag) {
+        const int32_t level      = engine->sleepController().activeSleepLevel();
+        auto          resume_tag = [this, vmm_backend](const std::string& tag) {
             const auto begin_time_us = currentTimeUs();
             const bool success       = vmm_backend->resume(tag);
             reportSleepVmmOpTime("resume", tag, begin_time_us);
             return success;
         };
-        // resume("weights") remaps physical pages at the same VA. For level 1 the
-        // tms host cpu_backup already restored the content; for level 2 the pages
-        // come back blank, so reload the weights in place from the model loader
-        // (streams the original checkpoint through prepare_weights() and copy_ s
-        // into the live tensors -- preserves data_ptr, keeping C++ aliases and
-        // CUDA graphs valid). No on-disk backup is involved.
+        // resume("weights") remaps physical pages at the same VA. Level 1 uses
+        // the tms host cpu_backup and restores content directly. Levels 2 and 3
+        // open the region without a backup, so both reload weights in place from
+        // the original checkpoint. Level 3 performs this after the CUDA driver
+        // has restored the non-VMM checkpoint state.
         bool ok = resume_tag("weights");
-        if (ok && engine->sleepController().activeSleepLevel() == 2) {
+        if (ok && level >= 2) {
             if (weight_manager_.is_none()) {
-                RTP_LLM_LOG_WARNING("level-2 wake: weight_manager unavailable, cannot reload weights");
+                RTP_LLM_LOG_WARNING("level-%d wake: weight_manager unavailable, cannot reload weights", level);
                 return false;
             }
             const auto reload_begin_us = currentTimeUs();
@@ -473,13 +480,13 @@ void LocalRpcServer::installSleepHooks() {
                 py::gil_scoped_acquire acquire;
                 weight_manager_.attr("reload_weights_from_loader")();
             } catch (const py::error_already_set& e) {
-                RTP_LLM_LOG_WARNING("level-2 wake: reload_weights_from_loader failed: %s", e.what());
+                RTP_LLM_LOG_WARNING("level-%d wake: reload_weights_from_loader failed: %s", level, e.what());
                 return false;
             }
             reportSleepVmmOpTime("reload", "weights", reload_begin_us);
         }
         ok = resume_tag("cuda_graph") && ok;
-        // Weights (level-1 host restore / level-2 loader reload) + cuda_graph GPU memory back.
+        // Weights (level-1 host restore / level-2/3 loader reload) + cuda_graph GPU memory back.
         logSleepMemorySnapshot("wake/after_weights_restore", local_rank);
         return ok;
     };
@@ -540,6 +547,71 @@ void LocalRpcServer::installSleepHooks() {
         }
         RTP_LLM_LOG_INFO("sleep warmup/self-check passed");
         return true;
+    };
+
+    // --- Level-3 deep-sleep collective teardown/rebuild (invoked by the state
+    // machine only when the active sleep level is 3). The heavy lifting is in
+    // Python (rtp_llm.models_py.distributed.collective_lifecycle); here we just
+    // call across the pybind boundary under the GIL. Teardown takes no args;
+    // rebuild uses a closure BackendManager registered at startup with the
+    // original init configs. ---
+    const bool has_collectives =
+        parallelism_config.tp_size > 1 || parallelism_config.dp_size > 1 || parallelism_config.ep_size > 1;
+    const bool invalidate_collective_graphs = has_collectives && maga_init_params_.hw_kernel_config.enable_cuda_graph;
+    hooks.teardownCollectives =
+        [engine, local_rank, has_collectives, invalidate_collective_graphs](const SleepOptions&) {
+            if (!has_collectives) {
+                return true;
+            }
+            try {
+                OptionalSleepDeviceGuard device_guard(local_rank);
+                if (invalidate_collective_graphs) {
+                    // TP collectives are embedded in these graph execs. Destroy them
+                    // before destroying the communicator they reference; canRun()
+                    // will then route requests through the eager path after wake.
+                    engine->invalidateCudaGraphs();
+                }
+                py::gil_scoped_acquire acquire;
+                py::module_::import("rtp_llm.models_py.distributed.collective_lifecycle").attr("run_teardown")();
+                return true;
+            } catch (const std::exception& e) {
+                RTP_LLM_LOG_WARNING("teardownCollectives failed: %s", e.what());
+                return false;
+            }
+        };
+    hooks.rebuildCollectives = [has_collectives]() {
+        if (!has_collectives) {
+            return true;
+        }
+        try {
+            py::gil_scoped_acquire acquire;
+            py::module_::import("rtp_llm.models_py.distributed.collective_lifecycle").attr("run_rebuild")();
+            return true;
+        } catch (const std::exception& e) {
+            // Catch std::exception (not just py::error_already_set): the rebuild
+            // closure can raise a plain C++ error, which must not escape the hook
+            // and unwind the state machine. Mirrors teardownCollectives.
+            RTP_LLM_LOG_WARNING("rebuildCollectives failed: %s", e.what());
+            return false;
+        }
+    };
+    hooks.recaptureCollectiveGraphs = [engine, local_rank, invalidate_collective_graphs]() {
+        if (!invalidate_collective_graphs) {
+            // Single-card / graph disabled: nothing was invalidated on sleep, so
+            // there is nothing to recapture.
+            return true;
+        }
+        try {
+            // The communicator has been rebuilt by rebuildCollectives; recapture the
+            // graphs (which bake in the collective kernels) against it so decode
+            // returns to the CUDA-graph fast path instead of eager fallback.
+            OptionalSleepDeviceGuard device_guard(local_rank);
+            engine->recaptureCudaGraphs();
+            return true;
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_WARNING("recaptureCollectiveGraphs failed: %s", e.what());
+            return false;
+        }
     };
 
     engine_->sleepController().setHooks(hooks);

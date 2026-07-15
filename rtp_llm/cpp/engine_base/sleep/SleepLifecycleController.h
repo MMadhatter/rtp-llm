@@ -133,6 +133,21 @@ struct SleepHooks {
     // M7/M8: warmup + health self-check before going back online.
     std::function<bool()> warmupAndHealthCheck;
 
+    // --- Level-3 deep-sleep (cuda-checkpoint) only. Empty => no-op success, so
+    // level-1/2 and the core state machine stay unaffected. Invoked only when the
+    // active sleep level is 3. ---
+    // Finalize cross-process collectives (NCCL destroy + DeepEP destroy; symm-mem
+    // is disabled at init under level-3) before the process is checkpointed. Runs
+    // in SUSPENDING after MR dereg, while the engine loop is quiesced.
+    std::function<bool(const SleepOptions&)> teardownCollectives;
+    // Rebuild collectives on wake after the process is restored, before MR
+    // re-registration. Strict order inside: NCCL first (init_distributed_environment),
+    // then DeepEP (its rendezvous runs all_gather_object on the live PG).
+    std::function<bool()> rebuildCollectives;
+    // Recapture CUDA graphs whose collectives were rebuilt (TP>1, tier A). A no-op
+    // for TP=1 (pure-compute graphs survive checkpoint transparently, tier C).
+    std::function<bool()> recaptureCollectiveGraphs;
+
     // M3: live counters surfaced through status().
     std::function<int64_t()> activeRequestCount;
     std::function<int64_t()> activeCacheTransferCount;
@@ -160,12 +175,19 @@ public:
     bool enabled() const;
 
     // Startup-selected sleep level for this process (see RuntimeConfig
-    // sleep_mode_level). Must be called before sleep()/wakeUp(). level==2 is the
-    // discard-weights mode: the weights VMM region was opened without host
-    // cpu_backup, so sleep frees GPU+host and wake reloads from a disk backup.
-    // This is fixed at model-load time by torch_memory_saver and cannot change
-    // per request, so a /sleep request's level must match it.
+    // sleep_mode_level), fixed at model-load time and advertised as the sole
+    // supported_levels entry; a /sleep request's level must match it. Must be set
+    // before sleep()/wakeUp().
+    //   1 = host cpu_backup of weights (fast wake, resident host memory).
+    //   2 = discard weights (free GPU+host), reload in place from model loader.
+    //   3 = deep-sleep (cuda-checkpoint): tear down collectives + checkpoint the
+    //       process so GPU->0; weights reload like level 2 on wake.
+    void    setSleepLevel(int32_t level);
+    int32_t sleepLevel() const;
+    // Back-compat shim: discard==true selects level 2, false selects level 1.
     void setDiscardWeights(bool discard);
+    // True when the configured level discards weights and reloads them on wake
+    // (levels 2 and 3).
     bool discardWeights() const;
     // Level captured on the RUNNING->DRAINING transition of the active sleep,
     // read by the wake_up restore hook to decide whether to reload weights.
@@ -219,8 +241,8 @@ private:
     std::atomic<int64_t>    sleep_epoch_{0};
     std::atomic<bool>       enabled_{false};
     std::atomic<bool>       runtime_supported_{true};
-    // True when this process was started in discard-weights (level 2) mode.
-    std::atomic<bool> discard_weights_{false};
+    // Startup-selected sleep level for this process (1/2/3); see setSleepLevel.
+    std::atomic<int32_t> sleep_level_{1};
     // Level of the in-progress/last sleep, captured at RUNNING->DRAINING.
     std::atomic<int32_t> active_sleep_level_{0};
     // Lock ordering: transition_mutex_ -> hooks_mutex_ -> status_mutex_.

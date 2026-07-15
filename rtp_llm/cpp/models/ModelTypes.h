@@ -125,6 +125,8 @@ public:
     virtual ~ModelBase()                                          = default;
     virtual GptModelOutputs forward(const GptModelInputs& inputs) = 0;
     virtual void            releaseBuffers() {}
+    virtual void            invalidateCudaGraphs() {}
+    virtual void            recaptureCudaGraphs() {}
 
     rtp_llm::Weights            weights_;
     rtp_llm::OverallExpertStats overall_expert_stats_;

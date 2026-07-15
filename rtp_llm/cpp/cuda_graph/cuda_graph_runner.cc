@@ -711,6 +711,35 @@ void CudaGraphRunner::initCapture() {
     }
 }
 
+void CudaGraphRunner::invalidateCapturedGraphs() {
+    if (!enable_cuda_graph_) {
+        return;
+    }
+    py::gil_scoped_acquire gil;
+    forward_event_.synchronize();
+    graph_instances_.clear();
+    capture_range_.clear();
+    capture_mem_hold_  = CaptureMemoryHold();
+    shared_graph_pool_ = {};
+    RTP_LLM_LOG_INFO("invalidated captured CUDA graphs; execution will use eager fallback");
+}
+
+void CudaGraphRunner::recaptureCapturedGraphs() {
+    if (!enable_cuda_graph_) {
+        return;
+    }
+    py::gil_scoped_acquire gil;
+    forward_event_.synchronize();
+    // Defensive idempotency: start from a clean slate even if invalidateCapturedGraphs
+    // was not called first, then run the exact startup capture path.
+    graph_instances_.clear();
+    capture_range_.clear();
+    capture_mem_hold_  = CaptureMemoryHold();
+    shared_graph_pool_ = {};
+    initCapture();
+    RTP_LLM_LOG_INFO("recaptured CUDA graphs after deep-sleep wake");
+}
+
 void CudaGraphRunner::replayGraph(int key) {
     graph_instances_[key].graph_.replay();
 }

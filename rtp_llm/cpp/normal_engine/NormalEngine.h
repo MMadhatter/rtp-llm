@@ -39,6 +39,8 @@ public:
     void                              pause() override;
     void                              restart() override;
     absl::Status                      pauseAndWaitQuiesced(int64_t timeout_ms) override;
+    void                              invalidateCudaGraphs() override;
+    void                              recaptureCudaGraphs() override;
 
     KVCacheInfo  getCacheStatusInfo(int64_t latest_version, bool need_cache_keys) override;
     absl::Status step();

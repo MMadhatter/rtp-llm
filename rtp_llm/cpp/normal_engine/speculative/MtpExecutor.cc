@@ -809,6 +809,30 @@ bool MtpExecutor::consumeLastPauseSignal() {
     return last_pause_signal_.exchange(false, std::memory_order_acq_rel);
 }
 
+void MtpExecutor::invalidateCudaGraphs() {
+    if (model_) {
+        model_->invalidateCudaGraphs();
+    }
+    if (draft_model_) {
+        draft_model_->invalidateCudaGraphs();
+    }
+    if (sp_prefill_draft_model_) {
+        sp_prefill_draft_model_->invalidateCudaGraphs();
+    }
+}
+
+void MtpExecutor::recaptureCudaGraphs() {
+    if (model_) {
+        model_->recaptureCudaGraphs();
+    }
+    if (draft_model_) {
+        draft_model_->recaptureCudaGraphs();
+    }
+    if (sp_prefill_draft_model_) {
+        sp_prefill_draft_model_->recaptureCudaGraphs();
+    }
+}
+
 absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
     RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.process(stream_size=%zu,mtp_step=%zu)", streams.size(), propose_step_);
 

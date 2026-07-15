@@ -129,6 +129,18 @@ bool NormalExecutor::consumeLastPauseSignal() {
     return last_pause_signal_.exchange(false, std::memory_order_acq_rel);
 }
 
+void NormalExecutor::invalidateCudaGraphs() {
+    if (model_) {
+        model_->invalidateCudaGraphs();
+    }
+}
+
+void NormalExecutor::recaptureCudaGraphs() {
+    if (model_) {
+        model_->recaptureCudaGraphs();
+    }
+}
+
 absl::Status NormalExecutor::processImpl(const std::list<GenerateStreamPtr>& streams, bool pause_signal) {
     StreamGroups                   stream_groups(streams);
     RtpLLMExecutorMetricsCollector executor_collector;

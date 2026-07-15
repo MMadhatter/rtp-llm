@@ -147,9 +147,7 @@ class TestCudaGraphDecodePadding(unittest.TestCase):
 
         # Keep legacy fields in sync for compatibility with non-cuda-graph paths.
         attention_inputs.kv_cache_block_id_device = block_ids
-        attention_inputs.kv_cache_block_id = (
-            attention_inputs.kv_cache_kernel_block_id
-        )
+        attention_inputs.kv_cache_block_id = attention_inputs.kv_cache_kernel_block_id
 
         # padding_offset
         attention_inputs.padding_offset = torch.zeros(
@@ -249,6 +247,45 @@ class TestCudaGraphDecodePadding(unittest.TestCase):
         for bs in batch_range:
             self._test_single(bs)
             print(f"success for batch size: {bs}")
+
+    def test_invalidate_captured_graphs_falls_back_to_eager(self):
+        inputs = self.build_inputs(
+            1,
+            self.max_seq_len,
+            self.kernel_tokens_per_block,
+        )
+        self.assertTrue(self.op.canRun(inputs))
+
+        self.op.invalidateCapturedGraphs()
+
+        self.assertFalse(self.op.canRun(inputs))
+
+    def test_recapture_after_invalidate_restores_graph_and_output(self):
+        """Mirrors the level-3 deep-sleep wake path: invalidate (as on sleep)
+        then recapture (as on wake). After recapture canRun must be True again,
+        the graph must replay, and its output must match the eager model. Also
+        exercise a second invalidate->recapture cycle for idempotency."""
+        for cycle in range(2):
+            probe = self.build_inputs(1, self.max_seq_len, self.kernel_tokens_per_block)
+            self.assertTrue(
+                self.op.canRun(probe), f"expected graph available before cycle {cycle}"
+            )
+
+            self.op.invalidateCapturedGraphs()
+            self.assertFalse(
+                self.op.canRun(probe),
+                f"expected eager fallback after invalidate {cycle}",
+            )
+
+            self.op.recaptureCapturedGraphs()
+            self.assertTrue(
+                self.op.canRun(probe),
+                f"expected graph restored after recapture {cycle}",
+            )
+
+        # After recapture, a replayed batch must still match the eager model.
+        for bs in (1, 8, 64):
+            self._test_single(bs)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,8 @@ public:
     absl::Status process(const std::list<GenerateStreamPtr>& streams) override;
     absl::Status processForPause() override;
     bool         consumeLastPauseSignal() override;
+    void         invalidateCudaGraphs() override;
+    void         recaptureCudaGraphs() override;
     void         reportMetrics(const StreamGroups&             stream_groups,
                                RtpLLMExecutorMetricsCollector& executor_collector,
                                RtpLLMTokenPSMetricsCollector&  tps_collector);

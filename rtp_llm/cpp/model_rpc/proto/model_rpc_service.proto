@@ -637,6 +637,9 @@ message SleepStatusResponsePB {
     repeated int32 supported_levels = 11;
     repeated string supported_modes = 12;
     string disabled_reason = 13;
+    // OS pid of this backend rank's process. Used by the level-3 deep-sleep
+    // coordinator to target cuCheckpointProcess* on the local backend ranks.
+    int32 process_id = 14;
 }
 
 message IsSleepingResponsePB {

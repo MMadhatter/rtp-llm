@@ -1,3 +1,21 @@
+py_test(
+    name = "symm_mem_sleep_level_test",
+    srcs = ["symm_mem_sleep_level_test.py"],
+    deps = [
+        "//rtp_llm/models_py/distributed:collective_torch",
+    ],
+    timeout = "short",
+)
+
+py_test(
+    name = "collective_lifecycle_test",
+    srcs = ["collective_lifecycle_test.py"],
+    deps = [
+        "//rtp_llm/models_py/distributed:collective_torch",
+    ],
+    timeout = "short",
+)
+
 py_test (
     name = "deepep_test",
     srcs = ["deepep_test.py"],

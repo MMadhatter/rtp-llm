@@ -42,6 +42,7 @@ __all__ = [
     "use_accl_ep",
     "allow_mnnvl",
     "init_deepep_wrapper",
+    "destroy_deepep_wrapper",
 ]
 
 
@@ -504,6 +505,11 @@ class DeepEPWrapper:
             "num_rdma_bytes": num_rdma_bytes,
             "low_latency_mode": False,
             "num_qps_per_rank": num_qps_per_rank,
+            # explicitly_destroy=True is required for a clean buffer.destroy()
+            # (deep_ep asserts this flag). Needed for level-3 deep-sleep, which
+            # must tear the DeepEP buffer down before cuCheckpoint (PoC #8: a live
+            # buffer makes Restore fail 801). Harmless for level-1/2 and normal runs.
+            "explicitly_destroy": True,
         }
 
         if self._use_accl_ep:
@@ -545,6 +551,7 @@ class DeepEPWrapper:
             "low_latency_mode": True,
             "num_qps_per_rank": num_qps_per_rank,
             "allow_mnnvl": True,
+            "explicitly_destroy": True,  # see _init_normal_buffer
         }
 
         if self._use_accl_ep:
@@ -595,6 +602,7 @@ class DeepEPWrapper:
             "num_rdma_bytes": num_rdma_bytes,
             "low_latency_mode": True,
             "num_qps_per_rank": num_qps_per_rank,
+            "explicitly_destroy": True,  # see _init_normal_buffer
         }
 
         if self._use_accl_ep:
@@ -604,11 +612,46 @@ class DeepEPWrapper:
         return DeepEPBuffer(**init_kwargs)  # type: ignore
 
     def _destroy_buffer(self) -> None:
-        """Destroy the DeepEP buffer and free resources."""
+        """Destroy the DeepEP buffer and free resources.
+
+        Buffers are built with explicitly_destroy=True, so call the cpp runtime's
+        destroy() for a deterministic release (nvshmem_finalize + heap/QP + CUDA IPC
+        teardown) instead of relying on __del__ (which the deep_ep docstring warns can
+        hang the interpreter-finalize path). Falls back to del if destroy is
+        unavailable/asserts. Idempotent.
+        """
         if self._buffer is not None:
-            del self._buffer
-            self._buffer = None
+            buffer, self._buffer = self._buffer, None
+            try:
+                if getattr(buffer, "explicitly_destroy", False) and hasattr(
+                    buffer, "destroy"
+                ):
+                    buffer.destroy()
+                else:
+                    logging.warning(
+                        "DeepEP buffer built without explicitly_destroy; "
+                        "falling back to del (may not release cleanly)"
+                    )
+            except Exception as e:
+                logging.warning(f"DeepEP buffer.destroy() failed: {e}")
+            finally:
+                del buffer
         gc.collect()
+
+    @classmethod
+    def destroy(cls) -> None:
+        """Production teardown of the DeepEP singleton (thread-safe, idempotent).
+
+        Tears the buffer's cpp runtime down (NVSHMEM/IBGDA + CUDA IPC) and clears the
+        singleton so a subsequent init_deepep_wrapper() rebuilds cleanly. Required
+        before cuCheckpoint in level-3 deep-sleep: a live DeepEP buffer makes Restore
+        fail 801 (PoC #8). Unlike reset(), this is a supported production path.
+        """
+        with cls._lock:
+            if cls._instance is not None:
+                cls._instance._destroy_buffer()
+                cls._instance = None
+            cls._initialized = False
 
 
 def init_deepep_wrapper(
@@ -667,3 +710,19 @@ def init_deepep_wrapper(
     )
 
     DeepEPWrapper.create(deepep_config)
+
+
+def destroy_deepep_wrapper() -> None:
+    """Tear down the DeepEP wrapper if initialized (production, idempotent).
+
+    Safe no-op when DeepEP is unsupported or was never initialized. Call before
+    cuCheckpoint in level-3 deep-sleep (a live DeepEP buffer makes Restore fail 801,
+    PoC #8); pair with init_deepep_wrapper() on wake to rebuild.
+
+    Note: MoE routers that cached wrapper.buffer at construction hold a stale ref
+    after this; they must re-fetch DeepEPWrapper.get_instance().buffer on wake
+    (handled by the level-3 rebuild hook / router refresh, not here).
+    """
+    if not DeepEPWrapper.supported():
+        return
+    DeepEPWrapper.destroy()

@@ -119,12 +119,21 @@ bool SleepLifecycleController::enabled() const {
     return enabled_.load(std::memory_order_acquire);
 }
 
+void SleepLifecycleController::setSleepLevel(int32_t level) {
+    sleep_level_.store(level, std::memory_order_release);
+}
+
+int32_t SleepLifecycleController::sleepLevel() const {
+    return sleep_level_.load(std::memory_order_acquire);
+}
+
 void SleepLifecycleController::setDiscardWeights(bool discard) {
-    discard_weights_.store(discard, std::memory_order_release);
+    setSleepLevel(discard ? 2 : 1);
 }
 
 bool SleepLifecycleController::discardWeights() const {
-    return discard_weights_.load(std::memory_order_acquire);
+    const int32_t level = sleep_level_.load(std::memory_order_acquire);
+    return level == 2 || level == 3;
 }
 
 int32_t SleepLifecycleController::activeSleepLevel() const {
@@ -171,11 +180,11 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
     if (opt.prepare_only && opt.commit_only) {
         return SleepResult::invalidArgument("sleep rejected: prepare_only and commit_only cannot both be true");
     }
-    // torch_memory_saver binds the weights region's cpu_backup at model-load
-    // time, so this process supports exactly one non-zero level, selected at
-    // startup: 2 (discard weights) when sleep_mode_level=2, otherwise 1 (host
-    // backup). A request must match it.
-    const int32_t configured_level = discard_weights_.load(std::memory_order_acquire) ? 2 : 1;
+    // The process supports exactly one non-zero level, selected at startup by
+    // sleep_mode_level (1 host backup / 2 discard weights / 3 deep-sleep). It is
+    // fixed at model-load time (torch_memory_saver binds the weights backup mode),
+    // so a request's level must match it.
+    const int32_t configured_level = sleep_level_.load(std::memory_order_acquire);
     if (opt.level == 0) {
         return SleepResult::unimplemented(
             "sleep rejected: level=0 state-preserving sleep is defined but not implemented; supported_levels=["
@@ -270,6 +279,15 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
         ok = invokeHookNoThrow("synchronizeAndDeregisterMr", hooks_.synchronizeAndDeregisterMr, opt);
         if (!ok) {
             setLastError("synchronizeAndDeregisterMr failed");
+        }
+    }
+    // Level-3 deep-sleep: finalize cross-process collectives before the process is
+    // checkpointed. A live NCCL/DeepEP buffer makes cuCheckpoint Restore fail
+    // (304 / 801); teardown here, while the engine is quiesced and MR deregistered.
+    if (ok && opt.level == 3 && hooks_.teardownCollectives) {
+        ok = invokeHookNoThrow("teardownCollectives", hooks_.teardownCollectives, opt);
+        if (!ok) {
+            setLastError("teardownCollectives failed");
         }
     }
     if (ok && hooks_.releaseKvMemoryBacking) {
@@ -371,6 +389,17 @@ SleepResult SleepLifecycleController::wakeUp(const WakeUpOptions& opt) {
             setLastError("restoreRestorableGpuMemory failed");
         }
     }
+    // Level-3 deep-sleep: rebuild collectives torn down before checkpoint, after
+    // the process is restored and weights are back, before MR re-registration.
+    // NCCL must come first (DeepEP rendezvous runs on the live PG); the hook impl
+    // enforces that internal order.
+    if (!opt.commit_only && ok && active_sleep_level_.load(std::memory_order_acquire) == 3
+        && hooks_.rebuildCollectives) {
+        ok = invokeHookNoThrow("rebuildCollectives", hooks_.rebuildCollectives);
+        if (!ok) {
+            setLastError("rebuildCollectives failed");
+        }
+    }
     if (!opt.commit_only && ok && hooks_.registerMr) {
         ok = invokeHookNoThrow("registerMr", hooks_.registerMr);
         if (!ok) {
@@ -390,6 +419,15 @@ SleepResult SleepLifecycleController::wakeUp(const WakeUpOptions& opt) {
         return SleepResult::success();
     }
 
+    // Level-3 deep-sleep: recapture CUDA graphs whose collectives were rebuilt
+    // (TP>1, tier A), after collectives+MR are back and before the engine loop
+    // restarts. No-op for TP=1 (pure-compute graphs survive checkpoint, tier C).
+    if (ok && active_sleep_level_.load(std::memory_order_acquire) == 3 && hooks_.recaptureCollectiveGraphs) {
+        ok = invokeHookNoThrow("recaptureCollectiveGraphs", hooks_.recaptureCollectiveGraphs);
+        if (!ok) {
+            setLastError("recaptureCollectiveGraphs failed");
+        }
+    }
     if (ok && hooks_.restartEngine) {
         ok = invokeHookNoThrow("restartEngine", hooks_.restartEngine);
         if (!ok) {
@@ -423,8 +461,8 @@ SleepStatus SleepLifecycleController::status() const {
     s.sleep_mode_enabled = enabled();
     s.effective          = effective();
     // This process supports exactly one non-zero level, fixed at startup by
-    // sleep_mode_level (2 = discard weights, else 1); see sleep() gate.
-    const int32_t configured_level = discard_weights_.load(std::memory_order_acquire) ? 2 : 1;
+    // sleep_mode_level (1 host backup / 2 discard weights / 3 deep-sleep); see sleep() gate.
+    const int32_t configured_level = sleep_level_.load(std::memory_order_acquire);
     s.supported_levels             = s.effective ? std::vector<int32_t>{configured_level} : std::vector<int32_t>{};
     s.supported_modes       = s.effective ? std::vector<std::string>{"wait", "abort"} : std::vector<std::string>{};
     s.disabled_reason       = s.effective ? "" : disabledReason();

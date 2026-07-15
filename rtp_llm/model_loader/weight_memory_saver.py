@@ -1,13 +1,20 @@
-"""WeightMemorySaver (Sleep/wake_up M6): weight GPU memory pause/resume with CPU backup.
+"""WeightMemorySaver (Sleep/wake_up M6): weight GPU memory pause/resume.
 
 Wraps ``torch_memory_saver`` so that every CUDA allocation that holds model
-weights is registered under the ``tag="weights"`` region with
-``enable_cpu_backup=True``. On engine sleep, :func:`pause_weights` backs the
-weight pages up to host (pinned) memory and releases the physical GPU pages
-while keeping the virtual addresses stable (constraint C2: data_ptr must not
-change because CUDA graphs and the C++ ``weights_`` aliases bake pointers in).
-On wake_up, :func:`resume_weights` remaps physical pages at the same VA and
-copies the content back (constraint C4: weight content must be preserved).
+weights is registered under the ``tag="weights"`` region. Whether the region
+carries a host backup is chosen by the startup sleep level (see
+:func:`weights_region`): level 1 opens it with ``enable_cpu_backup=True``;
+levels 2 and 3 use discard semantics with ``enable_cpu_backup=False``.
+
+On engine sleep, :func:`pause_weights` releases the physical GPU pages while
+keeping the virtual addresses stable (constraint C2: data_ptr must not change
+because CUDA graphs and the C++ ``weights_`` aliases bake pointers in). Under
+level 1 the pages are first backed up to host (pinned) memory so
+:func:`resume_weights` can copy the content back at wake_up (constraint C4:
+weight content must be preserved). Under levels 2 and 3 no host copy is kept:
+pause frees the GPU pages and resume remaps blank pages at the same VA, relying
+on the sleep hooks to reload weights in place from the original checkpoint via
+the model loader (LocalRpcServer -> WeightManager.reload_weights_from_loader).
 
 Activation
 ----------
@@ -85,9 +92,9 @@ def configure_from_runtime(
     sleep controller is exercised, so this explicit override keeps
     ``--enable-sleep-mode`` / ``--sleep-mode-level`` and the corresponding env
     vars equivalent. ``sleep_mode_level`` selects whether the weights region is
-    opened with host cpu_backup (level 1) or as discard-only (level 2); it is
-    frozen at allocation time by torch_memory_saver, so it cannot change per
-    /sleep request.
+    opened with host cpu_backup (level 1) or as discard-only (levels 2 and 3);
+    it is frozen at allocation time by torch_memory_saver, so it cannot change
+    per /sleep request.
     """
     global _enabled_override, _level_override, _tms, _import_attempted, _paused
     with _lock:
@@ -111,7 +118,7 @@ def is_enabled() -> bool:
 
 
 def sleep_mode_level() -> int:
-    """Startup-selected sleep level for this process (1 = host backup, 2 = discard).
+    """Startup-selected level (1 = host backup, 2/3 = discard and reload).
 
     Reads the explicit override first (set via :func:`configure_from_runtime`),
     then the ``SLEEP_MODE_LEVEL`` env var (mirrored from the parsed runtime
@@ -143,9 +150,14 @@ def _get_tms() -> Optional[Any]:
             )
 
             _tms = torch_memory_saver
+            backup = (
+                "with cpu backup"
+                if sleep_mode_level() == 1
+                else "without cpu backup (discard)"
+            )
             logging.info(
                 "WeightMemorySaver enabled: torch_memory_saver available, "
-                f"weights will be registered under tag={WEIGHTS_TAG!r} with cpu backup"
+                f"weights will be registered under tag={WEIGHTS_TAG!r} {backup}"
             )
         except Exception:
             _tms = None
@@ -207,9 +219,10 @@ def is_paused() -> bool:
 def weights_region() -> Iterator[None]:
     """Context manager registering CUDA allocations as pausable weight memory.
 
-    Equivalent to ``tms.region(tag="weights", enable_cpu_backup=True)`` when
-    the saver is available, ``nullcontext()`` otherwise. Re-entrant: nested
-    uses on the same thread enter the underlying region only once.
+    Opens ``tms.region(tag="weights", ...)`` when the saver is available,
+    ``nullcontext()`` otherwise. ``enable_cpu_backup`` follows the startup sleep
+    level (True for level 1, False for levels 2 and 3). Re-entrant: nested uses
+    on the same thread enter the underlying region only once.
     """
     tms = _get_tms()
     if tms is None:
@@ -237,11 +250,12 @@ def weights_region() -> Iterator[None]:
         pass
 
     # Level 1 backs weights up to pinned host on pause (fast wake, holds host
-    # RAM). Level 2 opens the region without host backup: pause frees GPU without
-    # a host copy and resume remaps blank pages at the same VA; the sleep hooks
-    # dump/reload the weights via a local-disk raw backup. tms freezes this
-    # choice at allocation time, hence it is a startup-level knob.
-    enable_cpu_backup = sleep_mode_level() != 2
+    # RAM). Levels 2 and 3 open the region without host backup: pause frees GPU
+    # without a host copy and resume remaps blank pages at the same VA; the sleep
+    # hooks then reload weights in place from the original checkpoint. Level 3
+    # additionally checkpoints the CUDA state left after these VMM releases.
+    # tms freezes this choice at allocation time, hence it is a startup-level knob.
+    enable_cpu_backup = sleep_mode_level() == 1
     _region_depth.value = 1
     try:
         with tms.region(tag=WEIGHTS_TAG, enable_cpu_backup=enable_cpu_backup):
@@ -251,12 +265,15 @@ def weights_region() -> Iterator[None]:
 
 
 def pause_weights() -> bool:
-    """Backup weights to host and release physical GPU pages (VA preserved).
+    """Release physical GPU pages for weights (VA preserved).
 
-    Returns True if the weights are paused after the call. No-op (warning,
-    returns False) when the saver is unavailable; idempotent when already
-    paused. Intended to be called from the M1 sleep sequence *after* the KV
-    cache pause.
+    Under level 1 the pages are backed up to pinned host memory first; under
+    levels 2 and 3 they are discarded with no host copy (reloaded from the
+    original checkpoint on wake). Returns True if the weights are paused after
+    the call.
+    No-op (warning, returns False) when the saver is unavailable; idempotent
+    when already paused. Intended to be called from the M1 sleep sequence
+    *after* the KV cache pause.
     """
     global _paused
     tms = _get_tms()
@@ -272,17 +289,21 @@ def pause_weights() -> bool:
             return True
         tms.pause(WEIGHTS_TAG)
         _paused = True
-        logging.info("WeightMemorySaver: weights paused (cpu backup, VA preserved)")
+        backup = "cpu backup" if sleep_mode_level() == 1 else "discarded, no host copy"
+        logging.info(f"WeightMemorySaver: weights paused ({backup}, VA preserved)")
         return True
 
 
 def resume_weights() -> bool:
-    """Remap physical pages at the same VA and copy weight content back.
+    """Remap physical pages at the same VA (VA preserved).
 
-    Returns True if the weights are resumed (not paused) after the call.
-    No-op (warning, returns False) when the saver is unavailable; idempotent
-    when not paused. Intended to be called from the M1 wake_up sequence
-    *after* the KV cache physical memory is remapped.
+    Under level 1 torch_memory_saver copies the host-backed content back. Under
+    levels 2 and 3 the remapped pages are blank; the sleep hooks reload the
+    weights in place from the original checkpoint afterwards. Returns True if
+    the weights are resumed (not paused) after the call. No-op (warning, returns
+    False) when the saver is unavailable; idempotent when not paused. Intended
+    to be called from the M1 wake_up sequence *after* the KV cache physical
+    memory is remapped.
     """
     global _paused
     tms = _get_tms()
@@ -298,16 +319,22 @@ def resume_weights() -> bool:
             return True
         tms.resume(WEIGHTS_TAG)
         _paused = False
-        logging.info("WeightMemorySaver: weights resumed (content restored)")
+        restored = (
+            "content restored"
+            if sleep_mode_level() == 1
+            else "blank pages, reload via loader"
+        )
+        logging.info(f"WeightMemorySaver: weights resumed ({restored})")
         return True
 
 
 def _reset_for_testing() -> None:
     """Reset module-level caches/state. Test-only helper."""
-    global _tms, _import_attempted, _paused, _enabled_override
+    global _tms, _import_attempted, _paused, _enabled_override, _level_override
     with _lock:
         _tms = None
         _import_attempted = False
         _paused = False
         _enabled_override = None
+        _level_override = None
     _region_depth.value = 0

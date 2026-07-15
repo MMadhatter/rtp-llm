@@ -26,6 +26,7 @@ from rtp_llm.models_py.distributed.deepep_wrapper import (
     DeepEPConfig,
     DeepEPWrapper,
     DeepepWrapperConfig,
+    destroy_deepep_wrapper,
     init_deepep_wrapper,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
@@ -1862,6 +1863,200 @@ class DeepEPTest(TestCase):
         destroy_distributed_environment()
 
     @staticmethod
+    def _assert_intranode_dispatch_ok(
+        buffer: DeepEPBuffer,
+        num_tokens: int,
+        hidden: int,
+        num_experts: int,
+        num_topk: int,
+        num_sms: int,
+        rank: int,
+        num_ranks: int,
+        group: dist.ProcessGroup,
+        tag: str,
+    ):
+        """Lean single BF16 dispatch+combine correctness check (subset of
+        _test_intranode_main). Used by the destroy/rebuild UT to prove a rebuilt
+        buffer is fully functional, without the heavy tuning sweeps."""
+        assert num_experts % num_ranks == 0
+
+        x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * rank
+        scores = (
+            torch.randn(
+                (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+            ).abs()
+            + 1
+        )
+        topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+        topk_weights = (
+            torch.ones((num_tokens, num_topk), dtype=torch.float32, device="cuda")
+            * rank
+        )
+        rank_idx = topk_idx // (num_experts // num_ranks)
+        rank_idx.masked_fill_(topk_idx == -1, -1)
+        inplace_unique(rank_idx, num_ranks)
+
+        num_tokens_per_expert = torch.zeros(
+            (num_experts,), dtype=torch.int, device="cuda"
+        )
+        for i in range(num_experts):
+            num_tokens_per_expert[i] = (topk_idx == i).sum()
+        gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
+        dist.all_reduce(gbl_num_tokens_per_expert, group=group)
+
+        num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, device="cuda")
+        token_idx_in_rank = torch.full(
+            (num_ranks, num_tokens), -1, dtype=torch.long, device="cuda"
+        )
+        for i in range(num_ranks):
+            num_tokens_per_rank[i] = (rank_idx == i).sum()
+            token_sel = (rank_idx == i).max(dim=-1)[0]
+            count = token_sel.sum().item()
+            tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+            tokens[:count] = torch.sort(tokens[:count])[0]
+            token_idx_in_rank[i][tokens[:count]] = torch.arange(
+                count, dtype=torch.long, device="cuda"
+            )
+        token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
+        is_token_in_rank = token_idx_in_rank >= 0
+        gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
+        dist.all_reduce(gbl_num_tokens_per_rank, group=group)
+
+        config = DeepEPConfig(num_sms, 8, 256)
+        (
+            recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            recv_num_tokens_per_expert_list,
+            handle,
+            event,
+        ) = buffer.dispatch(
+            x=x,
+            num_tokens_per_rank=num_tokens_per_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            config=config,
+        )
+        assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(
+            0
+        ), f"[{tag}] recv token count mismatch: {gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+
+        # Dispatched rows for source-rank i must all equal i (x was filled with rank)
+        rank_prefix_matrix = handle[0]
+        check_start = 0
+        for i in range(num_ranks):
+            check_end = rank_prefix_matrix[i][rank].item()
+            assert (
+                recv_x[check_start:check_end, :].int() - i
+            ).sum().item() == 0, f"[{tag}] dispatched data from rank {i} corrupted"
+            check_start = check_end
+
+        # Masked topk weights (mirror _test_intranode_main) then combine
+        recv_topk_weights[recv_topk_idx.eq(-1)] = recv_topk_weights.amax(
+            dim=1, keepdim=True
+        ).expand_as(recv_topk_weights)[recv_topk_idx.eq(-1)]
+        combined_x, combined_topk_weights, event = buffer.combine(
+            x=recv_x,
+            topk_weights=recv_topk_weights,
+            handle=handle,
+            config=config,
+        )
+        check_x = combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
+        assert (
+            calc_diff(check_x, x) < 5e-6
+        ), f"[{tag}] combine result diff too large: {calc_diff(check_x, x)}"
+
+    @staticmethod
+    def _run_deepep_destroy_rebuild_test(
+        rank: int, num_ranks: int, args: Dict[str, Any]
+    ):
+        """M1a UT: init -> destroy_deepep_wrapper -> re-init -> dispatch still
+        correct, over repeated cycles. Proves the production teardown/rebuild path
+        (buffer.destroy() via explicitly_destroy=True) leaves the singleton in a
+        clean, re-initializable state -- the invariant level-3 deep-sleep relies on
+        (a live DeepEP buffer makes cuCheckpoint Restore fail 801, PoC #8)."""
+        # GPU 0/1 by default; override to clean GPUs locally (e.g. "6,7").
+        visible = os.environ.get("DEEPEP_TEST_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = (
+            visible if visible else ",".join(str(i) for i in range(num_ranks))
+        )
+        nccl_comm_config, nccl_init_port, engine_config, model_config = (
+            DeepEPTest._create_deepep_config(
+                rank,
+                num_ranks,
+                args,
+                use_deepep_low_latency=False,
+                enable_ffn_disaggregate=False,
+            )
+        )
+        parallelism_config = engine_config.parallelism_config
+        torch.cuda.set_device(parallelism_config.local_rank)
+        torch.set_default_device(f"cuda:{parallelism_config.local_rank}")
+        init_distributed_environment(
+            parallelism_config=parallelism_config,
+            nccl_comm_config=nccl_comm_config,
+            nccl_init_port=nccl_init_port,
+            backend="nccl",
+            timeout=60,
+        )
+
+        config_adapter = MoEConfigAdapter(
+            model_config=model_config,
+            parallelism_config=engine_config.parallelism_config,
+            moe_config=engine_config.moe_config,
+        )
+        deepep_config = DeepepWrapperConfig.from_config_adapter(
+            config_adapter, ll_num_max_token_per_rank=0
+        )
+
+        def build_and_check(tag: str):
+            init_deepep_wrapper(engine_config, model_config)
+            assert DeepEPWrapper.is_initialized(), f"[{tag}] not initialized"
+            wrapper = DeepEPWrapper.get_instance(deepep_config)
+            DeepEPTest._assert_intranode_dispatch_ok(
+                wrapper.buffer,
+                args["max_seq_len"],
+                wrapper.hidden_size,
+                wrapper.num_experts,
+                wrapper.num_topk,
+                wrapper.num_sms,
+                wrapper.ep_rank,
+                wrapper.ep_size,
+                dist.group.WORLD,
+                tag,
+            )
+
+        # Baseline: clean start.
+        assert not DeepEPWrapper.is_initialized()
+
+        # Cycle 1: initial build + dispatch correctness.
+        build_and_check("initial")
+
+        # Production destroy -> singleton must be fully cleared and idempotent.
+        destroy_deepep_wrapper()
+        assert not DeepEPWrapper.is_initialized(), "destroy did not clear _initialized"
+        assert DeepEPWrapper._instance is None, "destroy did not clear _instance"
+        destroy_deepep_wrapper()  # idempotent: second call is a safe no-op
+        assert not DeepEPWrapper.is_initialized()
+        # All ranks must be torn down before any rank rebuilds: DeepEP rendezvous
+        # (all_gather_object on WORLD PG) requires every rank to participate.
+        dist.barrier()
+
+        # Cycle 2: rebuild + dispatch correctness again.
+        build_and_check("rebuild")
+
+        # Cycle 3: second destroy+rebuild to exercise repeated deep-sleep cycles.
+        destroy_deepep_wrapper()
+        assert not DeepEPWrapper.is_initialized()
+        dist.barrier()
+        build_and_check("rebuild2")
+
+        DeepEPWrapper.reset()
+        destroy_distributed_environment()
+
+    @staticmethod
     def _run_deepep_low_latency_test(rank: int, num_ranks: int, args: Dict[str, Any]):
         # set env
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_ranks))
@@ -2311,6 +2506,23 @@ class DeepEPTest(TestCase):
                 DeepEPTest._init_sp_deepep_wrapper,
                 args=(2,),
                 nprocs=2,
+                join=True,
+            )
+
+    def test_deepep_destroy_rebuild(self):
+        """M1a: DeepEP production destroy/rebuild (level-3 deep-sleep prerequisite)."""
+        with PortsContext(None, 1) as ports:
+            os.environ["MASTER_PORT"] = str(ports[0])
+            args = {
+                "max_seq_len": self.MAX_SEQ_LEN[0],
+                "hidden_size": self.HIDDEN_SIZES[0],
+                "expert_num": self.NUM_EXPERT[0],
+                "moe_k": self.TOP_K[0],
+            }
+            mp.spawn(
+                DeepEPTest._run_deepep_destroy_rebuild_test,
+                args=(self.NUM_PROCESSES[0], args),
+                nprocs=self.NUM_PROCESSES[0],
                 join=True,
             )
 

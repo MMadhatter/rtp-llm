@@ -75,6 +75,18 @@ public:
         return runner_ != nullptr ? runner_->getCurrentRealGraphBs(state_) : 0;
     }
 
+    void invalidateCapturedGraphs() {
+        if (runner_ != nullptr) {
+            runner_->invalidateCapturedGraphs();
+        }
+    }
+
+    void recaptureCapturedGraphs() {
+        if (runner_ != nullptr) {
+            runner_->recaptureCapturedGraphs();
+        }
+    }
+
     ~CudaGraphTestRunner() {
         reset_runner();
     }
@@ -116,5 +128,7 @@ PYBIND11_MODULE(libtest_cuda_graph_runner, m) {
              py::arg("decode_capture_batch_sizes"))
         .def("canRun", &CudaGraphTestRunner::canRun)
         .def("forward", &CudaGraphTestRunner::forward)
-        .def("getCurrentRealGraphSize", &CudaGraphTestRunner::getCurrentRealGraphSize);
+        .def("getCurrentRealGraphSize", &CudaGraphTestRunner::getCurrentRealGraphSize)
+        .def("invalidateCapturedGraphs", &CudaGraphTestRunner::invalidateCapturedGraphs)
+        .def("recaptureCapturedGraphs", &CudaGraphTestRunner::recaptureCapturedGraphs);
 }

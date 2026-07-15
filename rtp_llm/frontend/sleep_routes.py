@@ -42,10 +42,10 @@ def register_sleep_routes(app: FastAPI, grpc_client: Any) -> None:
                 status_code=400,
                 content={"error": "sleep level and timeout_ms must be integers"},
             )
-        if level not in (0, 1, 2):
+        if level not in (0, 1, 2, 3):
             return ORJSONResponse(
                 status_code=400,
-                content={"error": "sleep level must be 0, 1 or 2"},
+                content={"error": "sleep level must be 0, 1, 2 or 3"},
             )
         mode = req.get("mode", "wait")
         if mode not in ("wait", "abort"):

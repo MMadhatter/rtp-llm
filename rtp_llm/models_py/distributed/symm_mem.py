@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/bf214ca22625e311a2c4c0dfbf7af19128f4919c/vllm/distributed/device_communicators/symm_mem.py
 import logging
 import math
+import os
 from typing import Optional, Union
 
 import torch
@@ -245,11 +246,45 @@ class TorchSymmMemCommunicator:
 _symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
 
 
+def _sleep_mode_level_disables_symm_mem() -> bool:
+    """True when deep-sleep (level-3) is active for this process.
+
+    symm-mem's NVLS multicast binding wedges cuda-checkpoint and torch exposes no
+    in-process teardown (PoC #7/#7b), so level-3 currently skips symm-mem entirely
+    and TP all_reduce falls back to NCCL. NOTE: this is a TEMPORARY measure to bring
+    the level-3 path up end-to-end -- it costs the NVLS all_reduce fast path. The
+    perf-preserving fix (driver-level cuMulticastUnbind/cuMemUnmap at the checkpoint
+    boundary + rebind on wake, keeping symm-mem live at runtime) is tracked separately.
+
+    Reads the same env vars server_args mirrors from CLI (ENABLE_SLEEP_MODE /
+    SLEEP_MODE_LEVEL) rather than importing model_loader.weight_memory_saver, to keep
+    this comm module free of that bazel dependency.
+    """
+    if os.environ.get("ENABLE_SLEEP_MODE", "0") != "1":
+        return False
+    try:
+        return int(os.environ.get("SLEEP_MODE_LEVEL", "1")) == 3
+    except (TypeError, ValueError):
+        return False
+
+
 def init_symm_mem_communicator(
     tp_group: ProcessGroup,
 ) -> Optional[TorchSymmMemCommunicator]:
-    """Initialize TorchSymmMemCommunicator for TP group."""
+    """Initialize TorchSymmMemCommunicator for TP group.
+
+    Returns None (symm-mem disabled) under deep-sleep level-3; see
+    :func:`_sleep_mode_level_disables_symm_mem` for the why and the perf caveat.
+    """
     global _symm_mem_comm
+
+    if _sleep_mode_level_disables_symm_mem():
+        logging.info(
+            "SLEEP_MODE_LEVEL=3 (deep-sleep): skipping symm-mem init; TP all_reduce "
+            "uses NCCL (symm-mem is temporarily disabled -- incompatible with "
+            "cuda-checkpoint until the unbind/rebind bypass lands)"
+        )
+        return None
     try:
         symm_mem_comm = TorchSymmMemCommunicator(tp_group, torch.cuda.current_device())
         if symm_mem_comm.disabled:

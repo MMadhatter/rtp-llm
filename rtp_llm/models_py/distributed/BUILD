@@ -5,6 +5,7 @@ deep_ep_py_deps()
 py_library(
     name = "collective_torch",
     srcs = [
+        "collective_lifecycle.py",
         "collective_torch.py",
         "rocm_rccl.py",
         "symm_mem.py",

@@ -408,6 +408,18 @@ void NormalEngine::restart() {
     pause_cv_.notify_all();
 }
 
+void NormalEngine::invalidateCudaGraphs() {
+    if (executor_) {
+        executor_->invalidateCudaGraphs();
+    }
+}
+
+void NormalEngine::recaptureCudaGraphs() {
+    if (executor_) {
+        executor_->recaptureCudaGraphs();
+    }
+}
+
 void NormalEngine::markPauseQuiesced() {
     {
         std::lock_guard<std::mutex> lock(pause_mutex_);

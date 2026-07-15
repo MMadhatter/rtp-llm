@@ -112,6 +112,7 @@ class _FakeSleepStatusResponsePB(_FakeProtoMessage):
             "supported_levels": [],
             "supported_modes": [],
             "disabled_reason": "",
+            "process_id": 0,
         }
         defaults.update(kwargs)
         for key, value in defaults.items():
@@ -126,7 +127,11 @@ def _install_sleep_proto_test_fallback(pb2, grpc_client_wrapper_module):
         pb2.SleepRequestPB = _FakeSleepRequestPB
     if not hasattr(pb2, "WakeUpRequestPB"):
         pb2.WakeUpRequestPB = _FakeWakeUpRequestPB
-    if not hasattr(pb2, "SleepStatusResponsePB"):
+    sleep_status_pb = getattr(pb2, "SleepStatusResponsePB", None)
+    sleep_status_fields = getattr(
+        getattr(sleep_status_pb, "DESCRIPTOR", None), "fields_by_name", {}
+    )
+    if sleep_status_pb is None or "process_id" not in sleep_status_fields:
         pb2.SleepStatusResponsePB = _FakeSleepStatusResponsePB
 
     message_to_dict = grpc_client_wrapper_module.MessageToDict
@@ -634,6 +639,67 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(commit_request.commit_only)
             self.assertEqual(commit_request.timeout_ms, 0)
 
+    async def test_level3_sleep_checkpoints_all_local_backend_pids(self):
+        addresses = ["127.0.0.1:10001", "127.0.0.1:10009"]
+        wrapper, pb2 = self._build_wrapper(control_addresses=addresses)
+        pids = [111, 222]
+        for address, pid in zip(addresses, pids):
+            wrapper._dp_stubs[address].SleepServing = AsyncMock(
+                return_value=pb2.EmptyPB()
+            )
+            wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(
+                side_effect=[
+                    self._status_pb(pb2, supported_levels=[3], process_id=pid),
+                    self._status_pb(
+                        pb2,
+                        state="SLEEPING",
+                        supported_levels=[3],
+                        process_id=pid,
+                        kv_memory_state="PAUSED",
+                        device_kv_cache_valid=False,
+                        gpu_resource_state="RELEASED",
+                    ),
+                ]
+            )
+
+        with (
+            patch(
+                "rtp_llm.utils.grpc_client_wrapper.os.path.exists", return_value=True
+            ),
+            patch(
+                "rtp_llm.utils.grpc_client_wrapper.checkpoint_deep_sleep_targets"
+            ) as checkpoint,
+        ):
+            result = await wrapper.sleep_serving({"level": 3})
+
+        self.assertEqual(result, {"status": "ok"})
+        checkpoint.assert_called_once()
+        self.assertEqual(checkpoint.call_args.args[1], pids)
+
+    async def test_level3_sleep_rejects_multi_node_checkpoint(self):
+        addresses = ["10.0.0.1:10001", "10.0.0.2:10001"]
+        wrapper, pb2 = self._build_wrapper(control_addresses=addresses)
+        for address, pid in zip(addresses, [111, 222]):
+            wrapper._dp_stubs[address].SleepServing = AsyncMock(
+                return_value=pb2.EmptyPB()
+            )
+            wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(
+                side_effect=[
+                    self._status_pb(pb2, supported_levels=[3], process_id=pid),
+                    self._status_pb(
+                        pb2,
+                        state="SLEEPING",
+                        supported_levels=[3],
+                        process_id=pid,
+                    ),
+                ]
+            )
+
+        result = await wrapper.sleep_serving({"level": 3})
+
+        self.assertEqual(result["grpc_status"], "FAILED_PRECONDITION")
+        self.assertIn("single node", result["error"])
+
     async def test_sleep_serving_phase_rejected_before_status_probe(self):
         wrapper, pb2 = self._build_wrapper()
         address = wrapper.control_addresses[0]
@@ -687,6 +753,31 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(commit_request.prepare_only)
             self.assertTrue(commit_request.commit_only)
 
+    async def test_wake_up_restores_level3_before_first_status_rpc(self):
+        wrapper, pb2 = self._build_wrapper()
+        address = wrapper.control_addresses[0]
+        events = []
+
+        def restore(_control_addresses):
+            events.append("restore")
+            return True
+
+        async def get_status(*args, **kwargs):
+            events.append("status")
+            return self._status_pb(pb2, state="RUNNING")
+
+        wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(side_effect=get_status)
+        wrapper._dp_stubs[address].WakeUpServing = AsyncMock(return_value=pb2.EmptyPB())
+
+        with patch(
+            "rtp_llm.utils.grpc_client_wrapper.restore_deep_sleep_targets",
+            side_effect=restore,
+        ):
+            result = await wrapper.wake_up_serving()
+
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(events[:2], ["restore", "status"])
+
     async def test_wake_up_serving_phase_rejected_before_status_probe(self):
         wrapper, pb2 = self._build_wrapper()
         address = wrapper.control_addresses[0]
@@ -729,6 +820,7 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
             "supported_levels",
             "supported_modes",
             "disabled_reason",
+            "process_id",
             "state",
             "sleep_epoch",
             "kv_memory_state",
@@ -842,7 +934,9 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["grpc_status"], "UNIMPLEMENTED")
         self.assertIn("level=0", result["error"])
-        self.assertEqual(result["supported_levels"], [1])
+        # This fast rejection intentionally does not probe backend status, so it
+        # cannot know whether the process was configured for level 1, 2, or 3.
+        self.assertNotIn("supported_levels", result)
         wrapper._dp_stubs[address].GetSleepStatus.assert_not_awaited()
 
     async def test_sleep_serving_invalid_tag_element_rejected_before_status_probe(self):

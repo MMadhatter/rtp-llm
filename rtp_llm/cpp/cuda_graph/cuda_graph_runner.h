@@ -82,6 +82,8 @@ public:
     int            getCurrentRealGraphBs(const CudaGraphState& state) const;
     PyModelOutputs forward(const PyModelInputs& inputs, CudaGraphState& state) override;
     void           initCapture() override;
+    void           invalidateCapturedGraphs() override;
+    void           recaptureCapturedGraphs() override;
 
     // Factory methods for test: take GraphParams so callers can reuse the same struct
     static CudaGraphRunner* createForPrefill(py::object py_instance, GraphParams params);

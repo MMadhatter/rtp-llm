@@ -23,6 +23,8 @@ public:
     virtual bool consumeLastPauseSignal() {
         return false;
     }
+    virtual void invalidateCudaGraphs() {}
+    virtual void recaptureCudaGraphs() {}
 
     static GptModelDescription genModelDescription(const ModelConfig&       model_config,
                                                    const ParallelismConfig& parallelism_config,

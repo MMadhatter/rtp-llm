@@ -267,6 +267,18 @@ class FakeTmsForwardingTest(WeightMemorySaverTestBase):
         )
         self.assertEqual(self.fake.region_depth, 0)
 
+    def test_level_two_and_three_regions_discard_without_cpu_backup(self) -> None:
+        for level in (2, 3):
+            with self.subTest(level=level):
+                self.fake.region_calls.clear()
+                wms.configure_from_runtime(True, sleep_mode_level=level)
+                with wms.weights_region():
+                    pass
+                self.assertEqual(
+                    self.fake.region_calls,
+                    [{"tag": wms.WEIGHTS_TAG, "enable_cpu_backup": False}],
+                )
+
     def test_region_reentrant_enters_once(self) -> None:
         with wms.weights_region():
             with wms.weights_region():

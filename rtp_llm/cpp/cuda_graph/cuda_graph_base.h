@@ -38,7 +38,7 @@ struct GraphParams {
     // 0 = model does not use combo_position_ids (no buffer allocated, capture skips it).
     // >0 = factor (e.g. Mrope = rope_config.index_factor). Sourced from
     //     description_.attention_conf.rope_config in the model wrapper, not Python reflection.
-    int                  position_id_len_factor = 0;
+    int position_id_len_factor = 0;
 };
 
 class GraphBase {
@@ -51,6 +51,8 @@ public:
     virtual void           setTokenTypeEmbedding(torch::Tensor token_type_embedding)   = 0;
     virtual void           setInputEmbeddingScalar(float input_embedding_scalar)       = 0;
     virtual bool           canRun(const PyModelInputs& inputs, CudaGraphState& state)  = 0;
+    virtual void           invalidateCapturedGraphs()                                  = 0;
+    virtual void           recaptureCapturedGraphs()                                   = 0;
     py::object             py_instance_;
 };
 }  // namespace rtp_llm

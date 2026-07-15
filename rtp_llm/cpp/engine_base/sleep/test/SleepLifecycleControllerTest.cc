@@ -604,4 +604,188 @@ TEST(SleepLifecycleControllerTest, ConcurrentSleepWakeUpIsSerializedAndConsisten
     EXPECT_EQ(controller.sleepEpoch(), 1);
 }
 
+// --- M2: level-3 deep-sleep state-machine plumbing ---
+
+TEST(SleepLifecycleControllerTest, SleepLevelReplacesDiscardWeightsAndDrivesSupportedLevels) {
+    SleepLifecycleController controller(true);
+    // Default: level 1.
+    EXPECT_EQ(controller.sleepLevel(), 1);
+    EXPECT_FALSE(controller.discardWeights());
+    EXPECT_EQ(controller.status().supported_levels, std::vector<int32_t>{1});
+
+    // Back-compat shim still maps to level 2.
+    controller.setDiscardWeights(true);
+    EXPECT_EQ(controller.sleepLevel(), 2);
+    EXPECT_TRUE(controller.discardWeights());
+
+    // Explicit level 3 discards weights (reload on wake) and is advertised alone.
+    controller.setSleepLevel(3);
+    EXPECT_EQ(controller.sleepLevel(), 3);
+    EXPECT_TRUE(controller.discardWeights());
+    EXPECT_EQ(controller.status().supported_levels, std::vector<int32_t>{3});
+}
+
+TEST(SleepLifecycleControllerTest, LevelThreeProcessRejectsMismatchedRequestLevels) {
+    SleepLifecycleController controller(true);
+    controller.setSleepLevel(3);
+
+    for (int32_t bad : {1, 2}) {
+        auto opt          = gracefulOptions();
+        opt.level         = bad;
+        const auto result = controller.sleep(opt);
+        EXPECT_FALSE(result.ok);
+        EXPECT_EQ(result.code, SleepResult::Code::INVALID_ARGUMENT);
+        EXPECT_EQ(controller.state(), SleepState::RUNNING);
+    }
+}
+
+TEST(SleepLifecycleControllerTest, LevelThreeInvokesCollectiveHooksInOrderAcrossSleepWake) {
+    SleepLifecycleController controller(true);
+    controller.setSleepLevel(3);
+
+    std::vector<std::string> calls;
+    SleepHooks               hooks;
+    hooks.quiesceEngine = [&](const SleepOptions&) {
+        calls.push_back("quiesce");
+        return true;
+    };
+    hooks.synchronizeAndDeregisterMr = [&](const SleepOptions&) {
+        calls.push_back("dereg_mr");
+        return true;
+    };
+    hooks.teardownCollectives = [&](const SleepOptions& o) {
+        EXPECT_EQ(o.level, 3);
+        calls.push_back("teardown");
+        return true;
+    };
+    hooks.releaseKvMemoryBacking = [&](const SleepOptions&) {
+        calls.push_back("release_kv");
+        return true;
+    };
+    hooks.releaseRestorableGpuMemory = [&](const SleepOptions&) {
+        calls.push_back("release_gpu");
+        return true;
+    };
+    hooks.restoreKvMemoryBackingAndResetMetadata = [&]() {
+        calls.push_back("restore_kv");
+        return true;
+    };
+    hooks.restoreRestorableGpuMemory = [&]() {
+        calls.push_back("restore_gpu");
+        return true;
+    };
+    hooks.rebuildCollectives = [&]() {
+        calls.push_back("rebuild");
+        return true;
+    };
+    hooks.registerMr = [&]() {
+        calls.push_back("register_mr");
+        return true;
+    };
+    hooks.recaptureCollectiveGraphs = [&]() {
+        calls.push_back("recapture");
+        return true;
+    };
+    hooks.restartEngine = [&]() {
+        calls.push_back("restart");
+        return true;
+    };
+    hooks.warmupAndHealthCheck = [&]() {
+        calls.push_back("warmup");
+        return true;
+    };
+    controller.setHooks(hooks);
+
+    auto opt  = gracefulOptions();
+    opt.level = 3;
+    ASSERT_TRUE(controller.sleep(opt).ok);
+    EXPECT_EQ(controller.state(), SleepState::SLEEPING);
+    ASSERT_TRUE(controller.wakeUp().ok);
+    EXPECT_EQ(controller.state(), SleepState::RUNNING);
+
+    // teardown after MR dereg, before KV release; rebuild after weights restore,
+    // before MR register; recapture after MR register, before engine restart.
+    const std::vector<std::string> expected = {
+        "quiesce",
+        "dereg_mr",
+        "teardown",
+        "release_kv",
+        "release_gpu",
+        "restore_kv",
+        "restore_gpu",
+        "rebuild",
+        "register_mr",
+        "recapture",
+        "restart",
+        "warmup",
+    };
+    EXPECT_EQ(calls, expected);
+}
+
+TEST(SleepLifecycleControllerTest, CollectiveHooksNotInvokedBelowLevelThree) {
+    SleepLifecycleController controller(true);  // default level 1
+    std::atomic<int>         teardown{0}, rebuild{0}, recapture{0};
+    SleepHooks               hooks;
+    hooks.teardownCollectives = [&](const SleepOptions&) {
+        teardown++;
+        return true;
+    };
+    hooks.rebuildCollectives = [&]() {
+        rebuild++;
+        return true;
+    };
+    hooks.recaptureCollectiveGraphs = [&]() {
+        recapture++;
+        return true;
+    };
+    controller.setHooks(hooks);
+
+    ASSERT_TRUE(controller.sleep(gracefulOptions()).ok);
+    ASSERT_TRUE(controller.wakeUp().ok);
+
+    // Level-1 sleep must never touch the collective teardown/rebuild/recapture hooks.
+    EXPECT_EQ(teardown.load(), 0);
+    EXPECT_EQ(rebuild.load(), 0);
+    EXPECT_EQ(recapture.load(), 0);
+}
+
+TEST(SleepLifecycleControllerTest, TeardownCollectivesFailureTransitionsToError) {
+    SleepLifecycleController controller(true);
+    controller.setSleepLevel(3);
+    SleepHooks hooks;
+    hooks.teardownCollectives = [](const SleepOptions&) { return false; };
+    controller.setHooks(hooks);
+
+    auto opt          = gracefulOptions();
+    opt.level         = 3;
+    const auto result = controller.sleep(opt);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(controller.state(), SleepState::ERROR);
+    EXPECT_NE(controller.status().last_error.find("teardownCollectives"), std::string::npos);
+}
+
+TEST(SleepLifecycleControllerTest, RebuildCollectivesFailureOnWakeTransitionsToError) {
+    SleepLifecycleController controller(true);
+    controller.setSleepLevel(3);
+    std::atomic<int> register_mr_called{0};
+    SleepHooks       hooks;
+    hooks.rebuildCollectives = []() { return false; };
+    hooks.registerMr         = [&]() {
+        register_mr_called++;
+        return true;
+    };
+    controller.setHooks(hooks);
+
+    auto opt  = gracefulOptions();
+    opt.level = 3;
+    ASSERT_TRUE(controller.sleep(opt).ok);
+
+    const auto result = controller.wakeUp();
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(controller.state(), SleepState::ERROR);
+    // rebuild precedes registerMr, so a rebuild failure must short-circuit before it.
+    EXPECT_EQ(register_mr_called.load(), 0);
+    EXPECT_NE(controller.status().last_error.find("rebuildCollectives"), std::string::npos);
+}
+
 }  // namespace rtp_llm

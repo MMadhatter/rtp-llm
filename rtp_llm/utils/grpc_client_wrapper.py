@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -15,6 +16,10 @@ from rtp_llm.frontend.sleep_validation import (
     unsupported_lifecycle_control_field,
 )
 from rtp_llm.metrics import AccMetrics, GaugeMetrics, kmonitor
+from rtp_llm.utils.checkpoint_controller import (
+    checkpoint_deep_sleep_targets,
+    restore_deep_sleep_targets,
+)
 from rtp_llm.utils.time_util import Timer
 
 
@@ -327,6 +332,35 @@ class GrpcClientWrapper:
         ]
         return await asyncio.gather(*tasks)
 
+    def _collect_local_checkpoint_pids(
+        self, results: List[Dict[str, Any]]
+    ) -> List[int]:
+        failures = [result for result in results if "error" in result]
+        if failures:
+            raise RuntimeError("cannot collect backend pids from all control ranks")
+        hosts = {
+            address.rsplit(":", 1)[0].strip("[]") for address in self.control_addresses
+        }
+        if len(hosts) != 1:
+            raise RuntimeError(
+                "level-3 deep sleep currently supports a single node only"
+            )
+        pids = [_as_int(result.get("process_id", 0)) for result in results]
+        if (
+            len(pids) != len(self.control_addresses)
+            or any(pid <= 0 for pid in pids)
+            or len(set(pids)) != len(pids)
+        ):
+            raise RuntimeError(
+                "invalid or duplicate backend process ids from control ranks"
+            )
+        missing_pids = [pid for pid in pids if not os.path.exists(f"/proc/{pid}")]
+        if missing_pids:
+            raise RuntimeError(
+                "level-3 checkpoint targets are not local processes: " f"{missing_pids}"
+            )
+        return pids
+
     def _aggregate_sleep_status(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         successes = [result for result in results if "error" not in result]
         failures = [result for result in results if "error" in result]
@@ -447,13 +481,11 @@ class GrpcClientWrapper:
                     "grpc_status": "UNIMPLEMENTED",
                     "supported_modes": ["wait", "abort"],
                 }
-            # level 1 (host backup) and level 2 (discard weights) are both valid
-            # requests; the backend is the authority on which one this process
-            # supports (fixed at startup by sleep_mode_level) and returns
-            # INVALID_ARGUMENT on a mismatch.
-            if level not in (1, 2):
+            # The backend is the authority on which configured level this process
+            # supports and returns INVALID_ARGUMENT on a mismatch.
+            if level not in (1, 2, 3):
                 return {
-                    "error": "sleep level must be 0, 1 or 2",
+                    "error": "sleep level must be 0, 1, 2 or 3",
                     "grpc_status": "INVALID_ARGUMENT",
                 }
             mode = str(req.get("mode", "wait"))
@@ -551,7 +583,7 @@ class GrpcClientWrapper:
                     "grpc_status": failures[0].get("grpc_status", "UNKNOWN"),
                     "details": _error_details(commit_results),
                 }
-            status = await self.get_sleep_status()
+            final_results, status = await self._fetch_sleep_status()
             if "error" in status:
                 return status
             if status.get("state") != "SLEEPING":
@@ -559,6 +591,18 @@ class GrpcClientWrapper:
                     "error": "Sleep did not converge on all control ranks",
                     "grpc_status": "FAILED_PRECONDITION",
                 }
+            if level == 3:
+                try:
+                    pids = self._collect_local_checkpoint_pids(final_results)
+                    await asyncio.to_thread(
+                        checkpoint_deep_sleep_targets, self.control_addresses, pids
+                    )
+                except Exception as e:
+                    logging.error("level-3 backend checkpoint failed: %s", e)
+                    return {
+                        "error": f"Failed to checkpoint level-3 backend processes: {e}",
+                        "grpc_status": "FAILED_PRECONDITION",
+                    }
             return {"status": "ok"}
         except grpc.aio.AioRpcError as e:
             logging.error(f"Sleep serving failed: {e.details()}")
@@ -601,6 +645,21 @@ class GrpcClientWrapper:
                 return {
                     "error": f"wake_up {unsupported_field} is unsupported",
                     "grpc_status": "INVALID_ARGUMENT",
+                }
+            # A level-3 backend is frozen and cannot answer even GetSleepStatus.
+            # Restore it from the node-local registry before the first control RPC.
+            self._refresh_control_addresses_if_needed()
+            try:
+                restored = await asyncio.to_thread(
+                    restore_deep_sleep_targets, self.control_addresses
+                )
+                if restored:
+                    logging.info("restored level-3 backend processes before wake RPC")
+            except Exception as e:
+                logging.error("level-3 backend restore failed: %s", e)
+                return {
+                    "error": f"Failed to restore level-3 backend processes: {e}",
+                    "grpc_status": "FAILED_PRECONDITION",
                 }
             status = await self.get_sleep_status()
             if "error" in status:
@@ -661,16 +720,26 @@ class GrpcClientWrapper:
             logging.error(f"Wake_up serving failed: {e}")
             return {"error": f"Failed to wake_up serving: {str(e)}"}
 
+    async def _fetch_sleep_status(self) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Broadcast GetSleepStatus and return (raw per-rank results, aggregate).
+
+        The raw results are needed by level-3 sleep to extract each rank's
+        process_id; the aggregate is what every other caller wants. Reports
+        metrics as a side effect. Shared by get_sleep_status() and the sleep
+        commit path so the broadcast/aggregate/report logic lives in one place.
+        """
+        self._refresh_control_addresses_if_needed()
+        results = await self._broadcast_control_rpc(
+            "GetSleepStatus", pb2.EmptyPB(), timeout_s=3
+        )
+        status = self._aggregate_sleep_status(results)
+        _report_sleep_status_metrics(status)
+        return results, status
+
     async def get_sleep_status(self, req: Any = None) -> Dict[str, Any]:
         """Get aggregate sleep lifecycle status from every control rank."""
         try:
-            self._refresh_control_addresses_if_needed()
-            request = pb2.EmptyPB()
-            results = await self._broadcast_control_rpc(
-                "GetSleepStatus", request, timeout_s=3
-            )
-            status = self._aggregate_sleep_status(results)
-            _report_sleep_status_metrics(status)
+            _, status = await self._fetch_sleep_status()
             return status
         except Exception as e:
             logging.error(f"Get sleep status failed: {e}")

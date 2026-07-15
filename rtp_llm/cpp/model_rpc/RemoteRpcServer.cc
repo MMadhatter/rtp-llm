@@ -87,6 +87,23 @@ void RemoteRpcServer::initCacheStore(const EngineInitParams&                init
                      params.listen_port,
                      params.rdma_listen_port,
                      params.rdma_mode);
+    // level-3 deep-sleep (cuCheckpoint) + RDMA cache-store is a KNOWN-BROKEN combination on wake.
+    // cuCheckpointProcessRestore breaks the legacy nvidia-peermem (nvidia_p2p_get_pages) GPUDirect
+    // path, so re-registering the resumed VMM KV region via ibv_reg_mr fails with EFAULT (errno=14)
+    // and wake never recovers. The verified fix is to register GPU MRs through dma-buf
+    // (cuMemGetHandleForAddressRange(...,DMA_BUF_FD) -> ibv_reg_dmabuf_mr), which survives restore,
+    // but that change lives in the accl-barex library (XGpuMempoolImpl::MrForAllDevices) owned by
+    // another team and is intentionally NOT landed here. Warn loudly instead of silently failing.
+    // See freeze_resume_dev.md §16.14 / §18.P1.
+    if (params.rdma_mode && init_params.runtime_config.enable_sleep_mode
+        && init_params.runtime_config.sleep_mode_level >= 3) {
+        RTP_LLM_LOG_WARNING(
+            "sleep_mode_level=%ld with RDMA cache-store (cache_store_rdma_mode=1) under PD separation "
+            "is NOT supported: cuCheckpoint restore breaks nvidia-peermem GPUDirect, so wake will fail "
+            "at KV MR re-registration (ibv_reg_mr EFAULT). Use sleep_mode_level<=2 for RDMA PD, or land "
+            "the dma-buf MR registration in accl-barex. See freeze_resume_dev.md §16.14.",
+            init_params.runtime_config.sleep_mode_level);
+    }
     cache_store_ = NormalCacheStore::createNormalCacheStore(params);
     RTP_LLM_CHECK_WITH_INFO(cache_store_ != nullptr, "cache store init failed");
     RTP_LLM_LOG_INFO("cache store init success");
