@@ -400,20 +400,36 @@ void LocalRpcServer::installSleepHooks() {
         // cpu_backup, so pause frees GPU with no host copy and nothing is written
         // anywhere. Wake reloads the weights in place from the model loader
         // (see restoreRestorableGpuMemory below), so sleep just pauses the region.
+        // These pauses are the ESSENTIAL GPU release; do them first so a failure in the
+        // best-effort emptyCache() below can never leave the regions mapped.
         bool ok = pause_tag("cuda_graph");
         ok      = pause_tag("weights") && ok;
         // The engine is only paused (not torn down): the still-alive executor's transient
         // buffers (activations, attention/cuBLAS workspaces, sampler) can linger in the torch
         // device caching allocator as reserved-but-free blocks, which cudaMemGetInfo still
         // counts as used. Return them to the driver; the allocator transparently re-grows on
-        // wake. Only frees FREE cached blocks -- it does not touch the VMM-tagged weights/kv/
-        // cuda_graph regions (paused above via torch_memory_saver, still torch-"allocated").
-        // Yield is workload-dependent: near-zero once the engine is quiesced (transient pools
-        // already returned), larger when big prefill/capture pools were left cached.
+        // wake. Only frees FREE cached blocks; the VMM-tagged weights/kv/cuda_graph regions
+        // paused above are still torch-"allocated", so this does not target them.
+        //
+        // BEST-EFFORT ONLY: on a decode role with captured CUDA graphs, the caching allocator
+        // holds graph-private MemPool blocks backed by torch_memory_saver VMM. emptyCache()'s
+        // release_block() then issues a cuMemUnmap/cudaFree that returns "CUDA error: invalid
+        // argument" (reproduced on decode DP2 + CUDA graph regardless of whether it runs before
+        // or after the pauses; prefill without graph never hits it -- same family as the
+        // MemPool-destroy-under-TMS issue). This reclaim is non-essential -- yield is near-zero
+        // once the engine is quiesced -- so a failure must NOT fail the sleep: swallow it, drain
+        // the sticky CUDA error so it can't poison the subsequent wake, and continue.
 #if USING_CUDA || USING_ROCM
         {
             OptionalSleepDeviceGuard empty_cache_guard(local_rank);
-            c10::cuda::CUDACachingAllocator::emptyCache();
+            try {
+                c10::cuda::CUDACachingAllocator::emptyCache();
+            } catch (const std::exception& e) {
+                (void)cudaGetLastError();  // clear sticky error left by the failed free
+                RTP_LLM_LOG_WARNING("releaseRestorableGpuMemory: best-effort emptyCache() failed (%s); "
+                                    "continuing, GPU regions already released via VMM pause",
+                                    e.what());
+            }
         }
 #endif
         // Terminal sleep state: weights + cuda_graph GPU memory released (level-2 keeps no backup).
@@ -456,13 +472,19 @@ void LocalRpcServer::installSleepHooks() {
             reportSleepVmmOpTime("resume", tag, begin_time_us);
             return success;
         };
-        // resume("weights") remaps physical pages at the same VA. For level 1 the
-        // tms host cpu_backup already restored the content; for level 2 the pages
-        // come back blank, so reload the weights in place from the model loader
-        // (streams the original checkpoint through prepare_weights() and copy_ s
-        // into the live tensors -- preserves data_ptr, keeping C++ aliases and
-        // CUDA graphs valid). No on-disk backup is involved.
+        // resume("weights") and resume("cuda_graph") remap physical pages at the same VA.
+        // For level 1 the tms host cpu_backup already restored the content; for level 2 the
+        // weights pages come back blank and are reloaded below.
+        //
+        // IMPORTANT (level 2): resume BOTH VMM regions BEFORE the loader reload. The reload
+        // allocates transient shard/dequant buffers via the torch caching allocator
+        // (at::empty_cuda). If the "cuda_graph" region is still paused at that point, the
+        // allocator's graph-private MemPool is left with unmapped VMM pages, and a fresh
+        // at::empty_cuda throws "CUDA error: invalid argument" (reproduced on decode DP2 +
+        // CUDA graph; same MemPool-under-TMS family as the sleep-side emptyCache failure).
+        // Resuming cuda_graph first re-maps that pool so the reload's allocations succeed.
         bool ok = resume_tag("weights");
+        ok      = resume_tag("cuda_graph") && ok;
         if (ok && engine->sleepController().activeSleepLevel() == 2) {
             if (weight_manager_.is_none()) {
                 RTP_LLM_LOG_WARNING("level-2 wake: weight_manager unavailable, cannot reload weights");
@@ -478,7 +500,6 @@ void LocalRpcServer::installSleepHooks() {
             }
             reportSleepVmmOpTime("reload", "weights", reload_begin_us);
         }
-        ok = resume_tag("cuda_graph") && ok;
         // Weights (level-1 host restore / level-2 loader reload) + cuda_graph GPU memory back.
         logSleepMemorySnapshot("wake/after_weights_restore", local_rank);
         return ok;

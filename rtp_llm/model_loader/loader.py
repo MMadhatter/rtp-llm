@@ -367,8 +367,53 @@ class ModelLoader:
         return isinstance(weight.kernel, MoeAtomicWeight) and weight.scale is not None
 
     def _load_from_fastsafetensor(self, device: str):
-        logging.info(f"load weight by device: {device}")
         model_weights = self._create_model_weights(device)
+        # Thin consumer over the shared fastsafetensors generator: for the cold
+        # load we materialize new GPU storage via set_*_weight. The yield
+        # boundary does not change tensor ref lifetimes vs the previous inline
+        # body, so cold-load memory behavior is unchanged.
+        for layer_id, name, tensor in self.prepare_weights_fastsafetensor(device):
+            if layer_id is not None:
+                model_weights.set_layer_weight(layer_id, name, tensor)
+            else:
+                model_weights.set_global_weight(name, tensor)
+        return model_weights
+
+    def prepare_weights_fastsafetensor(
+        self, device: str, in_weights_region: bool = True
+    ):
+        """Bulk fastsafetensors weight generator: yields ``(layer_id, name, tensor)``.
+
+        Streams checkpoint shards through the fastsafetensors iterator and emits
+        already-processed tensors (post dequant / MoE per-expert split / TP
+        split) — the same layout ``prepare_weights`` produces per-tensor, but via
+        the fast bulk shard path instead of per-tensor database reads. Shared by
+        the cold load (:meth:`_load_from_fastsafetensor`) and the level-2 wake
+        reload (:meth:`WeightManager.reload_weights_from_loader`).
+
+        ``in_weights_region`` controls whether the fastsafetensors allocations are
+        scoped into the torch_memory_saver "weights" region:
+
+        * Cold load (``True``): the emitted tensors *become* the resident weights,
+          so they must live in the weights region to be paused/resumed by sleep.
+        * Wake reload (``False``): the emitted tensors are only transient ``copy_``
+          sources into weights that are already resident at a fixed VA. Scoping
+          them into the region would commit them (and every dequant/split
+          intermediate) as region-backed physical pages that ``cudaFree`` /
+          ``empty_cache`` cannot return to the driver — leaving several GB stuck
+          (and *growing with weight count*) and starving the subsequent KV-cache
+          ``resume`` (observed OOM in ``cu_mem_create``). With ``nullcontext``
+          they are plain torch allocations freed per-tensor in the reload loop,
+          so the stuck footprint collapses from "scales with the model" to a
+          bounded, model-size-independent residual (~1GB order): the freed blocks
+          land in torch segments co-tenanted with resident engine allocations, so
+          ``empty_cache`` cannot return those segments, but peak simultaneous
+          transient is tiny (one tensor at a time) so the residual no longer
+          scales. Fully draining that last residual would need per-reload segment
+          isolation (a private ``MemPool``), which aborts under
+          torch_memory_saver — see ``mempool-destroy-crashes-under-tms``.
+        """
+        logging.info(f"load weight by device: {device}")
         tensor_to_weight_map, weight_info_list = self._generate_weight_info()
 
         stacked_key_config = self._build_stacked_key_config(weight_info_list)
@@ -393,7 +438,7 @@ class ModelLoader:
             device,
             True,
             stacked_key_config=stacked_key_config,
-            allocation_context=weights_region,
+            allocation_context=weights_region if in_weights_region else None,
         )
 
         _inline_count = 0
@@ -438,12 +483,7 @@ class ModelLoader:
                     load_config=self._load_config,
                 )
                 for name, tensor in tensors.items():
-                    if weight_info.layer_id is not None:
-                        model_weights.set_layer_weight(
-                            weight_info.layer_id, name, tensor
-                        )
-                    else:
-                        model_weights.set_global_weight(name, tensor)
+                    yield (weight_info.layer_id, name, tensor)
                 weight_info.collector.clear()
                 if inline_fp8:
                     torch.cuda.empty_cache()
@@ -469,11 +509,42 @@ class ModelLoader:
                 load_config=self._load_config,
             )
             for name, tensor in tensors.items():
-                if weight_info.layer_id is not None:
-                    model_weights.set_layer_weight(weight_info.layer_id, name, tensor)
-                else:
-                    model_weights.set_global_weight(name, tensor)
-        return model_weights
+                yield (weight_info.layer_id, name, tensor)
+
+    def can_reload_from_fastsafetensor(self) -> bool:
+        """Whether the level-2 wake reload can use the fast bulk fastsafetensors path.
+
+        Distinct from the cold-start check (:meth:`_is_memory_enough_for_fastsafetensor`),
+        which sizes headroom for allocating a *second* full copy of the model.
+        Wake reload copies into weights that are ALREADY resident (blank pages
+        remapped by ``resume``), so only the transient shard buffers need
+        headroom — checked against a few max-size files, not the whole model.
+        Returns False (caller falls back to the load-from-scratch per-tensor
+        reload) when fastsafetensors is unavailable or the checkpoint is not
+        fast-loadable (non-safetensors / duplicate tensor names).
+        """
+        if not has_module("fastsafetensors"):
+            logging.info("reload: fastsafetensors module unavailable, use scratch path")
+            return False
+        if not self._load_config.database.is_safetensor:
+            logging.info("reload: checkpoint is not safetensors, use scratch path")
+            return False
+        tensors_name = self._load_config.database.get_pretrain_tensor_names()
+        if len(set(tensors_name)) != len(tensors_name):
+            logging.info("reload: duplicate tensor names, use scratch path")
+            return False
+        device_mem_info = self._load_config.exported_device.get_mem_info()
+        if device_mem_info is not None:
+            free_mb = device_mem_info.free / (1024.0**2)
+            max_file_mb = self._load_config.database.get_max_file_size() / (1024.0**2)
+            if free_mb <= 3 * max_file_mb:
+                logging.warning(
+                    "reload: insufficient transient headroom for fastsafetensors "
+                    f"(free={free_mb:.0f}MB <= 3x max_file={3 * max_file_mb:.0f}MB), "
+                    "use scratch path"
+                )
+                return False
+        return True
 
     def prepare_weights(self, device: str):
         if not self._is_attn_model:

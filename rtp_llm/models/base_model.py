@@ -186,7 +186,8 @@ class BaseModel(object):
 
         例外：level-2 sleep（丢弃权重）在 wake 时需要由 model loader 从原始
         checkpoint 原地重载权重（WeightManager.reload_weights_from_loader ->
-        ModelLoader.prepare_weights，经 _load_config.database 重读）。若此处清理
+        ModelLoader.prepare_weights_fastsafetensor 优先，不可用时回退
+        prepare_weights，两者均经 _load_config.database 重读）。若此处清理
         database（关闭 safetensor 句柄并清空 tensor 索引），wake 重载会以
         "ts is empty" 失败。因此 level-2 保留 database；其余模式照旧释放。保留的
         只是 tensor 索引 + safetensor header 元数据（KB~MB 级）与 mmap 句柄，
