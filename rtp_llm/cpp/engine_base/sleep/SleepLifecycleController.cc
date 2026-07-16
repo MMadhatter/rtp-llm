@@ -355,6 +355,21 @@ SleepResult SleepLifecycleController::wakeUp(const WakeUpOptions& opt) {
 
     // --- WAKING_UP: restore memory backing, reset metadata, reg MR, warmup (M5/M6/M7). ---
     bool ok = true;
+    // Restore weights (level-2 streams them back in place from the model loader)
+    // BEFORE re-backing the KV cache. The KV cache is sized to consume nearly all
+    // GPU memory left free after weights at cold start, so remapping the KV
+    // physical pages first leaves no headroom for the loader's transient buffers
+    // (raw checkpoint reads, dequant / TP-split / MoE-fusion intermediates) during
+    // the level-2 reload -> OOM. Weights-then-KV mirrors the cold-start order
+    // (weights load, then KV is sized from what remains). The two hooks are
+    // independent: the reload only copies into the weight tensors and cuda_graph
+    // resume only remaps graph-private pages; neither touches KV content.
+    if (!opt.commit_only && ok && hooks_.restoreRestorableGpuMemory) {
+        ok = invokeHookNoThrow("restoreRestorableGpuMemory", hooks_.restoreRestorableGpuMemory);
+        if (!ok) {
+            setLastError("restoreRestorableGpuMemory failed");
+        }
+    }
     if (!opt.commit_only && ok && hooks_.restoreKvMemoryBackingAndResetMetadata) {
         kv_memory_state_.store(KvMemoryState::WAKING_UP, std::memory_order_release);
         ok = invokeHookNoThrow("restoreKvMemoryBackingAndResetMetadata", hooks_.restoreKvMemoryBackingAndResetMetadata);
@@ -364,12 +379,6 @@ SleepResult SleepLifecycleController::wakeUp(const WakeUpOptions& opt) {
     }
     if (!opt.commit_only && ok) {
         kv_memory_state_.store(KvMemoryState::ACTIVE, std::memory_order_release);
-    }
-    if (!opt.commit_only && ok && hooks_.restoreRestorableGpuMemory) {
-        ok = invokeHookNoThrow("restoreRestorableGpuMemory", hooks_.restoreRestorableGpuMemory);
-        if (!ok) {
-            setLastError("restoreRestorableGpuMemory failed");
-        }
     }
     if (!opt.commit_only && ok && hooks_.registerMr) {
         ok = invokeHookNoThrow("registerMr", hooks_.registerMr);

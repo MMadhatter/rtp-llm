@@ -73,6 +73,7 @@ _paused: bool = False
 _enabled_override: Optional[bool] = None
 _level_override: Optional[int] = None
 _region_depth = threading.local()
+_region_suppressed = threading.local()
 
 
 def configure_from_runtime(
@@ -211,6 +212,13 @@ def weights_region() -> Iterator[None]:
     the saver is available, ``nullcontext()`` otherwise. Re-entrant: nested
     uses on the same thread enter the underlying region only once.
     """
+    # Explicitly suppressed on this thread (e.g. level-2 wake reload): the
+    # resident weights already occupy their VA, so nothing allocated now should
+    # join the region -- see suppress_weights_region().
+    if getattr(_region_suppressed, "value", False):
+        yield
+        return
+
     tms = _get_tms()
     if tms is None:
         yield
@@ -248,6 +256,31 @@ def weights_region() -> Iterator[None]:
             yield
     finally:
         _region_depth.value = 0
+
+
+@contextmanager
+def suppress_weights_region() -> Iterator[None]:
+    """Force every ``weights_region()`` on this thread to become a nullcontext.
+
+    Used by the level-2 wake reload. At wake the resident weight tensors already
+    occupy their fixed VA (remapped in place by torch_memory_saver ``resume``);
+    the reload only streams transient sources and ``copy_``-s them into those
+    live tensors. ``WeightModule.load`` (and the fastsafetensors iterator) would
+    otherwise allocate every raw read / dequant / TP-split / final ``.to(device)``
+    intermediate INSIDE the weights region -- committing them as region-backed,
+    cpu-backup pages that ``empty_cache`` cannot return to the driver. Those stick
+    around (and *grow with weight count*), then starve the following KV-cache
+    ``resume`` -> ``cu_mem_create`` OOM. Suppressing the region keeps them as plain
+    torch allocations, freed per-tensor in the reload loop. This is the
+    scratch-path analogue of ``prepare_weights_fastsafetensor(in_weights_region=
+    False)`` and also covers that path belt-and-suspenders.
+    """
+    prev = getattr(_region_suppressed, "value", False)
+    _region_suppressed.value = True
+    try:
+        yield
+    finally:
+        _region_suppressed.value = prev
 
 
 def pause_weights() -> bool:
