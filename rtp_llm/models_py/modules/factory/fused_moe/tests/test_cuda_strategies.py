@@ -95,7 +95,6 @@ def create_parallelism_config(
 
 def create_moe_config(
     use_deepep_low_latency: bool = False,
-    use_deepep_moe: Optional[bool] = None,
     use_all_gather: Optional[bool] = None,
     moe_strategy: Optional[str] = None,
 ) -> MoeConfig:
@@ -108,8 +107,6 @@ def create_moe_config(
     moe_config = MoeConfig()
     if use_deepep_low_latency is not None:
         moe_config.use_deepep_low_latency = use_deepep_low_latency
-    if use_deepep_moe is not None:
-        moe_config.use_deepep_moe = use_deepep_moe
     if use_all_gather is not None:
         moe_config.use_all_gather = use_all_gather
     if moe_strategy is not None:
@@ -325,9 +322,7 @@ class TestCudaFp8PerBlockEpNormalStrategy(unittest.TestCase):
             parallelism_config=create_parallelism_config(
                 ep_size=2, tp_size=1, dp_size=1
             ),
-            moe_config=create_moe_config(
-                use_deepep_moe=True, use_deepep_low_latency=False
-            ),
+            moe_config=create_moe_config(use_deepep_low_latency=False),
             enable_cuda_graph=False,
         )
 
@@ -350,9 +345,7 @@ class TestCudaFp8PerBlockEpNormalStrategy(unittest.TestCase):
             parallelism_config=create_parallelism_config(
                 ep_size=4, tp_size=2, dp_size=2
             ),
-            moe_config=create_moe_config(
-                use_deepep_moe=True, use_deepep_low_latency=False
-            ),
+            moe_config=create_moe_config(use_deepep_low_latency=False),
             enable_cuda_graph=False,
         )
 
@@ -375,9 +368,7 @@ class TestCudaFp8PerBlockEpNormalStrategy(unittest.TestCase):
             parallelism_config=create_parallelism_config(
                 ep_size=2, tp_size=1, dp_size=1
             ),
-            moe_config=create_moe_config(
-                use_deepep_moe=True, use_deepep_low_latency=False
-            ),
+            moe_config=create_moe_config(use_deepep_low_latency=False),
             enable_cuda_graph=False,
         )
 
@@ -399,9 +390,7 @@ class TestCudaFp8PerBlockEpNormalStrategy(unittest.TestCase):
         mock_get_sm.return_value = (9, 0)
         mock_supported.return_value = True
 
-        moe_config = create_moe_config(
-            use_deepep_moe=True, use_deepep_low_latency=True
-        )
+        moe_config = create_moe_config(use_deepep_low_latency=True)
         config = create_moe_config_adapter(
             model_config=create_model_config_with_fp8_block_quant(),
             parallelism_config=create_parallelism_config(
@@ -430,9 +419,7 @@ class TestCudaFp8PerBlockEpNormalStrategy(unittest.TestCase):
             parallelism_config=create_parallelism_config(
                 ep_size=1, tp_size=1, dp_size=1
             ),
-            moe_config=create_moe_config(
-                use_deepep_moe=True, use_deepep_low_latency=False
-            ),
+            moe_config=create_moe_config(use_deepep_low_latency=False),
             enable_cuda_graph=False,
         )
 
@@ -456,9 +443,7 @@ class TestCudaFp8PerBlockEpNormalStrategy(unittest.TestCase):
             parallelism_config=create_parallelism_config(
                 ep_size=2, tp_size=1, dp_size=1
             ),
-            moe_config=create_moe_config(
-                use_deepep_moe=True, use_deepep_low_latency=False
-            ),
+            moe_config=create_moe_config(use_deepep_low_latency=False),
             enable_cuda_graph=False,
         )
 
@@ -469,31 +454,6 @@ class TestCudaFp8PerBlockEpNormalStrategy(unittest.TestCase):
         # Verify it works with SM 9.0+
         mock_get_sm.return_value = (9, 0)
         self.assertTrue(strategy.can_handle(config))
-
-    @patch("rtp_llm.models_py.kernels.cuda.deepgemm_wrapper.has_deep_gemm")
-    @patch("rtp_llm.models_py.utils.arch.get_sm")
-    @patch("rtp_llm.models_py.distributed.deepep_wrapper.DeepEPWrapper.supported")
-    def test_can_handle_false_deepep_disabled(
-        self, mock_supported: Any, mock_get_sm: Any, mock_has_deep_gemm: Any
-    ) -> None:
-        """DeepEP strategy must not be selected when use_deepep_moe is false."""
-        mock_has_deep_gemm.return_value = True
-        mock_get_sm.return_value = (9, 0)
-        mock_supported.return_value = True
-
-        config = create_moe_config_adapter(
-            model_config=create_model_config_with_fp8_block_quant(),
-            parallelism_config=create_parallelism_config(
-                ep_size=2, tp_size=1, dp_size=2
-            ),
-            moe_config=create_moe_config(
-                use_deepep_moe=False, use_deepep_low_latency=False
-            ),
-            enable_cuda_graph=False,
-        )
-
-        strategy = CudaFp8PerBlockEpNormalStrategy()
-        self.assertFalse(strategy.can_handle(config))
 
     def test_priority(self) -> None:
         """Test priority"""

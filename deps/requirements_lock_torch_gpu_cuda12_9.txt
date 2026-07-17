@@ -2535,9 +2535,9 @@ partial-json-parser==0.2.1.1.post6 \
     --hash=sha256:43896b68929678224cbbe4884a6a5fe9251ded4b30b8b7d7eb569e5feea93afc \
     --hash=sha256:abc332f09b13ef5233384dbfe7128a0e9ea3fa4b8f8be9b37ac1b433c810e99e
     # via -r requirements_base.txt
-peft==0.13.2 \
-    --hash=sha256:0e0cbd40ebdf5fe4ea79f255880d02f96712d18899509369a2cc5768ad46d672 \
-    --hash=sha256:d4e0951ec78eac11c45a051801c569913436888c578d48e5ce86996b715bc6ef
+peft==0.17.1 \
+    --hash=sha256:3d129d64def3d74779c32a080d2567e5f7b674e77d546e3585138216d903f99e \
+    --hash=sha256:e6002b42517976c290b3b8bbb9829a33dd5d470676b2dec7cb4df8501b77eb9f
     # via auto-gptq
 pillow==12.0.0 \
     --hash=sha256:0869154a2d0546545cde61d1789a6524319fc1897d9ee31218eae7a60ccc5643 \

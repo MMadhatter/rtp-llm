@@ -88,11 +88,6 @@ class MoeConfigResolver:
         return config.moe_config.use_deepep_low_latency if config.moe_config else False
 
     @staticmethod
-    def use_deepep(config: MoEConfigAdapter) -> bool:
-        """Check if DeepEP is explicitly enabled for MoE routing."""
-        return config.moe_config.use_deepep_moe if config.moe_config else False
-
-    @staticmethod
     def is_single_gpu(config: MoEConfigAdapter) -> bool:
         """Check if single GPU mode
 
