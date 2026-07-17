@@ -90,19 +90,19 @@ public:
     size_t                  maxAvailableTokensNum() const;
     KVCacheInfo             getKVCacheInfo(int64_t latest_version, bool need_cache_keys) const;
 
-    // Sleep/wake_up (M5): physical KV memory release/restore + metadata reset.
+    // Sleep/wake_up: physical KV memory release/restore + metadata reset.
     // releaseKVCacheMemoryBacking: releases the physical pages of the KV big buffer while keeping its VA.
-    //   The caller (M1 SleepLifecycleController) must guarantee the engine is drained and
-    //   MRs are deregistered (M7) before calling.
+    //   The caller (SleepLifecycleController) must guarantee the engine is drained and
+    //   MRs are deregistered before calling.
     // restoreKVCacheMemoryBackingAndResetMetadata: re-maps physical pages at the same VA
     //   (content discarded), then resets all KV metadata: BlockPool::resetMetadata +
     //   BlockCache::clear (generation++).
-    //   device_kv_cache_valid bookkeeping is owned by M1. MemoryBlockCache is
+    //   device_kv_cache_valid bookkeeping is owned by SleepLifecycleController. MemoryBlockCache is
     //   host-backed and survives the device KV reset; drained writes remain reusable.
     bool releaseKVCacheMemoryBacking();
     bool restoreKVCacheMemoryBackingAndResetMetadata();
 
-    // Sleep/wake_up (M7): discard / reallocate the host memory-cache (enable_memory_cache)
+    // Sleep/wake_up: discard / reallocate the host memory-cache (enable_memory_cache)
     // pinned buffer. This tier is plain pinned host RAM (not under any VMM tag, not MR-
     // registered), so it needs an explicit free + reallocate independent of the GPU KV
     // VMM pause/resume above. Delegates to the connector coordinator; no-op when the

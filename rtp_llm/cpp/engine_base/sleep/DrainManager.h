@@ -12,24 +12,24 @@
 
 namespace rtp_llm {
 
-// M3 DrainManager (design doc §2 M3): aggregates in-flight counters from every
-// layer (frontend, rpc, scheduler, cache loading, connector, p2p, cache store)
-// and decides whether the engine is fully drained. Counter sources are injected
-// as named providers instead of hard dependencies on concrete classes, so unit
-// tests mock them and integration wires the real getters
+// Aggregates in-flight counters from every layer (frontend, rpc, scheduler,
+// cache loading, connector, p2p, cache store) and decides whether the engine is
+// fully drained. Counter sources are injected as named providers instead of hard
+// dependencies on concrete classes, so unit tests mock them and integration
+// wires the real getters
 // (e.g. KVCacheConnectorCoordinator::inflightTransferCount,
 // NormalCacheStore::activeTransferCount).
 //
 // Drain policies:
 //   - wait: waitDrained(timeout_ms) polls until all counters reach zero or
-//     the timeout expires. On timeout it returns false and the caller (M1)
-//     stays in DRAINING without releasing GPU resources.
+//     the timeout expires. On timeout it returns false and the caller stays in
+//     DRAINING without releasing GPU resources.
 //   - abort: an injected cancel callback is invoked first (the callback owner
 //     is responsible for cancelling non-streaming requests and exempting
 //     streaming ones), then drain is awaited as usual.
 //
-// Acts as the SleepHooks drain provider for SleepLifecycleController (M1)
-// via installHooks(). Thread-safe.
+// Acts as the SleepHooks drain provider for SleepLifecycleController via
+// installHooks(). Thread-safe.
 class DrainManager {
 public:
     using CounterFn = std::function<size_t()>;
@@ -76,11 +76,11 @@ public:
     // lock so the callback may freely query this DrainManager.
     void forceCancel();
 
-    // Aggregates for M1 status() reporting.
+    // Aggregates for status() reporting.
     int64_t activeRequestCount() const;
     int64_t activeCacheTransferCount() const;
 
-    // Wire this manager into M1's SleepHooks (drain + the two count hooks).
+    // Wire this manager into SleepHooks (drain + the two count hooks).
     // The DrainManager must outlive the controller that holds the hooks.
     void installHooks(SleepHooks& hooks);
 

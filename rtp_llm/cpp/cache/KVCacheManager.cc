@@ -432,15 +432,15 @@ KVCacheInfo KVCacheManager::getKVCacheInfo(int64_t latest_version, bool need_cac
     return info;
 }
 
-// Sleep/wake_up (M5)
+// Sleep/wake_up
 
 bool KVCacheManager::releaseKVCacheMemoryBacking() {
     if (!kv_memory_controller_) {
         RTP_LLM_LOG_ERROR("releaseKVCacheMemoryBacking failed: kv memory controller not initialized");
         return false;
     }
-    // Caller (M1) guarantees the engine is drained: no in-flight requests, schedulers stopped,
-    // connector transfers finished and MRs deregistered (M7) before physical pages are dropped.
+    // Caller guarantees the engine is drained: no in-flight requests, schedulers stopped,
+    // connector transfers finished and MRs deregistered before physical pages are dropped.
     return kv_memory_controller_->pausePhysicalMemory();
 }
 
@@ -450,7 +450,7 @@ bool KVCacheManager::restoreKVCacheMemoryBackingAndResetMetadata() {
         return false;
     }
     if (!kv_memory_controller_->resumePhysicalMemory()) {
-        // Physical memory is not back; keep metadata untouched and let M1 transition to ERROR.
+        // Physical memory is not back; keep metadata untouched and let the caller transition to ERROR.
         return false;
     }
 

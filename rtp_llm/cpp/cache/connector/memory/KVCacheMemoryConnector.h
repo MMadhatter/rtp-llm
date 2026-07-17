@@ -55,7 +55,7 @@ public:
     virtual bool              copyCache(const MemoryOperationRequestPB& request, MemoryOperationResponsePB& response);
     std::vector<CacheKeyType> cacheKeys() const;
 
-    // Sleep/wake_up (M7): discard the pinned host memory-cache buffer on sleep and
+    // Sleep/wake_up: discard the pinned host memory-cache buffer on sleep and
     // reallocate it on wake. Drops the cache-key->block LRU (block_cache_) since it
     // indexes into the freed buffer. Runs under malloc_mutex_. No-op-safe if the
     // block pool was never created.

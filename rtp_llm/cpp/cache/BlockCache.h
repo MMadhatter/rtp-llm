@@ -63,12 +63,10 @@ public:
     };
     EvictResult selectAndEvict(size_t min_blocks);
 
-    // Sleep/wake_up (M5): drop all entries and bump the cache generation.
-    // After a KV physical-memory pause/resume cycle, every cached block content is invalid
-    // (constraint C3), so all prefix-cache entries must be discarded.
-    // Minimal generation scheme: clearing empties the cache (any old cache key misses) and
-    // increments generation_; readers can compare generation() to detect stale snapshots /
-    // cache keys captured before the reset.
+    // Drop all entries and bump the cache generation. After a KV physical-memory pause/resume
+    // cycle every cached block's content is invalid, so all prefix-cache entries are discarded.
+    // Clearing empties the cache and increments generation_ so readers can detect stale
+    // snapshots or cache keys captured before the reset.
     void clear();
 
     // Monotonically increasing generation, bumped on every clear(). Entries put before a

@@ -162,9 +162,9 @@ class WeightModule(ABC):
         device: str,
         load_config: LoadConfig,
     ):
-        # Sleep/wake_up M6: this is the final `.to(device)` landing point for
-        # every weight tensor (incl. quant scale/zeros); register the GPU
-        # allocations as pausable weight memory (no-op unless enabled).
+        # This is the final `.to(device)` landing point for every weight tensor
+        # (incl. quant scale/zeros); register the GPU allocations as pausable
+        # weight memory (no-op unless sleep mode is enabled).
         with weights_region():
             raw_tensors = self._load_raw_tensor(
                 tensor_source, layer_id, device, load_config
@@ -197,7 +197,8 @@ class WeightModule(ABC):
     def update(
         self, tensor: torch.Tensor, device: str, load_config: LoadConfig, **kwargs
     ):
-        # Sleep/wake_up M6: dynamic weight update also lands via `.to(device)`.
+        # Dynamic weight update also lands on GPU via `.to(device)`; register it
+        # as pausable weight memory too.
         with weights_region():
             split_tensors = self._split(tensor, load_config)
             processed_tensors = self._postprocess(split_tensors, device, load_config)

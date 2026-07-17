@@ -7,14 +7,14 @@
 
 namespace rtp_llm {
 
-// Abstraction over the physical-memory pause/resume mechanism (sleep/wake_up M5).
+// Abstraction over the physical-memory pause/resume mechanism used by sleep/wake_up.
 //
 // Contract for all implementations:
 // - pause(tag) releases the physical GPU pages of every allocation tracked under `tag`
-//   while keeping the virtual address range reserved (constraint C2: VA must stay stable,
+//   while keeping the virtual address range reserved (VA must stay stable, since
 //   CUDA graphs and C++/Python aliases bake the pointers in).
 // - resume(tag) re-maps fresh physical pages at the very same virtual addresses.
-//   KV cache uses discard mode: the content after resume is undefined (constraint C3),
+//   KV cache uses discard mode: the content after resume is undefined,
 //   metadata reset is handled by the caller.
 class PhysicalMemoryBackend {
 public:
@@ -43,7 +43,7 @@ public:
 };
 
 // VMM backend backed by torch_memory_saver's LD_PRELOAD hook shim
-// (torch_memory_saver_hook_mode_preload*.so, validated by spike S1).
+// (torch_memory_saver_hook_mode_preload*.so).
 //
 // The shim intercepts cudaMalloc/cudaFree process-wide and exports a C API. We do not link
 // against it: the symbols are probed at runtime via dlsym(RTLD_DEFAULT). If the process was
@@ -85,17 +85,17 @@ private:
     ShimSetBoolFn set_enable_cpu_backup_fn_  = nullptr;
 };
 
-// Controls the physical memory backing the KV cache big buffer (sleep/wake_up M5).
+// Controls the physical memory backing the KV cache big buffer for sleep/wake_up.
 //
 // Attach mode: the buffer itself is allocated by BlockPool via torch::empty(kCUDA) (which the
 // preload shim intercepts at allocation time); the controller only records base_ptr/size and
 // drives pause/resume through the injected backend, by tag.
 //
 // Invariants:
-// - basePtr() never changes across pause/resume (VA stability, constraint C2).
+// - basePtr() never changes across pause/resume (VA stability).
 // - pause/resume are idempotent: re-pausing while paused (or re-resuming while running) is a
 //   no-op that does not hit the backend and returns true.
-// - The caller (M1 SleepLifecycleController sequence) guarantees the engine is drained before
+// - The caller (SleepLifecycleController) guarantees the engine is drained before
 //   pausePhysicalMemory(); after resumePhysicalMemory() the KV content is garbage and the
 //   caller must reset KV metadata (BlockPool::resetMetadata + BlockCache::clear).
 class KVCachePhysicalMemoryController {

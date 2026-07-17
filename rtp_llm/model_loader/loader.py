@@ -119,7 +119,7 @@ class ModelLoader:
         if self._weights_info.weight_style == WeightStyle.RTP_LLM_STYLE:
             raise ValueError("load_lora_weights only support non-ft-style weight")
 
-        # Sleep/wake_up M6: cover LoRA tensors when loaded directly to GPU.
+        # Cover LoRA tensors as pausable weight memory when loaded directly to GPU.
         with weights_region():
             for id in range(self._load_config.num_layers):
                 result = self._load_layer_lora_weights(adapter_name, id, device)

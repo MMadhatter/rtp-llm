@@ -1,4 +1,4 @@
-"""Unit tests for rtp_llm.model_loader.weight_memory_saver (Sleep/wake_up M6).
+"""Unit tests for rtp_llm.model_loader.weight_memory_saver.
 
 GPU-free: torch_memory_saver is faked via sys.modules injection (or forced
 to be un-importable with a None sys.modules entry), so the tests validate:

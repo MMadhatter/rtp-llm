@@ -97,9 +97,8 @@ class BaseMultiModalMixin:
         self.load_method = load_method
         self.ckpt_path = ckpt_path
 
-        # Sleep/wake_up M6: ViT module construction allocates parameters
-        # directly on `device`; register them as pausable weight memory
-        # (no-op unless sleep mode is enabled).
+        # ViT module construction allocates parameters directly on `device`;
+        # register them as pausable weight memory (no-op unless sleep mode is enabled).
         with weights_region():
             with torch.device(device):
                 torch_default_dtype = torch.get_default_dtype()
@@ -116,8 +115,8 @@ class BaseMultiModalMixin:
 
         self.mm_mixin_loader = self.create_mm_mixin_loader()
 
-        # Sleep/wake_up M6: ViT (mm_part) checkpoint weights land on `device`
-        # here; keep them inside the pausable weights region too.
+        # ViT (mm_part) checkpoint weights land on `device` here; keep them
+        # inside the pausable weights region too.
         with weights_region():
             self.weights = self.mm_mixin_loader.load_weights(device=device)
 

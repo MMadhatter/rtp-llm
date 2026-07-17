@@ -9,7 +9,7 @@
 
 namespace rtp_llm {
 
-// Sleep lifecycle state machine (design doc M1).
+// Sleep lifecycle state machine.
 //   RUNNING -> DRAINING -> SUSPENDING -> SLEEPING -> WAKING_UP -> RUNNING
 // ERROR is a terminal state reachable from SUSPENDING, DRAINING, or WAKING_UP
 // on hook failure. The process must be restarted by the control plane.
@@ -62,7 +62,7 @@ struct ControllerAdmissionResult {
     }
 };
 
-// Tracks where the KV physical memory currently is. Mirrors M5 backing states.
+// Tracks where the KV physical memory currently is.
 enum class KvMemoryState {
     ACTIVE,
     PAUSING,
@@ -72,7 +72,7 @@ enum class KvMemoryState {
 
 std::string kvMemoryStateToString(KvMemoryState state);
 
-// Options passed in via SleepServing RPC (proto SleepRequestPB, design doc M2).
+// Options passed in via SleepServing RPC (proto SleepRequestPB).
 struct SleepOptions {
     // vLLM-compatible level. level=0 is defined as state-preserving sleep
     // (restore weights/device KV/cuda graph on wake_up), but is not implemented
@@ -143,35 +143,35 @@ struct SleepResult {
     }
 };
 
-// Injection points filled in by downstream modules (M3 drain, M5 KV memory,
-// M6/M7 restorable GPU memory, M7 MR/engine quiesce). Hooks left empty are
-// treated as no-op success so the core state machine remains unit-testable.
+// Injection points filled in by downstream modules (drain, KV memory,
+// restorable GPU memory, MR/engine quiesce). Hooks left empty are treated as
+// no-op success so the core state machine remains unit-testable.
 struct SleepHooks {
-    // M3 DrainManager: block until drained (or timeout). Return true when drained.
+    // Block until drained (or timeout). Return true when drained.
     std::function<bool(const SleepOptions&)> drain;
-    // M7: stop scheduler loop at a collective-safe point. No memory/MR release here.
+    // Stop scheduler loop at a collective-safe point. No memory/MR release here.
     std::function<bool(const SleepOptions&)> quiesceEngine;
-    // M7: after every rank is quiesced, CUDA sync and dereg MR before memory release.
+    // After every rank is quiesced, CUDA sync and dereg MR before memory release.
     std::function<bool(const SleepOptions&)> synchronizeAndDeregisterMr;
-    // M5: release KV physical pages while keeping VA reserved. KV content is discarded.
+    // Release KV physical pages while keeping VA reserved. KV content is discarded.
     std::function<bool(const SleepOptions&)> releaseKvMemoryBacking;
-    // M6/M7: release CPU-backed long-lived allocations, currently weights + cuda_graph tags.
+    // Release CPU-backed long-lived allocations, currently weights + cuda_graph tags.
     std::function<bool(const SleepOptions&)> releaseRestorableGpuMemory;
 
-    // M5: re-map KV physical pages at the same VA and reset KV/prefix-cache metadata.
+    // Re-map KV physical pages at the same VA and reset KV/prefix-cache metadata.
     std::function<bool()> restoreKvMemoryBackingAndResetMetadata;
-    // M6/M7: restore CPU-backed long-lived allocations, currently weights + cuda_graph tags.
+    // Restore CPU-backed long-lived allocations, currently weights + cuda_graph tags.
     std::function<bool()> restoreRestorableGpuMemory;
-    // M7: reg MR + refresh rkey/epoch, while the engine loop is still quiesced.
+    // Reg MR + refresh rkey/epoch, while the engine loop is still quiesced.
     std::function<bool()> registerMr;
-    // M7: restart scheduler loop without resource work.
+    // Restart scheduler loop without resource work.
     std::function<bool()> restartEngine;
-    // M7: abort a prepared sleep from DRAINING and resume the engine loop.
+    // Abort a prepared sleep from DRAINING and resume the engine loop.
     std::function<bool()> cancelQuiesceAndRestartEngine;
-    // M7/M8: warmup + health self-check before going back online.
+    // Warmup + health self-check before going back online.
     std::function<bool()> warmupAndHealthCheck;
 
-    // M3: live counters surfaced through status().
+    // Live counters surfaced through status().
     std::function<int64_t()> activeRequestCount;
     std::function<int64_t()> activeCacheTransferCount;
 };
@@ -235,7 +235,7 @@ public:
     // Snapshot for GetSleepStatus.
     SleepStatus status() const;
 
-    // AdmissionGate (M4) hook: true only when fully RUNNING.
+    // AdmissionGate hook: true only when fully RUNNING.
     bool admit() const;
 
     // Atomically check RUNNING and, if admitted, increment the controller-owned
@@ -248,7 +248,7 @@ public:
     SleepState state() const;
 
 private:
-    // Pure transition legality check against the design doc state diagram.
+    // Pure transition legality check against the state diagram.
     static bool isLegalTransition(SleepState from, SleepState to);
 
     // Atomically move state_ from expected_from to to if the transition is legal.

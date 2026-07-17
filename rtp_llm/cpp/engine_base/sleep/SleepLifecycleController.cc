@@ -251,7 +251,7 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
         }
     }
 
-    // --- DRAINING: wait for in-flight requests and cache transfers (M3). ---
+    // --- DRAINING: wait for in-flight requests and cache transfers. ---
     if (!opt.commit_only && hooks_.drain) {
         // Route through invokeHookNoThrow like every other hook: a throwing
         // drain must not escape the transition while transition_mutex_ is held
@@ -290,10 +290,10 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
         return SleepResult::failedPrecondition(status().last_error);
     }
 
-    // --- SUSPENDING: dereg MR, release memory backing (M7/M5/M6). ---
-    // Order per design doc: engine already quiesced in prepare; CUDA sync + dereg MR
-    // happen before pausing KV physical memory; CPU-backed persistent allocations
-    // are released last.
+    // --- SUSPENDING: dereg MR, release memory backing. ---
+    // Ordering: engine already quiesced in prepare; CUDA sync + dereg MR happen
+    // before pausing KV physical memory; CPU-backed persistent allocations are
+    // released last.
     bool ok = true;
     if (ok && hooks_.synchronizeAndDeregisterMr) {
         ok = invokeHookNoThrow("synchronizeAndDeregisterMr", hooks_.synchronizeAndDeregisterMr, opt);
@@ -382,7 +382,7 @@ SleepResult SleepLifecycleController::wakeUp(const WakeUpOptions& opt) {
         return SleepResult::failedPrecondition(status().last_error);
     }
 
-    // --- WAKING_UP: restore memory backing, reset metadata, reg MR, warmup (M5/M6/M7). ---
+    // --- WAKING_UP: restore memory backing, reset metadata, reg MR, warmup. ---
     bool ok = true;
     // Restore weights (level-2 streams them back in place from the model loader)
     // BEFORE re-backing the KV cache. The KV cache is sized to consume nearly all

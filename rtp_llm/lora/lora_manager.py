@@ -89,9 +89,9 @@ class LoraManager:
             weights = self.weights_loader_.load_lora_weights(
                 adapter_name, lora_path, "cpu"
             )
-            # Freeze/Resume M6: the C++ add_lora uploads adapters host->GPU on
-            # this thread; register those allocations as pausable weight
-            # memory (the LD_PRELOAD hook intercepts in-thread C++ cudaMalloc).
+            # The C++ add_lora uploads adapters host->GPU on this thread;
+            # register those allocations as pausable weight memory (the
+            # LD_PRELOAD hook intercepts in-thread C++ cudaMalloc).
             with weights_region():
                 self.lora_cpp_wrapper_.add_lora(
                     adapter_name, weights.lora_a_weights, weights.lora_b_weights

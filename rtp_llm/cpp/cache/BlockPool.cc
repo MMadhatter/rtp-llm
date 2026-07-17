@@ -45,7 +45,7 @@ void BlockPool::initializeCacheBuffer() {
                                              torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
                                     .pin_memory();
     } else {
-        // Sleep/wake_up (M5): tag the KV big-buffer allocation so the torch_memory_saver
+        // Sleep/wake_up: tag the KV big-buffer allocation so the torch_memory_saver
         // preload shim (when present) tracks it under "kv_cache" and can later
         // pause/resume its physical pages. Without the shim this is a no-op.
         VmmBackend vmm_backend;

@@ -1,20 +1,20 @@
-"""WeightMemorySaver (Sleep/wake_up M6): weight GPU memory pause/resume with CPU backup.
+"""WeightMemorySaver: weight GPU memory pause/resume with CPU backup.
 
 Wraps ``torch_memory_saver`` so that every CUDA allocation that holds model
 weights is registered under the ``tag="weights"`` region with
 ``enable_cpu_backup=True``. On engine sleep, :func:`pause_weights` backs the
 weight pages up to host (pinned) memory and releases the physical GPU pages
-while keeping the virtual addresses stable (constraint C2: data_ptr must not
-change because CUDA graphs and the C++ ``weights_`` aliases bake pointers in).
-On wake_up, :func:`resume_weights` remaps physical pages at the same VA and
-copies the content back (constraint C4: weight content must be preserved).
+while keeping the virtual addresses stable (data_ptr must not change because
+CUDA graphs and the C++ ``weights_`` aliases bake pointers in). On wake_up,
+:func:`resume_weights` remaps physical pages at the same VA and copies the
+content back so weight values are preserved.
 
 Activation
 ----------
 Disabled by default. Enable by setting the environment variable
 ``ENABLE_SLEEP_MODE=1`` (or programmatically from the parsed runtime config)
 and having ``torch_memory_saver`` importable (typically via its LD_PRELOAD
-hook shim, see spike S1). ``RTP_LLM_WEIGHT_MEMORY_SAVER=1`` is kept as a
+hook shim). ``RTP_LLM_WEIGHT_MEMORY_SAVER=1`` is kept as a
 low-level developer override for isolated memory-saver tests. When the switch
 is off or the package is unavailable, every API in this module degrades to a
 no-op so production startup paths are unaffected.
@@ -39,13 +39,13 @@ Coverage checklist (weight tensors that must land inside ``weights_region``)
 - [covered] Dynamic LoRA adapters: ``LoraManager.add_lora``
   (rtp_llm/lora/lora_manager.py) wraps the host->device upload performed by
   the C++ ``add_lora`` (LD_PRELOAD hook intercepts the in-thread C++
-  cudaMalloc, validated by spike S1 "cpp" scenario).
+  cudaMalloc).
 - [covered] Draft / MTP propose models: loaded through the same
   ``BaseModel.load -> ModelLoader.load_weights`` path as the main model.
 - [left-for-integration] Dynamic EPLB weight relayout: Python
   ``ExpertBalancer.load_moe_weight`` only produces CPU tensors; the GPU-side
   expert buffers are (re)allocated inside the C++ engine (EPLB plan buffers).
-  Needs the C++-side region hook from M5/M7 integration.
+  Needs the C++-side region hook to be integrated.
 - [left-for-integration] Runtime in-place weight update (``WeightManager``)
   copies into already-registered tensors (no new GPU allocation), but any
   future reallocation there must also be wrapped.
@@ -235,7 +235,7 @@ def weights_region() -> Iterator[None]:
 
     # Drop cached allocator blocks so weight tensors cannot be served from
     # physically-backed cache blocks allocated *before* this region (those
-    # would escape torch_memory_saver tracking; see spike S1 notes).
+    # would escape torch_memory_saver tracking).
     try:
         import torch
 
@@ -288,7 +288,7 @@ def pause_weights() -> bool:
 
     Returns True if the weights are paused after the call. No-op (warning,
     returns False) when the saver is unavailable; idempotent when already
-    paused. Intended to be called from the M1 sleep sequence *after* the KV
+    paused. Intended to be called from the sleep sequence *after* the KV
     cache pause.
     """
     global _paused
@@ -314,8 +314,8 @@ def resume_weights() -> bool:
 
     Returns True if the weights are resumed (not paused) after the call.
     No-op (warning, returns False) when the saver is unavailable; idempotent
-    when not paused. Intended to be called from the M1 wake_up sequence
-    *after* the KV cache physical memory is remapped.
+    when not paused. Intended to be called from the wake_up sequence *after*
+    the KV cache physical memory is remapped.
     """
     global _paused
     tms = _get_tms()
