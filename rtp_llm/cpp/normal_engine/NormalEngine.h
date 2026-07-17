@@ -78,13 +78,20 @@ private:
     bool isEagle() override;
 
 private:
-    autil::ThreadPtr        loop_thread_;
-    std::atomic<bool>       running_{false};
-    std::mutex              process_mutex_;
-    std::mutex              collective_quiesce_state_mutex_;
-    torch::Tensor           collective_quiesce_state_;
-    torch::Tensor           collective_quiesce_result_;
-    bool                    collective_quiesce_prev_pending_ = false;
+    autil::ThreadPtr  loop_thread_;
+    std::atomic<bool> running_{false};
+    std::mutex        process_mutex_;
+    std::mutex        collective_quiesce_state_mutex_;
+    torch::Tensor     collective_quiesce_state_;
+    // Async arm-on-demand sleep-quiesce consensus state (see maybeReachCollectiveSleepQuiesce).
+    // engaged_: latched true once this rank observes pause_, cleared on a terminal verdict
+    //           (consensus reached, or globally cancelled). Steady serving keeps it false so
+    //           the step loop issues ZERO consensus collectives.
+    // handle_:  opaque non-zero id of the in-flight async all-reduce (0 = none in flight). A
+    //           rank issues round k+1 only after round k completes, so per-rank round counts
+    //           stay matched across the group.
+    bool                    collective_quiesce_engaged_ = false;
+    uint64_t                collective_quiesce_handle_  = 0;
     std::mutex              pause_mutex_;
     std::condition_variable pause_cv_;
     // Monotonic quiesce acknowledgement: the highest pause epoch a quiesce has

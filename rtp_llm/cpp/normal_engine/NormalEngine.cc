@@ -482,26 +482,41 @@ bool NormalEngine::collectiveSleepQuiesceEnabled() const {
            && (parallelism_config.dp_size > 1 || parallelism_config.ep_size > 1);
 }
 
-// Why a per-step collective (all-reduce) is unavoidable here, despite the cost of touching
-// the DP/TP path:
+// Why the sleep-quiesce consensus needs a collective at all, and why it now costs the steady
+// serving path nothing:
 //
-// Under DP/EP (world_size > 1 with dp_size > 1 or ep_size > 1), every step's forward pass
-// itself issues collectives (all-reduce / all-to-all) over the SAME DP_AND_TP communicator.
-// A collective only completes when every rank in the group participates. Sleep therefore
-// cannot be a rank-local decision: if the coordinator merely set each rank's pause_ flag and
-// let ranks stop independently, a rank that stopped one step before its peers would leave
-// those peers' next forward-pass collective blocked forever on the departed rank -- a
-// fleet-wide hang, not a clean sleep.
+// Under DP/EP (world_size > 1 with dp_size > 1 or ep_size > 1) sleep cannot be a rank-local
+// decision. The pause request is broadcast to every rank's engine independently
+// (grpc_client_wrapper.sleep_serving fans out to every control rank), but arrives
+// asynchronously: rank A may observe pause_ several steps before rank B. If a rank simply
+// stopped as soon as it saw pause_, its peers' next forward-pass collective (TP all-reduce /
+// EP all-to-all) would block forever on the departed rank -- a fleet-wide hang, not a clean
+// sleep. The ranks must instead agree, from a value every rank observes identically, that
+// "everyone has received the pause AND everyone is drained" before any of them stops.
 //
-// The ranks must instead agree, on the identical step, that "everyone has received the pause
-// AND everyone is drained" before any of them stops. There is no lock-free, rank-local way to
-// reach that agreement across a collective group -- consensus has to travel over the same
-// communicator the forward path uses. So we are forced to fold a tiny consensus all-reduce
-// into the step loop; it is the only construct that guarantees all ranks observe the same
-// quiesce verdict on the same step and can then stop together. (The single-rank / pure-TP
-// deployment escapes this entirely -- see releasePendingTpCollectiveForPause() /
-// enterPausedState(), which need no per-step collective.) The code below is all about paying
-// for this unavoidable collective as cheaply as possible on the normal serving path.
+// That agreement is an all-reduce, but it is issued ASYNCHRONOUSLY and ONLY WHILE A SLEEP IS
+// ARMED, on a DEDICATED communicator (ParallelMode::SLEEP_QUIESCE) that carries no other
+// traffic:
+//   * Steady state (no pause armed): this function returns after a single relaxed atomic
+//     load. It issues NO collective, acquires NO GIL, does NO device work -- the decode hot
+//     path pays nothing. This is what the earlier every-step blocking all-reduce could not do.
+//   * Armed: the rank latches "engaged" and drives one async all-reduce at a time. Because it
+//     is async_op=True the rank KEEPS participating in its forward collectives while the
+//     consensus is in flight, so an early-arming rank never strands its peers -- the deadlock
+//     that forces a *blocking* consensus to run every step cannot occur.
+//   * Dedicated comm: an async round can complete a variable number of engine steps after it
+//     was issued. On the shared DP_AND_TP communicator that lag would let the consensus
+//     interleave with EPLB's periodic all-reduce/broadcast (ExpertBalancer, also on
+//     DP_AND_TP) and desync the collective stream. A private communicator carrying only the
+//     consensus makes the k-th round unambiguous on every rank.
+//
+// Round matching / termination: a rank issues round k+1 only after round k completes, so all
+// ranks run the same 1..K rounds. The verdict is derived from the shared summed result, so
+// every rank reaches the same terminal round K simultaneously (all armed + all drained ->
+// REACHED; or, after a cancel/wake, the pending count returns to zero -> CANCELLED) and stops
+// issuing together -- no rank is ever left with an unmatched collective. (The single-rank /
+// pure-TP deployment escapes all of this -- see releasePendingTpCollectiveForPause() /
+// enterPausedState(), which need no collective.)
 absl::Status NormalEngine::maybeReachCollectiveSleepQuiesce() {
     if (!collectiveSleepQuiesceEnabled()) {
         return absl::OkStatus();
@@ -509,88 +524,86 @@ absl::Status NormalEngine::maybeReachCollectiveSleepQuiesce() {
 
     const bool pending = pause_.load(std::memory_order_acquire);
 
-    // data[0] = number of ranks that have received the pause request.
-    // data[1] = number of ranks not ready (either not pending or still has inflight streams).
-    // Quiesce is reached when all ranks are pending (data[0] == world_size) and
-    // none are blocked (data[1] == 0).
-    //
-    // The all-reduce MUST be issued on EVERY step regardless of pending, because the
-    // decision to call it has to be rank-symmetric: gating it on the per-rank pause_
-    // flag would let a rank that received sleep first block inside the collective while
-    // peers still run normal forwards, hanging the fleet. Two of its costs are kept off
-    // the normal serving path: a non-pending rank's contribution is the constant [0, 1]
-    // ("not pausing, counts as one not-ready"), so the input buffer is filled once and
-    // reduced out-of-place into a separate result buffer (input preserved -> no per-step
-    // fill), and the device->host copy that reads the consensus only runs while a sleep
-    // is actually pending.
-    //
-    // What is NOT free, and what makes this a known interim cost rather than a zero-cost
-    // path: execAllReduce() here is not a native NCCL call. It acquires the Python GIL and
-    // invokes a registered Python callback (models_py/distributed/collective_torch.py),
-    // which runs torch.distributed.all_reduce WITHOUT async_op -- a blocking enqueue, not a
-    // fire-and-forget. So on EVERY step of a DP/EP deployment this adds a GIL acquisition, a
-    // C++->Python round-trip, and a 16-byte all-reduce enqueue on the DP_AND_TP communicator,
-    // even when no sleep is pending. That is measurable on the decode hot path and is the
-    // reason collectiveSleepQuiesceEnabled() is scoped as narrowly as possible (sleep enabled
-    // AND world_size>1 AND dp/ep>1). The intended end state is to sink this consensus into the
-    // native comm layer and fold it into the existing forward-pass collective so the steady
-    // state costs nothing extra; until then this per-step Python round-trip is the price of
-    // hang-free DP/EP sleep. See freeze_resume_dev.md for the DP/EP decode benchmark and the
-    // native-lowering plan.
+    // Steady serving fast path: nothing armed and no round in flight -> issue no collective.
+    // engaged_ and handle_ are touched only on the engine loop thread (this function runs
+    // from step()), so they need no synchronization.
+    if (!collective_quiesce_engaged_ && collective_quiesce_handle_ == 0 && !pending) {
+        return absl::OkStatus();
+    }
+
+    // First observation of pause_ arms this rank. Once engaged we stay engaged (still issuing
+    // rounds) even if pause_ later clears via wake, so a cancel converges to a shared CANCELLED
+    // verdict rather than leaving peers waiting on a round this rank stopped issuing.
+    if (pending) {
+        collective_quiesce_engaged_ = true;
+    }
+
     bool reached = false;
     {
-        // step() normally runs only on the engine loop thread. Keep the reusable
-        // buffers safe if another caller enters the execute path concurrently.
+        // Guard the reusable buffer against a concurrent execute-path caller. The async round
+        // reduces IN-PLACE on collective_quiesce_state_; because we never refill or read the
+        // buffer until the in-flight round completes, its contents are stable while in flight.
         std::lock_guard<std::mutex> lock(collective_quiesce_state_mutex_);
         c10::DeviceGuard            device_guard(c10::Device(c10::kCUDA, static_cast<c10::DeviceIndex>(getDeviceId())));
         if (!collective_quiesce_state_.defined()) {
             const auto options = torch::TensorOptions()
                                      .dtype(torch::kInt64)
                                      .device(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(getDeviceId())));
-            collective_quiesce_state_  = torch::empty({2}, options);
-            collective_quiesce_result_ = torch::empty({2}, options);
-            // Steady-state not-pausing contribution: [pending=0, not_ready=1].
-            collective_quiesce_state_.select(0, 0).fill_(0);
-            collective_quiesce_state_.select(0, 1).fill_(1);
-            collective_quiesce_prev_pending_ = false;
+            collective_quiesce_state_ = torch::empty({2}, options);
         }
 
-        if (pending) {
-            const int64_t unfinished =
-                parallelism_config.tp_rank == 0 && scheduler_ ? std::max<int64_t>(0, scheduler_->onflightStreams()) : 0;
-            collective_quiesce_state_.select(0, 0).fill_(1);
+        if (collective_quiesce_handle_ == 0) {
+            // No round in flight: fill this rank's contribution and enqueue an async round.
+            //   data[0] = 1 if this rank currently holds the pause request, else 0.
+            //   data[1] = unfinished streams on this rank (only tp_rank 0 can observe them).
+            const int64_t pending_flag = pending ? 1 : 0;
+            const int64_t unfinished   = (pending && parallelism_config.tp_rank == 0 && scheduler_) ?
+                                             std::max<int64_t>(0, scheduler_->onflightStreams()) :
+                                             0;
+            collective_quiesce_state_.select(0, 0).fill_(pending_flag);
             collective_quiesce_state_.select(0, 1).fill_(unfinished);
-        } else if (collective_quiesce_prev_pending_) {
-            // Left the pause window (sleep cancelled): reset the input back to the
-            // [0, 1] constant once so later normal steps need no fill.
-            collective_quiesce_state_.select(0, 0).fill_(0);
-            collective_quiesce_state_.select(0, 1).fill_(1);
+            collective_quiesce_handle_ =
+                execAllReduceAsync({collective_quiesce_state_, ReduceOp::Sum, false, ParallelMode::SLEEP_QUIESCE});
+            // handle 0 => async path unavailable (no callback / degenerate group). Nothing to
+            // wait for; retry next step. (Should not happen once the group is built.)
+            return absl::OkStatus();
         }
-        collective_quiesce_prev_pending_ = pending;
 
-        // Out-of-place reduce into a dedicated result buffer so the input keeps its
-        // constant value across steps (a non-pending rank must always contribute a
-        // correct [0, 1], because a pending peer reads the summed result).
-        auto reduced =
-            execAllReduce(
-                {collective_quiesce_state_, ReduceOp::Sum, false, ParallelMode::DP_AND_TP, collective_quiesce_result_})
-                .buffer;
-
-        // Only the pausing path needs the consensus value; reading it forces a
-        // device->host sync, so keep that off the normal serving path.
-        if (pending) {
-            if (reduced.device().is_cuda()) {
-                reduced = reduced.cpu();
-            }
-            auto          reduced_data    = reduced.data_ptr<int64_t>();
-            const int64_t pending_sum     = reduced_data[0];
-            const int64_t not_ready_count = reduced_data[1];
-            reached                       = pending_sum == parallelism_config.world_size && not_ready_count == 0;
+        // A round is in flight. Poll without blocking the loop; if not done, keep serving and
+        // participating in forward collectives (the whole point of async arm-on-demand).
+        if (!pollAsyncComm(collective_quiesce_handle_)) {
+            return absl::OkStatus();
         }
+        collective_quiesce_handle_ = 0;
+
+        // Round complete: read the summed verdict. The device->host copy only ever runs on the
+        // armed path (never in steady serving). pollAsyncComm() already waited on the collective,
+        // so the reduced buffer is safe to read here.
+        auto reduced = collective_quiesce_state_;
+        if (reduced.device().is_cuda()) {
+            reduced = reduced.cpu();
+        }
+        auto          reduced_data    = reduced.data_ptr<int64_t>();
+        const int64_t pending_sum     = reduced_data[0];
+        const int64_t not_ready_count = reduced_data[1];
+
+        if (pending_sum == parallelism_config.world_size && not_ready_count == 0) {
+            reached = true;  // all ranks armed AND drained on the same round -> sleep now
+        } else if (pending_sum == 0) {
+            // Every rank has left the pause window (sleep cancelled / woken before quiesce):
+            // disengage together on this shared verdict and resume normal serving at zero cost.
+            collective_quiesce_engaged_ = false;
+            RTP_LLM_LOG_INFO("normal engine collective sleep quiesce cancelled before reaching, world_size=%ld",
+                             parallelism_config.world_size);
+        }
+        // else: partial (some ranks still arming, or still draining) -> stay engaged and issue
+        // the next round on a later step.
     }
 
     if (reached) {
-        const auto pause_epoch = pause_epoch_.load(std::memory_order_acquire);
+        // Disengage before parking so a subsequent wake resumes at the steady zero-cost path.
+        collective_quiesce_engaged_ = false;
+        const auto pause_epoch      = pause_epoch_.load(std::memory_order_acquire);
         processed_pause_epoch_.store(pause_epoch, std::memory_order_release);
         RTP_LLM_LOG_INFO("normal engine collective sleep quiesce reached, epoch=%lu, world_size=%ld",
                          pause_epoch,
