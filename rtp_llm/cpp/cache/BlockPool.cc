@@ -71,8 +71,6 @@ void BlockPool::initializeCacheBuffer() {
             RTP_LLM_LOG_INFO("KV cache buffer (%zu bytes) allocated under VMM tag '%s'",
                              config_.total_size_bytes,
                              KVCachePhysicalMemoryController::kDefaultTag);
-            VmmTagStatsRegistry::recordAllocation(KVCachePhysicalMemoryController::kDefaultTag,
-                                                  config_.total_size_bytes);
         }
     }
     cache_base_ptr_ = cache_aligned_buffer_.data_ptr();

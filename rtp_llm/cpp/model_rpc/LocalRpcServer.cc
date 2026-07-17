@@ -309,14 +309,6 @@ void LocalRpcServer::installSleepHooks() {
 
     SleepHooks hooks;
     drain_manager_->installHooks(hooks);  // drain + activeRequestCount + activeCacheTransferCount
-    auto drain_hook = hooks.drain;
-    hooks.drain     = [this, drain_hook](const SleepOptions& opt) {
-        const auto begin_time_us = currentTimeUs();
-        const bool success       = drain_hook ? drain_hook(opt) : true;
-        reportSleepDrainTime(opt.mode, begin_time_us, success);
-        return success;
-    };
-
     const auto local_rank  = maga_init_params_.parallelism_config.local_rank;
     auto       vmm_backend = vmm_backend_;
     hooks.quiesceEngine    = [engine, local_rank](const SleepOptions& opt) {
@@ -330,26 +322,21 @@ void LocalRpcServer::installSleepHooks() {
         return true;
     };
     hooks.synchronizeAndDeregisterMr = [this, engine, local_rank](const SleepOptions&) {
-        const auto               begin_time_us = currentTimeUs();
         OptionalSleepDeviceGuard device_guard(local_rank);
-        auto                     finish = [this, begin_time_us](bool success) {
-            reportSleepMrOpTime("dereg", begin_time_us);
-            return success;
-        };
         // Baseline before any resource is dropped: MR-pinned (VmPin) + KV + weights all live.
         logSleepMemorySnapshot("sleep/RUNNING", local_rank);
         if (!synchronizeSleepDevice("before_dereg_mr")) {
-            return finish(false);
+            return false;
         }
         if (auto cache_manager = engine->getCacheManager()) {
             cache_manager->deregUserMr();
         }
         if (!synchronizeSleepDevice("after_dereg_mr")) {
-            return finish(false);
+            return false;
         }
         // MR deregistered: VmPin should have collapsed relative to the baseline above.
         logSleepMemorySnapshot("sleep/after_dereg_mr", local_rank);
-        return finish(true);
+        return true;
     };
     hooks.releaseKvMemoryBacking = [this, engine, local_rank](const SleepOptions&) {
         OptionalSleepDeviceGuard device_guard(local_rank);
@@ -361,20 +348,16 @@ void LocalRpcServer::installSleepHooks() {
         // under any VMM tag and NOT MR-registered, so the VMM pause below cannot free it.
         // Discard it explicitly here (no-op when the memory cache is disabled). Runs on
         // every sleep level; in-flight H2D/D2H copies were already drained (connector_inflight).
-        const auto mc_begin_us = currentTimeUs();
         if (!cache_manager->releaseMemoryCacheBacking()) {
             RTP_LLM_LOG_WARNING("releaseKvMemoryBacking: releaseMemoryCacheBacking failed");
             return false;
         }
-        reportSleepVmmOpTime("release", "memory_cache", mc_begin_us);
         auto controller = cache_manager->kvMemoryController();
         if (!controller || !controller->backendAvailable()) {
             RTP_LLM_LOG_WARNING("releaseKvMemoryBacking skipped VMM pause: backend unavailable");
             return true;
         }
-        const auto begin_time_us = currentTimeUs();
-        const bool success       = cache_manager->releaseKVCacheMemoryBacking();
-        reportSleepVmmOpTime("pause", controller->tag(), begin_time_us);
+        const bool success = cache_manager->releaseKVCacheMemoryBacking();
         // Memory-cache pinned host buffer + GPU KV released here: watch sys MemAvailable
         // (host pinned) rise and gpu_free rise.
         logSleepMemorySnapshot("sleep/after_kv_release", local_rank);
@@ -392,12 +375,7 @@ void LocalRpcServer::installSleepHooks() {
             RTP_LLM_LOG_WARNING("releaseRestorableGpuMemory skipped: VMM backend unavailable");
             return true;
         }
-        auto pause_tag = [this, vmm_backend](const std::string& tag) {
-            const auto begin_time_us = currentTimeUs();
-            const bool success       = vmm_backend->pause(tag);
-            reportSleepVmmOpTime("pause", tag, begin_time_us);
-            return success;
-        };
+        auto pause_tag = [vmm_backend](const std::string& tag) { return vmm_backend->pause(tag); };
         // Level 2 (discard weights): the "weights" region was opened without host
         // cpu_backup, so pause frees GPU with no host copy and nothing is written
         // anywhere. Wake reloads the weights in place from the model loader
@@ -446,20 +424,16 @@ void LocalRpcServer::installSleepHooks() {
         }
         // Reallocate the host memory-cache pinned buffer first (mirrors the sleep-side
         // release order). Independent of the GPU KV VMM resume below; no-op when disabled.
-        const auto mc_begin_us = currentTimeUs();
         if (!cache_manager->restoreMemoryCacheBacking()) {
             RTP_LLM_LOG_WARNING("restoreKvMemoryBackingAndResetMetadata: restoreMemoryCacheBacking failed");
             return false;
         }
-        reportSleepVmmOpTime("reallocate", "memory_cache", mc_begin_us);
         auto controller = cache_manager->kvMemoryController();
         if (!controller || !controller->isPaused()) {
             return true;  // pause was skipped (no shim); keep metadata untouched
         }
         // Re-maps pages at the same VA, then resets BlockPool metadata + BlockCache.
-        const auto begin_time_us = currentTimeUs();
-        const bool success       = cache_manager->restoreKVCacheMemoryBackingAndResetMetadata();
-        reportSleepVmmOpTime("resume", controller->tag(), begin_time_us);
+        const bool success = cache_manager->restoreKVCacheMemoryBackingAndResetMetadata();
         logSleepMemorySnapshot("wake/after_kv_restore", local_rank);
         return success;
     };
@@ -468,12 +442,7 @@ void LocalRpcServer::installSleepHooks() {
         if (!vmm_backend->isAvailable()) {
             return true;
         }
-        auto resume_tag = [this, vmm_backend](const std::string& tag) {
-            const auto begin_time_us = currentTimeUs();
-            const bool success       = vmm_backend->resume(tag);
-            reportSleepVmmOpTime("resume", tag, begin_time_us);
-            return success;
-        };
+        auto resume_tag = [vmm_backend](const std::string& tag) { return vmm_backend->resume(tag); };
         // resume("weights") and resume("cuda_graph") remap physical pages at the same VA.
         // For level 1 the tms host cpu_backup already restored the content; for level 2 the
         // weights pages come back blank and are reloaded below.
@@ -492,7 +461,6 @@ void LocalRpcServer::installSleepHooks() {
                 RTP_LLM_LOG_WARNING("level-2 wake: weight_manager unavailable, cannot reload weights");
                 return false;
             }
-            const auto reload_begin_us = currentTimeUs();
             try {
                 py::gil_scoped_acquire acquire;
                 weight_manager_.attr("reload_weights_from_loader")();
@@ -500,21 +468,15 @@ void LocalRpcServer::installSleepHooks() {
                 RTP_LLM_LOG_WARNING("level-2 wake: reload_weights_from_loader failed: %s", e.what());
                 return false;
             }
-            reportSleepVmmOpTime("reload", "weights", reload_begin_us);
         }
         // Weights (level-1 host restore / level-2 loader reload) + cuda_graph GPU memory back.
         logSleepMemorySnapshot("wake/after_weights_restore", local_rank);
         return ok;
     };
     hooks.registerMr = [this, engine, local_rank]() {
-        const auto               begin_time_us = currentTimeUs();
         OptionalSleepDeviceGuard device_guard(local_rank);
-        auto                     finish = [this, begin_time_us](bool success) {
-            reportSleepMrOpTime("reg", begin_time_us);
-            return success;
-        };
         if (!synchronizeSleepDevice("before_reg_mr")) {
-            return finish(false);
+            return false;
         }
         if (auto cache_manager = engine->getCacheManager()) {
             cache_manager->regUserMr(maga_init_params_.model_id, cache_manager->getCacheStore());
@@ -524,14 +486,14 @@ void LocalRpcServer::installSleepHooks() {
         // no peer-visible MR epoch ABI; regUserMr() is the available boundary.
         // Fully restored: MR re-registered, VmPin should be back at the baseline.
         logSleepMemorySnapshot("wake/RUNNING", local_rank);
-        return finish(true);
+        return true;
     };
     hooks.restartEngine = [engine]() {
         engine->restart();
         return true;
     };
     hooks.cancelQuiesceAndRestartEngine = hooks.restartEngine;
-    hooks.warmupAndHealthCheck          = [this, engine, vmm_backend, local_rank]() {
+    hooks.warmupAndHealthCheck          = [this, engine, local_rank]() {
         OptionalSleepDeviceGuard device_guard(local_rank);
         if (!engine) {
             RTP_LLM_LOG_ERROR("sleep warmup/self-check failed: engine is null");
@@ -549,13 +511,6 @@ void LocalRpcServer::installSleepHooks() {
                 if (controller->basePtr() == nullptr || controller->totalSizeBytes() == 0) {
                     RTP_LLM_LOG_WARNING("sleep warmup/self-check: kv memory controller has no attached buffer");
                 }
-            }
-        }
-        if (maga_init_params_.hw_kernel_config.enable_cuda_graph && vmm_backend && vmm_backend->isAvailable()) {
-            const auto graph_stats = VmmTagStatsRegistry::stats("cuda_graph");
-            if (graph_stats.allocation_count == 0 || graph_stats.total_size_bytes == 0) {
-                RTP_LLM_LOG_WARNING("sleep warmup/self-check: CUDA graph is enabled but no known VMM allocation was "
-                                             "recorded under tag cuda_graph; verify capture tagging on this workload");
             }
         }
         if (!synchronizeSleepDevice("after_warmup_health_check")) {
@@ -1152,46 +1107,6 @@ void LocalRpcServer::reportCacheStatusTime(int64_t request_begin_time_us) {
     if (metrics_reporter_) {
         metrics_reporter_->report<RpcCacheStatusMetrics, RpcCacheStatusMetricsCollector>(nullptr, &collector);
     }
-}
-
-void LocalRpcServer::reportSleepDrainTime(const std::string& mode, int64_t begin_time_us, bool success) {
-    if (!metrics_reporter_) {
-        return;
-    }
-    SleepLifecycleMetricsCollector collector;
-    collector.drain_rt_us       = currentTimeUs() - begin_time_us;
-    collector.drain_timeout_qps = !success;
-    kmonitor::MetricsTags tags;
-    tags.AddTag("mode", mode.empty() ? "wait" : mode);
-    metrics_reporter_->report<SleepLifecycleMetrics, SleepLifecycleMetricsCollector>(&tags, &collector);
-}
-
-void LocalRpcServer::reportSleepVmmOpTime(const std::string& operation,
-                                          const std::string& resource_tag,
-                                          int64_t            begin_time_us) {
-    if (!metrics_reporter_) {
-        return;
-    }
-    SleepLifecycleMetricsCollector collector;
-    const auto                     tag_stats = VmmTagStatsRegistry::stats(resource_tag);
-    collector.vmm_op_rt_us                   = currentTimeUs() - begin_time_us;
-    collector.vmm_tag_known_bytes            = static_cast<int64_t>(tag_stats.total_size_bytes);
-    collector.vmm_tag_known_count            = static_cast<int64_t>(tag_stats.allocation_count);
-    kmonitor::MetricsTags tags;
-    tags.AddTag("operation", operation);
-    tags.AddTag("resource_tag", resource_tag.empty() ? "all" : resource_tag);
-    metrics_reporter_->report<SleepLifecycleMetrics, SleepLifecycleMetricsCollector>(&tags, &collector);
-}
-
-void LocalRpcServer::reportSleepMrOpTime(const std::string& operation, int64_t begin_time_us) {
-    if (!metrics_reporter_) {
-        return;
-    }
-    SleepLifecycleMetricsCollector collector;
-    collector.mr_op_rt_us = currentTimeUs() - begin_time_us;
-    kmonitor::MetricsTags tags;
-    tags.AddTag("operation", operation);
-    metrics_reporter_->report<SleepLifecycleMetrics, SleepLifecycleMetricsCollector>(&tags, &collector);
 }
 
 ::grpc::Status LocalRpcServer::ExecuteFunction(::grpc::ServerContext*     context,

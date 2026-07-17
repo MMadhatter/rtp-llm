@@ -1,7 +1,6 @@
 #include "rtp_llm/cpp/cache/KVCachePhysicalMemoryController.h"
 
 #include <dlfcn.h>
-#include <unordered_map>
 
 #include "rtp_llm/cpp/utils/Logger.h"
 
@@ -20,35 +19,7 @@ FnType probeSymbol(const char* symbol_name) {
     return reinterpret_cast<FnType>(dlsym(RTLD_DEFAULT, symbol_name));
 }
 
-std::mutex                                   g_vmm_tag_stats_mutex;
-std::unordered_map<std::string, VmmTagStats> g_vmm_tag_stats;
-
 }  // namespace
-
-void VmmTagStatsRegistry::recordAllocation(const std::string& tag, size_t size_bytes) {
-    if (tag.empty()) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_vmm_tag_stats_mutex);
-    auto&                       stats = g_vmm_tag_stats[tag];
-    stats.allocation_count += 1;
-    stats.total_size_bytes += size_bytes;
-    RTP_LLM_LOG_INFO("VMM tag stats: tag=%s known_allocation_count=%zu known_total_size_bytes=%zu",
-                     tag.c_str(),
-                     stats.allocation_count,
-                     stats.total_size_bytes);
-}
-
-VmmTagStats VmmTagStatsRegistry::stats(const std::string& tag) {
-    std::lock_guard<std::mutex> lock(g_vmm_tag_stats_mutex);
-    auto                        iter = g_vmm_tag_stats.find(tag);
-    return iter == g_vmm_tag_stats.end() ? VmmTagStats{} : iter->second;
-}
-
-void VmmTagStatsRegistry::resetForTest() {
-    std::lock_guard<std::mutex> lock(g_vmm_tag_stats_mutex);
-    g_vmm_tag_stats.clear();
-}
 
 VmmBackend::VmmBackend() {
     pause_fn_                  = probeSymbol<ShimTagFn>("tms_pause");

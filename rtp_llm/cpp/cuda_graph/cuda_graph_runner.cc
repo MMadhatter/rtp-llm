@@ -26,7 +26,6 @@ public:
         // try to release ranges that VMM pause has already unmapped.
         active_ = vmm_backend_.beginAllocationRegion(kCudaGraphVmmTag, true);
         if (active_) {
-            pre_reserved_bytes_ = cuda_graph::graphReservedBytes();
             RTP_LLM_LOG_INFO("CUDA graph allocations are tagged under VMM tag '%s'", kCudaGraphVmmTag);
         }
     }
@@ -34,17 +33,6 @@ public:
     ~CudaGraphVmmRegionGuard() {
         if (active_) {
             vmm_backend_.endAllocationRegion();
-            const size_t post_reserved_bytes = cuda_graph::graphReservedBytes();
-            const size_t known_delta_bytes =
-                post_reserved_bytes > pre_reserved_bytes_ ? post_reserved_bytes - pre_reserved_bytes_ : 0;
-            if (known_delta_bytes > 0) {
-                VmmTagStatsRegistry::recordAllocation(kCudaGraphVmmTag, known_delta_bytes);
-            } else {
-                RTP_LLM_LOG_WARNING("CUDA graph VMM tag '%s' recorded zero known reserved-byte delta; "
-                                    "sleep can still pause the tag through torch_memory_saver, but known-byte "
-                                    "metrics cannot validate captured graph allocations for this run",
-                                    kCudaGraphVmmTag);
-            }
         }
     }
 
@@ -53,7 +41,6 @@ public:
 
 private:
     VmmBackend vmm_backend_;
-    size_t     pre_reserved_bytes_{0};
     bool       active_{false};
 };
 

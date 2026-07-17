@@ -110,12 +110,6 @@ public:
 
     void reportCacheStatusTime(int64_t request_begin_time_us);
 
-    void reportSleepDrainTime(const std::string& mode, int64_t begin_time_us, bool success);
-
-    void reportSleepVmmOpTime(const std::string& operation, const std::string& resource_tag, int64_t begin_time_us);
-
-    void reportSleepMrOpTime(const std::string& operation, int64_t begin_time_us);
-
     ::grpc::Status
     ExecuteFunction(::grpc::ServerContext* context, const ::FunctionRequestPB* request, ::FunctionResponsePB* response);
 

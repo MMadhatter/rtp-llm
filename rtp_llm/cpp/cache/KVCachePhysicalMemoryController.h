@@ -27,21 +27,6 @@ public:
     virtual bool resume(const std::string& tag) = 0;
 };
 
-struct VmmTagStats {
-    size_t allocation_count = 0;
-    size_t total_size_bytes = 0;
-};
-
-// Application-side observability for allocations that RTP-LLM knows were
-// opened under a VMM tag. torch_memory_saver 0.0.9 exposes no per-tag stats ABI,
-// so this deliberately reports known RTP-LLM regions only.
-class VmmTagStatsRegistry {
-public:
-    static void        recordAllocation(const std::string& tag, size_t size_bytes);
-    static VmmTagStats stats(const std::string& tag);
-    static void        resetForTest();
-};
-
 // VMM backend backed by torch_memory_saver's LD_PRELOAD hook shim
 // (torch_memory_saver_hook_mode_preload*.so).
 //
