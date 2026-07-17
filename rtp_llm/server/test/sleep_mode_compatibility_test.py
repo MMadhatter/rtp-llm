@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from rtp_llm.config.sleep_mode_compatibility import (
     Level2SleepCompatibility,
     reject_dynamic_lora_mutation,
+    reject_dynamic_weight_update,
     validate_level2_sleep_compatibility,
 )
 
@@ -82,6 +83,12 @@ class Level2SleepCompatibilityTest(unittest.TestCase):
         reject_dynamic_lora_mutation(enable_sleep_mode=True, sleep_mode_level=1)
         with self.assertRaisesRegex(ValueError, "runtime LoRA add/update/load"):
             reject_dynamic_lora_mutation(enable_sleep_mode=True, sleep_mode_level=2)
+
+    def test_dynamic_weight_update_gate_only_blocks_level_two(self):
+        reject_dynamic_weight_update(enable_sleep_mode=False, sleep_mode_level=2)
+        reject_dynamic_weight_update(enable_sleep_mode=True, sleep_mode_level=1)
+        with self.assertRaisesRegex(ValueError, "runtime weight update"):
+            reject_dynamic_weight_update(enable_sleep_mode=True, sleep_mode_level=2)
 
 
 class BackendValidationOrderingTest(unittest.TestCase):

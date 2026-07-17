@@ -7,9 +7,14 @@ from typing import Mapping
 
 import torch
 
+from rtp_llm.config.sleep_mode_compatibility import reject_dynamic_weight_update
 from rtp_llm.model_loader.loader import ModelLoader
 from rtp_llm.model_loader.model_weight_info import ModelWeights
-from rtp_llm.model_loader.weight_memory_saver import suppress_weights_region
+from rtp_llm.model_loader.weight_memory_saver import is_enabled as sleep_mode_enabled
+from rtp_llm.model_loader.weight_memory_saver import (
+    sleep_mode_level,
+    suppress_weights_region,
+)
 
 # Assuming these imports are from your project and accessible
 from rtp_llm.model_loader.weight_module import WeightModule
@@ -167,6 +172,12 @@ class WeightManager:
             - `Exception`: If the tensor cannot be built from the IPC metadata (e.g., invalid descriptor).
                           This is a general catch-all for unexpected failures in `_t_helper.build_from_meta`.
         """
+        # Level-2 wake reloads weights from the on-disk checkpoint, which would silently
+        # revert any runtime weight update pushed here. Reject rather than lose the update.
+        reject_dynamic_weight_update(
+            enable_sleep_mode=sleep_mode_enabled(),
+            sleep_mode_level=sleep_mode_level(),
+        )
         if "desc" not in req:
             raise KeyError(
                 "Update request is missing the 'desc' field. "

@@ -62,3 +62,20 @@ def reject_dynamic_lora_mutation(
             "because the adapter GPU weights cannot be reconstructed after wake. "
             "Remove adapters or use sleep mode level 1 instead."
         )
+
+
+def reject_dynamic_weight_update(
+    *, enable_sleep_mode: bool, sleep_mode_level: int
+) -> None:
+    """Prevent runtime weight sync (e.g. RLHF) that level-2 wake would silently revert.
+
+    Level-2 wake restores GPU weights from the original on-disk checkpoint, so any
+    in-place weight update pushed at runtime would be discarded on the next wake.
+    Level-1 (host backup) captures the updated content and is unaffected.
+    """
+    if enable_sleep_mode and sleep_mode_level == 2:
+        raise ValueError(
+            "sleep mode level 2 does not support runtime weight update because "
+            "the pushed GPU weights are not in the checkpoint and would be reverted "
+            "on wake. Use sleep mode level 1 instead."
+        )
