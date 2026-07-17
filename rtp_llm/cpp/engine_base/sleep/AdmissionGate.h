@@ -10,9 +10,9 @@
 
 namespace rtp_llm {
 
-// Structured admission result (design doc M4 error body). When denied, all
-// fields are populated so RPC callers can serialize ErrorDetailsPB and HTTP
-// callers can build a JSON body with the same schema:
+// Structured admission result. When denied, all fields are populated so RPC
+// callers can serialize ErrorDetailsPB and HTTP callers can build a JSON body
+// with the same schema:
 //   {error_code, error_code_str, message, instance_id, sleep_epoch, state}
 struct AdmissionCheckResult {
     bool        admitted   = true;
@@ -29,14 +29,14 @@ struct AdmissionAcquireResult {
     AdmissionLease       lease;
 };
 
-// Unified admission gate (design doc M4, constraint C5). Inference entries use
-// acquire() and retain its lease; health/status paths may use check() or
-// checkDetail(). Any state other than RUNNING is rejected with a retryable
-// ENGINE_UNAVAILABLE carrying instance_id / sleep_epoch / state.
+// Unified admission gate. Inference entries use acquire() and retain its lease;
+// health/status paths may use check() or checkDetail(). Any state other than
+// RUNNING is rejected with a retryable ENGINE_UNAVAILABLE carrying
+// instance_id / sleep_epoch / state.
 class AdmissionGate {
 public:
     // controller is not owned and must outlive the gate (it lives in
-    // EngineBase, which is never destructed per constraint C1).
+    // EngineBase, which is never destructed).
     explicit AdmissionGate(SleepLifecycleController* controller, std::string instance_id = ""):
         controller_(controller), instance_id_(std::move(instance_id)) {}
 
@@ -45,7 +45,7 @@ public:
     AdmissionAcquireResult acquire() const;
 
     // RUNNING (or no controller wired) -> OK. Otherwise UNAVAILABLE with the
-    // M4 error body serialized into grpc error_details as ErrorDetailsPB.
+    // error body serialized into grpc error_details as ErrorDetailsPB.
     grpc::Status check() const;
 
     // Structured variant for the HTTP layer (and tests).
@@ -54,10 +54,6 @@ public:
     // JSON body for HTTP responses, same schema as the gRPC error details.
     static std::string  toJson(const AdmissionCheckResult& result);
     static grpc::Status toGrpcStatus(const AdmissionCheckResult& result);
-
-    const std::string& instanceId() const {
-        return instance_id_;
-    }
 
 private:
     SleepLifecycleController* controller_;  // not owned

@@ -32,14 +32,9 @@ public:
     grpc::Status embedding(grpc::ServerContext* context, const EmbeddingInputPB* request, EmbeddingOutputPB* response);
     grpc::Status health(grpc::ServerContext* context, const EmbeddingHealthRequestPB* request, EmptyPB* writer);
 
-    // M4: EmbeddingEngine does not inherit EngineBase (no sleepController()),
-    // so the admission gate is injected by the owner (RtpEmbeddingOp) instead
-    // of being built here. Unset gate admits everything (current behavior).
-    void setAdmissionGate(const std::shared_ptr<AdmissionGate>& admission_gate) {
-        admission_gate_ = admission_gate;
-    }
-
 private:
+    // EmbeddingEngine does not inherit EngineBase, so it has no admission gate wired in.
+    // An unset gate admits every request.
     grpc::Status checkAdmission() const {
         return admission_gate_ ? admission_gate_->check() : grpc::Status::OK;
     }

@@ -58,7 +58,7 @@ public:
     void   connectorReference(BlockIdxType block_idx);
     void   connectorReference(const BlockIndicesType& block_indices);
 
-    // Sleep/wake_up (M5): reset all block metadata to the fresh-pool state after the physical
+    // Sleep/wake_up: reset all block metadata to the fresh-pool state after the physical
     // KV memory has been resumed (content discarded). Rebuilds free_block_ids_ to the full set
     // and re-inits every BlockRefCounter, exactly like initFreeBlocks() on a new pool.
     // Does NOT touch block_cache_ (callers clear it separately via BlockCache::clear()) and
@@ -66,7 +66,7 @@ public:
     // Caller must guarantee no in-flight users of the pool (engine drained).
     void resetMetadata();
 
-    // Sleep/wake_up (M7): host memory-cache tier discard / reallocate.
+    // Sleep/wake_up: host memory-cache tier discard / reallocate.
     // Only valid for AllocationType::HOST pools (the pinned host KV offload tier).
     // releaseHostBuffer() drops the pinned host buffer (torch::empty(...).pin_memory())
     // and all tensors that view into it, returning the ~memory_cache_size_mb of pinned
@@ -77,9 +77,6 @@ public:
     // clear any external cache-key->block LRU that indexes into the freed buffer.
     void releaseHostBuffer();
     void reallocateHostBuffer();
-    bool hostBufferReleased() const {
-        return host_released_;
-    }
 
     void    regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store = nullptr);
     void    deregUserMr();
