@@ -123,7 +123,7 @@ TEST(SleepLifecycleControllerTest, DefaultModeRejectsLevelTwo) {
 
 TEST(SleepLifecycleControllerTest, DiscardModeSupportsLevelTwo) {
     SleepLifecycleController controller(true);
-    controller.setDiscardWeights(true);
+    controller.setConfiguredLevel(2);
 
     EXPECT_TRUE(controller.discardWeights());
     EXPECT_EQ(controller.status().supported_levels, std::vector<int32_t>{2});
@@ -138,7 +138,7 @@ TEST(SleepLifecycleControllerTest, DiscardModeSupportsLevelTwo) {
 
 TEST(SleepLifecycleControllerTest, DiscardModeRejectsLevelOne) {
     SleepLifecycleController controller(true);
-    controller.setDiscardWeights(true);
+    controller.setConfiguredLevel(2);
 
     auto opt          = gracefulOptions();
     opt.level         = 1;

@@ -149,12 +149,19 @@ bool SleepLifecycleController::enabled() const {
     return enabled_.load(std::memory_order_acquire);
 }
 
-void SleepLifecycleController::setDiscardWeights(bool discard) {
-    discard_weights_.store(discard, std::memory_order_release);
+void SleepLifecycleController::setConfiguredLevel(int32_t level) {
+    // torch_memory_saver fixes the weights backup mode at model-load time: level
+    // 2 discards weights (region opened without host cpu_backup); any other value
+    // keeps host backup and is treated as level 1.
+    configured_level_.store(level == 2 ? 2 : 1, std::memory_order_release);
+}
+
+int32_t SleepLifecycleController::configuredLevel() const {
+    return configured_level_.load(std::memory_order_acquire);
 }
 
 bool SleepLifecycleController::discardWeights() const {
-    return discard_weights_.load(std::memory_order_acquire);
+    return configuredLevel() == 2;
 }
 
 int32_t SleepLifecycleController::activeSleepLevel() const {
@@ -205,7 +212,7 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
     // time, so this process supports exactly one non-zero level, selected at
     // startup: 2 (discard weights) when sleep_mode_level=2, otherwise 1 (host
     // backup). A request must match it.
-    const int32_t configured_level = discard_weights_.load(std::memory_order_acquire) ? 2 : 1;
+    const int32_t configured_level = configuredLevel();
     if (opt.level == 0) {
         return SleepResult::unimplemented(
             "sleep rejected: level=0 state-preserving sleep is defined but not implemented; supported_levels=["
@@ -462,7 +469,7 @@ SleepStatus SleepLifecycleController::status() const {
     s.effective          = effective();
     // This process supports exactly one non-zero level, fixed at startup by
     // sleep_mode_level (2 = discard weights, else 1); see sleep() gate.
-    const int32_t configured_level = discard_weights_.load(std::memory_order_acquire) ? 2 : 1;
+    const int32_t configured_level = configuredLevel();
     s.supported_levels             = s.effective ? std::vector<int32_t>{configured_level} : std::vector<int32_t>{};
     s.supported_modes       = s.effective ? std::vector<std::string>{"wait", "abort"} : std::vector<std::string>{};
     s.disabled_reason       = s.effective ? "" : disabledReason();

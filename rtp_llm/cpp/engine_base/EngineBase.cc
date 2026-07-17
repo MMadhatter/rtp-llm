@@ -24,9 +24,10 @@ std::shared_ptr<GenerateStream> EngineBase::makeStream(const std::shared_ptr<Gen
 
 void EngineBase::initRuntime(const EngineInitParams& params) {
     sleep_controller_.setEnabled(params.runtime_config.enable_sleep_mode);
-    // sleep_mode_level==2 selects discard-weights (level 2); the weights VMM
-    // region was correspondingly opened without host cpu_backup at load time.
-    sleep_controller_.setDiscardWeights(params.runtime_config.sleep_mode_level == 2);
+    // The controller owns the level->discard-weights mapping; just hand it the
+    // startup sleep_mode_level (2 opened the weights VMM region without host
+    // cpu_backup at load time).
+    sleep_controller_.setConfiguredLevel(params.runtime_config.sleep_mode_level);
     const auto rank =
         params.parallelism_config.dp_rank * params.parallelism_config.tp_size + params.parallelism_config.tp_rank;
     Logger::getEngineLogger().setRank(rank);

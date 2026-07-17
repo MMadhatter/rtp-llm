@@ -203,9 +203,11 @@ public:
     // discard-weights mode: the weights VMM region was opened without host
     // cpu_backup, so sleep frees GPU+host and wake reloads from a disk backup.
     // This is fixed at model-load time by torch_memory_saver and cannot change
-    // per request, so a /sleep request's level must match it.
-    void setDiscardWeights(bool discard);
-    bool discardWeights() const;
+    // per request, so a /sleep request's level must match it. Any value other
+    // than 2 is normalized to level 1 (host backup).
+    void    setConfiguredLevel(int32_t level);
+    int32_t configuredLevel() const;
+    bool    discardWeights() const;
     // Level captured on the RUNNING->DRAINING transition of the active sleep,
     // read by the wake_up restore hook to decide whether to reload weights.
     int32_t activeSleepLevel() const;
@@ -264,8 +266,10 @@ private:
     std::atomic<int64_t>    sleep_epoch_{0};
     std::atomic<bool>       enabled_{false};
     std::atomic<bool>       runtime_supported_{true};
-    // True when this process was started in discard-weights (level 2) mode.
-    std::atomic<bool> discard_weights_{false};
+    // Startup-fixed sleep level for this process (1 = host backup, 2 = discard
+    // weights). Normalized in setConfiguredLevel(); torch_memory_saver binds the
+    // weights backup mode at load time, so it never changes per request.
+    std::atomic<int32_t> configured_level_{1};
     // Level of the in-progress/last sleep, captured at RUNNING->DRAINING.
     std::atomic<int32_t> active_sleep_level_{0};
     // Lock ordering: transition_mutex_ -> admission_mutex_ -> hooks_mutex_ ->
