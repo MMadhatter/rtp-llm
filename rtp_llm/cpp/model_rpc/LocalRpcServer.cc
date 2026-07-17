@@ -267,7 +267,9 @@ void LocalRpcServer::installSleepHooks() {
     // --- M3: drain counters. ---
     drain_manager_ = std::make_shared<DrainManager>();
     drain_manager_->registerCounter(
-        "rpc_onflight", [this]() { return onflightRequestNum(); }, DrainManager::CounterKind::REQUEST);
+        "admission_leases",
+        [this]() { return static_cast<size_t>(engine_->sleepController().activeAdmissionCount()); },
+        DrainManager::CounterKind::REQUEST);
     auto engine = engine_;
     drain_manager_->registerCounter(
         "scheduler_onflight",
@@ -715,9 +717,11 @@ grpc::Status LocalRpcServer::GenerateStreamCall(grpc::ServerContext*            
                                                 const GenerateInputPB*                 request,
                                                 grpc::ServerWriter<GenerateOutputsPB>* writer) {
     RTP_LLM_PROFILE_SCOPE("rpc.generate_stream_call");
-    if (auto admission = checkAdmission(); !admission.ok()) {
-        return admission;
+    auto admission = acquireAdmission();
+    if (!admission.detail.admitted) {
+        return AdmissionGate::toGrpcStatus(admission.detail);
     }
+    auto               admission_lease = std::move(admission.lease);
     c10::InferenceMode inference_guard(true);
     AtomicGuard        request_guard(onflight_requests_);
     auto               request_id = request->request_id();
@@ -753,9 +757,11 @@ grpc::Status LocalRpcServer::BatchGenerateCall(grpc::ServerContext*        conte
                                                BatchGenerateOutputsPB*     response) {
     RTP_LLM_PROFILE_SCOPE("rpc.batch_generate_call");
     // Whole-batch rejection: a non-RUNNING instance must not run any of them.
-    if (auto admission = checkAdmission(); !admission.ok()) {
-        return admission;
+    auto admission = acquireAdmission();
+    if (!admission.detail.admitted) {
+        return AdmissionGate::toGrpcStatus(admission.detail);
     }
+    auto               admission_lease = std::move(admission.lease);
     c10::InferenceMode inference_guard(true);
     AtomicGuard        request_guard(onflight_requests_);
     const int          batch_size = request->inputs_size();

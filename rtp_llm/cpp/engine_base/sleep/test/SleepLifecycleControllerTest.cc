@@ -205,6 +205,29 @@ TEST(SleepLifecycleControllerTest, DrainTimeoutKeepsDraining) {
     EXPECT_TRUE(controller.status().device_kv_cache_valid);
 }
 
+TEST(SleepLifecycleControllerTest, LeaseAcquiredBeforeDrainMustReleaseBeforeSleepProgresses) {
+    SleepLifecycleController controller(true);
+    SleepHooks               hooks;
+    hooks.drain = [&controller](const SleepOptions&) { return controller.activeAdmissionCount() == 0; };
+    controller.setHooks(hooks);
+
+    SleepResult first_sleep;
+    {
+        auto admission = controller.acquireAdmission();
+        ASSERT_TRUE(admission.admitted());
+        EXPECT_EQ(controller.activeAdmissionCount(), 1);
+
+        first_sleep = controller.sleep(gracefulOptions());
+        EXPECT_FALSE(first_sleep.ok);
+        EXPECT_EQ(controller.state(), SleepState::DRAINING);
+    }
+
+    EXPECT_EQ(controller.activeAdmissionCount(), 0);
+    const auto retry = controller.sleep(gracefulOptions());
+    EXPECT_TRUE(retry.ok) << retry.message;
+    EXPECT_EQ(controller.state(), SleepState::SLEEPING);
+}
+
 TEST(SleepLifecycleControllerTest, SleepRetryFromDrainingCanComplete) {
     SleepLifecycleController controller(true);
     std::atomic<bool>        busy{true};
@@ -263,6 +286,29 @@ TEST(SleepLifecycleControllerTest, PrepareOnlyStaysDrainingUntilCommit) {
     EXPECT_EQ(quiesce_called.load(), 1);
     EXPECT_EQ(sync_dereg_called.load(), 1);
     EXPECT_EQ(release_kv_called.load(), 1);
+}
+
+TEST(SleepLifecycleControllerTest, PrepareAndCommitCannotAcquireStragglerAdmission) {
+    SleepLifecycleController controller(true);
+    SleepHooks               hooks;
+    hooks.drain = [&controller](const SleepOptions&) { return controller.activeAdmissionCount() == 0; };
+    controller.setHooks(hooks);
+
+    SleepOptions prepare = gracefulOptions();
+    prepare.prepare_only = true;
+    ASSERT_TRUE(controller.sleep(prepare).ok);
+    ASSERT_EQ(controller.state(), SleepState::DRAINING);
+
+    auto straggler = controller.acquireAdmission();
+    EXPECT_FALSE(straggler.admitted());
+    EXPECT_EQ(straggler.state, SleepState::DRAINING);
+    EXPECT_EQ(controller.activeAdmissionCount(), 0);
+
+    SleepOptions commit = gracefulOptions();
+    commit.commit_only  = true;
+    const auto result   = controller.sleep(commit);
+    EXPECT_TRUE(result.ok) << result.message;
+    EXPECT_EQ(controller.state(), SleepState::SLEEPING);
 }
 
 TEST(SleepLifecycleControllerTest, CommitOnlyRequiresPreparedQuiesce) {

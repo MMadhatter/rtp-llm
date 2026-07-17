@@ -22,7 +22,7 @@ SleepHooks successHooks() {
 class AdmissionGateTest: public ::testing::Test {
 protected:
     SleepLifecycleController controller_{true};
-    AdmissionGate             gate_{&controller_, "test_instance_0"};
+    AdmissionGate            gate_{&controller_, "test_instance_0"};
 };
 
 TEST_F(AdmissionGateTest, RunningAdmits) {
@@ -33,6 +33,21 @@ TEST_F(AdmissionGateTest, RunningAdmits) {
     EXPECT_EQ(detail.error_code, 0);
     EXPECT_EQ(detail.state, "RUNNING");
     EXPECT_EQ(detail.instance_id, "test_instance_0");
+}
+
+TEST_F(AdmissionGateTest, LeaseMoveTransfersOwnershipAndReleasesOnce) {
+    auto acquired = gate_.acquire();
+    ASSERT_TRUE(acquired.detail.admitted);
+    ASSERT_TRUE(static_cast<bool>(acquired.lease));
+    EXPECT_EQ(controller_.activeAdmissionCount(), 1);
+
+    AdmissionLease moved(std::move(acquired.lease));
+    EXPECT_FALSE(static_cast<bool>(acquired.lease));
+    EXPECT_TRUE(static_cast<bool>(moved));
+    EXPECT_EQ(controller_.activeAdmissionCount(), 1);
+
+    moved = AdmissionLease{};
+    EXPECT_EQ(controller_.activeAdmissionCount(), 0);
 }
 
 TEST_F(AdmissionGateTest, NullControllerAdmits) {
@@ -54,6 +69,12 @@ TEST_F(AdmissionGateTest, DrainingRejects) {
     const auto detail = gate_.checkDetail();
     EXPECT_FALSE(detail.admitted);
     EXPECT_EQ(detail.state, "DRAINING");
+
+    auto acquired = gate_.acquire();
+    EXPECT_FALSE(acquired.detail.admitted);
+    EXPECT_FALSE(static_cast<bool>(acquired.lease));
+    EXPECT_EQ(acquired.detail.state, "DRAINING");
+    EXPECT_EQ(controller_.activeAdmissionCount(), 0);
 }
 
 TEST_F(AdmissionGateTest, SuspendingRejects) {
@@ -99,7 +120,7 @@ TEST_F(AdmissionGateTest, WakingUpRejects) {
 }
 
 TEST_F(AdmissionGateTest, ErrorRejects) {
-    SleepHooks hooks   = successHooks();
+    SleepHooks hooks             = successHooks();
     hooks.releaseKvMemoryBacking = [](const SleepOptions&) { return false; };
     controller_.setHooks(hooks);
     EXPECT_FALSE(controller_.sleep(SleepOptions{}).ok);

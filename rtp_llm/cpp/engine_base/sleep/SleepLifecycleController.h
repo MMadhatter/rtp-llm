@@ -24,6 +24,44 @@ enum class SleepState {
 
 std::string sleepStateToString(SleepState state);
 
+class SleepLifecycleController;
+
+// Move-only proof that an inference request was admitted while the controller
+// was RUNNING. Destruction releases exactly one active admission.
+class AdmissionLease {
+public:
+    AdmissionLease() = default;
+    ~AdmissionLease();
+
+    AdmissionLease(const AdmissionLease&)            = delete;
+    AdmissionLease& operator=(const AdmissionLease&) = delete;
+
+    AdmissionLease(AdmissionLease&& other) noexcept;
+    AdmissionLease& operator=(AdmissionLease&& other) noexcept;
+
+    explicit operator bool() const {
+        return controller_ != nullptr;
+    }
+
+private:
+    explicit AdmissionLease(SleepLifecycleController* controller): controller_(controller) {}
+    void release();
+
+    SleepLifecycleController* controller_ = nullptr;
+
+    friend class SleepLifecycleController;
+};
+
+struct ControllerAdmissionResult {
+    AdmissionLease lease;
+    SleepState     state       = SleepState::RUNNING;
+    int64_t        sleep_epoch = 0;
+
+    bool admitted() const {
+        return static_cast<bool>(lease);
+    }
+};
+
 // Tracks where the KV physical memory currently is. Mirrors M5 backing states.
 enum class KvMemoryState {
     ACTIVE,
@@ -140,8 +178,9 @@ struct SleepHooks {
 
 // Thread-safe sleep/wake_up lifecycle state machine. Owns the authoritative
 // SleepState, sleep_epoch, kv_memory_state, device_kv_cache_valid and
-// last_error. State transitions are serialized through transition_mutex_;
-// admit() / sleepEpoch() read the atomic state without locking.
+// last_error. State transitions are serialized through transition_mutex_.
+// Admission acquisition and RUNNING-boundary transitions are linearized by
+// admission_mutex_; long-running lifecycle hooks never hold that mutex.
 class SleepLifecycleController {
 public:
     explicit SleepLifecycleController(bool enabled = false): enabled_(enabled) {}
@@ -199,6 +238,11 @@ public:
     // AdmissionGate (M4) hook: true only when fully RUNNING.
     bool admit() const;
 
+    // Atomically check RUNNING and, if admitted, increment the controller-owned
+    // active admission tracker. The returned lease releases the tracker once.
+    ControllerAdmissionResult acquireAdmission();
+    int64_t                   activeAdmissionCount() const;
+
     int64_t sleepEpoch() const;
 
     SleepState state() const;
@@ -212,6 +256,7 @@ private:
     // illegal transition.
     bool transitionLocked(SleepState expected_from, SleepState to);
 
+    void        releaseAdmission();
     void        setLastError(const std::string& msg);
     std::string disabledReason() const;
 
@@ -223,9 +268,12 @@ private:
     std::atomic<bool> discard_weights_{false};
     // Level of the in-progress/last sleep, captured at RUNNING->DRAINING.
     std::atomic<int32_t> active_sleep_level_{0};
-    // Lock ordering: transition_mutex_ -> hooks_mutex_ -> status_mutex_.
+    // Lock ordering: transition_mutex_ -> admission_mutex_ -> hooks_mutex_ ->
+    // status_mutex_.
     // Never acquire in reverse.
-    std::mutex transition_mutex_;  // serializes sleep/wake_up + idempotency
+    std::mutex         transition_mutex_;  // serializes sleep/wake_up + idempotency
+    mutable std::mutex admission_mutex_;
+    int64_t            active_admissions_ = 0;
 
     std::atomic<KvMemoryState> kv_memory_state_{KvMemoryState::ACTIVE};
     std::atomic<bool>          device_kv_cache_valid_{true};
@@ -242,6 +290,8 @@ private:
     // atomic).
     mutable std::mutex hooks_mutex_;
     SleepHooks         hooks_;
+
+    friend class AdmissionLease;
 };
 
 }  // namespace rtp_llm

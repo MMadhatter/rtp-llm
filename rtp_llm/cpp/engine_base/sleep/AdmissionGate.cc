@@ -34,31 +34,48 @@ std::string jsonEscape(const std::string& input) {
     return out;
 }
 
-}  // namespace
-
-AdmissionCheckResult AdmissionGate::checkDetail() const {
+AdmissionCheckResult makeCheckResult(const std::string& instance_id, SleepState state, int64_t sleep_epoch) {
     AdmissionCheckResult result;
-    result.instance_id = instance_id_;
-    if (controller_ == nullptr) {
-        result.state = sleepStateToString(SleepState::RUNNING);
-        return result;
-    }
-    const SleepState state = controller_->state();
-    result.sleep_epoch     = controller_->sleepEpoch();
-    result.state            = sleepStateToString(state);
+    result.instance_id = instance_id;
+    result.sleep_epoch = sleep_epoch;
+    result.state       = sleepStateToString(state);
     if (state == SleepState::RUNNING) {
         return result;
     }
     result.admitted       = false;
     result.error_code     = static_cast<int64_t>(ErrorCode::ENGINE_UNAVAILABLE);
     result.error_code_str = ErrorCodeToString(ErrorCode::ENGINE_UNAVAILABLE);
-    result.message        = "engine unavailable: instance [" + instance_id_ + "] is " + result.state
+    result.message        = "engine unavailable: instance [" + instance_id + "] is " + result.state
                      + " (sleep_epoch=" + std::to_string(result.sleep_epoch) + "), request can be retried elsewhere";
     return result;
 }
 
+}  // namespace
+
+AdmissionCheckResult AdmissionGate::checkDetail() const {
+    if (controller_ == nullptr) {
+        return makeCheckResult(instance_id_, SleepState::RUNNING, 0);
+    }
+    return makeCheckResult(instance_id_, controller_->state(), controller_->sleepEpoch());
+}
+
+AdmissionAcquireResult AdmissionGate::acquire() const {
+    AdmissionAcquireResult result;
+    if (controller_ == nullptr) {
+        result.detail = makeCheckResult(instance_id_, SleepState::RUNNING, 0);
+        return result;
+    }
+    auto controller_result = controller_->acquireAdmission();
+    result.detail          = makeCheckResult(instance_id_, controller_result.state, controller_result.sleep_epoch);
+    result.lease           = std::move(controller_result.lease);
+    return result;
+}
+
 grpc::Status AdmissionGate::check() const {
-    const auto result = checkDetail();
+    return toGrpcStatus(checkDetail());
+}
+
+grpc::Status AdmissionGate::toGrpcStatus(const AdmissionCheckResult& result) {
     if (result.admitted) {
         return grpc::Status::OK;
     }

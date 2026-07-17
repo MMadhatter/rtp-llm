@@ -13,19 +13,21 @@ namespace rtp_llm {
 
 // ChatService::ChatService() {}
 
-bool ChatService::rejectIfUnavailable(const std::unique_ptr<http_server::HttpResponseWriter>& writer) const {
+bool ChatService::acquireOrReject(const std::unique_ptr<http_server::HttpResponseWriter>& writer,
+                                  AdmissionLease&                                         lease) const {
     if (!engine_) {
         return false;
     }
     AdmissionGate gate(&engine_->sleepController());
-    const auto    result = gate.checkDetail();
-    if (result.admitted) {
+    auto          admission = gate.acquire();
+    if (admission.detail.admitted) {
+        lease = std::move(admission.lease);
         return false;
     }
     writer->SetWriteType(http_server::HttpResponseWriter::WriteType::Normal);
     writer->AddHeader("Content-Type", "application/json");
     writer->SetStatus(503, "Service Unavailable");
-    writer->Write(AdmissionGate::toJson(result));
+    writer->Write(AdmissionGate::toJson(admission.detail));
     return true;
 }
 
@@ -194,7 +196,8 @@ void ChatService::generateStreamingResponse(const std::shared_ptr<GenerateConfig
 void ChatService::chatCompletions(const std::unique_ptr<http_server::HttpResponseWriter>& writer,
                                   const http_server::HttpRequest&                         request,
                                   int64_t                                                 request_id) {
-    if (rejectIfUnavailable(writer)) {
+    AdmissionLease admission_lease;
+    if (acquireOrReject(writer, admission_lease)) {
         return;
     }
 

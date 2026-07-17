@@ -23,6 +23,32 @@ bool invokeHookNoThrow(const char* name, Hook& hook, Args&&... args) {
 
 }  // namespace
 
+AdmissionLease::~AdmissionLease() {
+    release();
+}
+
+AdmissionLease::AdmissionLease(AdmissionLease&& other) noexcept: controller_(other.controller_) {
+    other.controller_ = nullptr;
+}
+
+AdmissionLease& AdmissionLease::operator=(AdmissionLease&& other) noexcept {
+    if (this != &other) {
+        release();
+        controller_       = other.controller_;
+        other.controller_ = nullptr;
+    }
+    return *this;
+}
+
+void AdmissionLease::release() {
+    if (controller_ == nullptr) {
+        return;
+    }
+    auto* controller = controller_;
+    controller_      = nullptr;
+    controller->releaseAdmission();
+}
+
 std::string sleepStateToString(SleepState state) {
     switch (state) {
         case SleepState::RUNNING:
@@ -90,10 +116,14 @@ bool SleepLifecycleController::isLegalTransition(SleepState from, SleepState to)
 }
 
 bool SleepLifecycleController::transitionLocked(SleepState expected_from, SleepState to) {
-    const SleepState current = state_.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> admission_lock(admission_mutex_);
+    const SleepState            current = state_.load(std::memory_order_acquire);
     if (current != expected_from || !isLegalTransition(expected_from, to)) {
         setLastError("illegal transition: " + sleepStateToString(current) + " -> " + sleepStateToString(to));
         return false;
+    }
+    if (expected_from == SleepState::RUNNING && to == SleepState::DRAINING) {
+        sleep_epoch_.fetch_add(1, std::memory_order_acq_rel);
     }
     state_.store(to, std::memory_order_release);
     RTP_LLM_LOG_INFO("sleep state transition: %s -> %s (epoch=%ld)",
@@ -212,7 +242,6 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
     setLastError("");
 
     if (current == SleepState::RUNNING) {
-        sleep_epoch_.fetch_add(1, std::memory_order_acq_rel);
         engine_quiesced_.store(false, std::memory_order_release);
         // Record the level of this sleep so the wake_up restore hook knows
         // whether to reload discarded weights (level 2) or not (level 1).
@@ -478,6 +507,34 @@ SleepStatus SleepLifecycleController::status() const {
 
 bool SleepLifecycleController::admit() const {
     return state_.load(std::memory_order_acquire) == SleepState::RUNNING;
+}
+
+ControllerAdmissionResult SleepLifecycleController::acquireAdmission() {
+    std::lock_guard<std::mutex> lock(admission_mutex_);
+    ControllerAdmissionResult   result;
+    result.state       = state_.load(std::memory_order_acquire);
+    result.sleep_epoch = sleep_epoch_.load(std::memory_order_acquire);
+    if (result.state == SleepState::RUNNING) {
+        ++active_admissions_;
+        result.lease = AdmissionLease(this);
+    }
+    return result;
+}
+
+void SleepLifecycleController::releaseAdmission() {
+    {
+        std::lock_guard<std::mutex> lock(admission_mutex_);
+        if (active_admissions_ <= 0) {
+            RTP_LLM_LOG_ERROR("sleep lifecycle admission lease released with no active admission");
+            return;
+        }
+        --active_admissions_;
+    }
+}
+
+int64_t SleepLifecycleController::activeAdmissionCount() const {
+    std::lock_guard<std::mutex> lock(admission_mutex_);
+    return active_admissions_;
 }
 
 int64_t SleepLifecycleController::sleepEpoch() const {

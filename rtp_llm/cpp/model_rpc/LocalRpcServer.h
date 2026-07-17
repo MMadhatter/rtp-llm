@@ -70,8 +70,7 @@ public:
 
     grpc::Status IsSleeping(grpc::ServerContext* context, const EmptyPB* request, IsSleepingResponsePB* response);
 
-    grpc::Status
-    GetSleepStatus(grpc::ServerContext* context, const EmptyPB* request, SleepStatusResponsePB* response);
+    grpc::Status GetSleepStatus(grpc::ServerContext* context, const EmptyPB* request, SleepStatusResponsePB* response);
 
     grpc::Status SetLogLevel(grpc::ServerContext* context, const SetLogLevelRequestPB* request, EmptyPB* response);
 
@@ -124,10 +123,13 @@ public:
     typedef grpc::internal::WriterInterface<GenerateOutputsPB> WriterInterface;
 
 protected:
-    // M4 unified admission gate (constraint C5): every inference entry calls
-    // this first; non-RUNNING states get a retryable ENGINE_UNAVAILABLE.
+    // Non-owning health/status check. Inference entries must use
+    // acquireAdmission() and retain the returned lease for their full scope.
     grpc::Status checkAdmission() const {
         return admission_gate_ ? admission_gate_->check() : grpc::Status::OK;
+    }
+    AdmissionAcquireResult acquireAdmission() const {
+        return admission_gate_ ? admission_gate_->acquire() : AdmissionAcquireResult{};
     }
 
     // Wire the sleep/wake_up SleepHooks (M3 drain counters, M5 KV memory,
@@ -141,29 +143,29 @@ protected:
                                   std::shared_ptr<GenerateStream>& stream);
 
     // Shared helpers for single and batch paths
-    ErrorInfo prepareInput(const GenerateInputPB& input_pb, std::shared_ptr<GenerateInput>& output);
-    ErrorInfo collectStreamOutput(grpc::ServerContext*                  context,
-                                  std::shared_ptr<GenerateStream>&      stream,
-                                  const std::shared_ptr<GenerateInput>& input,
-                                  GenerateOutputs&                      last_outputs);
+    ErrorInfo             prepareInput(const GenerateInputPB& input_pb, std::shared_ptr<GenerateInput>& output);
+    ErrorInfo             collectStreamOutput(grpc::ServerContext*                  context,
+                                              std::shared_ptr<GenerateStream>&      stream,
+                                              const std::shared_ptr<GenerateInput>& input,
+                                              GenerateOutputs&                      last_outputs);
     std::shared_ptr<void> registerAbortableStreamForScope(const std::shared_ptr<GenerateStream>& stream);
     void                  unregisterAbortableStream(int64_t request_id);
     size_t                cancelAbortableStreams();
 
 protected:
-    std::shared_ptr<EngineBase>           engine_;
-    std::shared_ptr<AdmissionGate>        admission_gate_;
-    std::shared_ptr<DrainManager>         drain_manager_;
-    std::shared_ptr<VmmBackend>           vmm_backend_;
-    std::shared_ptr<MultimodalProcessor>  mm_processor_;
-    EngineInitParams                      maga_init_params_;
-    ProposeModelEngineInitParams*         propose_maga_init_params_;
-    kmonitor::MetricsReporterPtr          metrics_reporter_;
-    std::atomic<size_t>                   onflight_requests_{0};
-    std::shared_ptr<RpcServerRuntimeMeta> meta_;
-    py::object                            weight_manager_;
-    std::shared_ptr<BroadcastManager>     profile_broadcaster_;
-    mutable std::mutex                    abortable_streams_mutex_;
+    std::shared_ptr<EngineBase>                                engine_;
+    std::shared_ptr<AdmissionGate>                             admission_gate_;
+    std::shared_ptr<DrainManager>                              drain_manager_;
+    std::shared_ptr<VmmBackend>                                vmm_backend_;
+    std::shared_ptr<MultimodalProcessor>                       mm_processor_;
+    EngineInitParams                                           maga_init_params_;
+    ProposeModelEngineInitParams*                              propose_maga_init_params_;
+    kmonitor::MetricsReporterPtr                               metrics_reporter_;
+    std::atomic<size_t>                                        onflight_requests_{0};
+    std::shared_ptr<RpcServerRuntimeMeta>                      meta_;
+    py::object                                                 weight_manager_;
+    std::shared_ptr<BroadcastManager>                          profile_broadcaster_;
+    mutable std::mutex                                         abortable_streams_mutex_;
     std::unordered_map<int64_t, std::weak_ptr<GenerateStream>> abortable_streams_;
 };
 

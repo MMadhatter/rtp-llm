@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 
 #include "grpc++/grpc++.h"
 
@@ -23,16 +24,25 @@ struct AdmissionCheckResult {
     std::string state;  // RUNNING|DRAINING|SUSPENDING|SLEEPING|WAKING_UP|ERROR
 };
 
-// Unified admission gate (design doc M4, constraint C5). Single check() called
-// at every inference entry (gRPC + HTTP + embedding); any state other than
-// RUNNING is rejected with a retryable ENGINE_UNAVAILABLE error carrying
-// instance_id / sleep_epoch / state.
+struct AdmissionAcquireResult {
+    AdmissionCheckResult detail;
+    AdmissionLease       lease;
+};
+
+// Unified admission gate (design doc M4, constraint C5). Inference entries use
+// acquire() and retain its lease; health/status paths may use check() or
+// checkDetail(). Any state other than RUNNING is rejected with a retryable
+// ENGINE_UNAVAILABLE carrying instance_id / sleep_epoch / state.
 class AdmissionGate {
 public:
     // controller is not owned and must outlive the gate (it lives in
     // EngineBase, which is never destructed per constraint C1).
-    explicit AdmissionGate(const SleepLifecycleController* controller, std::string instance_id = ""):
+    explicit AdmissionGate(SleepLifecycleController* controller, std::string instance_id = ""):
         controller_(controller), instance_id_(std::move(instance_id)) {}
+
+    // Linearizable admission check. A successful result carries a move-only
+    // lease that must remain alive for the full inference request.
+    AdmissionAcquireResult acquire() const;
 
     // RUNNING (or no controller wired) -> OK. Otherwise UNAVAILABLE with the
     // M4 error body serialized into grpc error_details as ErrorDetailsPB.
@@ -42,15 +52,16 @@ public:
     AdmissionCheckResult checkDetail() const;
 
     // JSON body for HTTP responses, same schema as the gRPC error details.
-    static std::string toJson(const AdmissionCheckResult& result);
+    static std::string  toJson(const AdmissionCheckResult& result);
+    static grpc::Status toGrpcStatus(const AdmissionCheckResult& result);
 
     const std::string& instanceId() const {
         return instance_id_;
     }
 
 private:
-    const SleepLifecycleController* controller_;  // not owned
-    std::string                      instance_id_;
+    SleepLifecycleController* controller_;  // not owned
+    std::string               instance_id_;
 };
 
 }  // namespace rtp_llm
