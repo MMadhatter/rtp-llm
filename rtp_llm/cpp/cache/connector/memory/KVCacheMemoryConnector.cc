@@ -111,7 +111,11 @@ bool KVCacheMemoryConnector::releaseMemoryCacheBacking() {
         return true;
     }
     // The cache-key -> block index LRU points into the buffer we are about to free.
-    block_cache_ = std::make_shared<MemoryBlockCache>();
+    // Clear in place (keeping block_cache_'s address stable) so lock-free readers that
+    // hold the shared_ptr never race a pointer swap; MemoryBlockCache is internally locked.
+    if (block_cache_) {
+        block_cache_->clear();
+    }
     block_pool_->releaseHostBuffer();
     RTP_LLM_LOG_INFO("memory cache backing released for sleep");
     return true;
@@ -124,7 +128,10 @@ bool KVCacheMemoryConnector::restoreMemoryCacheBacking() {
     }
     block_pool_->reallocateHostBuffer();
     // Start from an empty cache: the previous host KV contents were discarded.
-    block_cache_ = std::make_shared<MemoryBlockCache>();
+    // Clear in place rather than swapping the pointer so lock-free readers stay safe.
+    if (block_cache_) {
+        block_cache_->clear();
+    }
     RTP_LLM_LOG_INFO("memory cache backing restored on wake");
     return true;
 }

@@ -517,13 +517,26 @@ absl::Status NormalEngine::maybeReachCollectiveSleepQuiesce() {
     // The all-reduce MUST be issued on EVERY step regardless of pending, because the
     // decision to call it has to be rank-symmetric: gating it on the per-rank pause_
     // flag would let a rank that received sleep first block inside the collective while
-    // peers still run normal forwards, hanging the fleet. But its two costs are kept off
+    // peers still run normal forwards, hanging the fleet. Two of its costs are kept off
     // the normal serving path: a non-pending rank's contribution is the constant [0, 1]
     // ("not pausing, counts as one not-ready"), so the input buffer is filled once and
     // reduced out-of-place into a separate result buffer (input preserved -> no per-step
     // fill), and the device->host copy that reads the consensus only runs while a sleep
-    // is actually pending. On the normal path the only residual work is the async
-    // 16-byte all-reduce itself.
+    // is actually pending.
+    //
+    // What is NOT free, and what makes this a known interim cost rather than a zero-cost
+    // path: execAllReduce() here is not a native NCCL call. It acquires the Python GIL and
+    // invokes a registered Python callback (models_py/distributed/collective_torch.py),
+    // which runs torch.distributed.all_reduce WITHOUT async_op -- a blocking enqueue, not a
+    // fire-and-forget. So on EVERY step of a DP/EP deployment this adds a GIL acquisition, a
+    // C++->Python round-trip, and a 16-byte all-reduce enqueue on the DP_AND_TP communicator,
+    // even when no sleep is pending. That is measurable on the decode hot path and is the
+    // reason collectiveSleepQuiesceEnabled() is scoped as narrowly as possible (sleep enabled
+    // AND world_size>1 AND dp/ep>1). The intended end state is to sink this consensus into the
+    // native comm layer and fold it into the existing forward-pass collective so the steady
+    // state costs nothing extra; until then this per-step Python round-trip is the price of
+    // hang-free DP/EP sleep. See freeze_resume_dev.md for the DP/EP decode benchmark and the
+    // native-lowering plan.
     bool reached = false;
     {
         // step() normally runs only on the engine loop thread. Keep the reusable
