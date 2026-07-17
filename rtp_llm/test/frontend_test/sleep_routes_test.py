@@ -55,6 +55,18 @@ class _FakeProtoMessage:
         return dict(self.__dict__)
 
 
+class _FakeStore:
+    def __init__(self):
+        self.values: Dict[str, str] = {}
+
+    def compare_set(self, key: str, expected: str, desired: str) -> bytes:
+        current = self.values.get(key, "")
+        if current == expected:
+            self.values[key] = desired
+            current = desired
+        return current.encode("utf-8")
+
+
 class _FakeSleepRequestPB(_FakeProtoMessage):
     def __init__(
         self,
@@ -415,7 +427,10 @@ class SleepRoutesTest(unittest.TestCase):
 class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
 
     def _build_wrapper(
-        self, control_addresses=None, expected_control_address_count=None
+        self,
+        control_addresses=None,
+        expected_control_address_count=None,
+        lifecycle_store=None,
     ):
         import rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 as pb2
         from rtp_llm.utils import grpc_client_wrapper
@@ -427,6 +442,7 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
             server_port=12345,
             control_addresses=control_addresses or ["127.0.0.1:10001"],
             expected_control_address_count=expected_control_address_count,
+            lifecycle_store=lifecycle_store,
         )
         wrapper.channel = MagicMock()
         wrapper.stub = MagicMock()
@@ -963,7 +979,10 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("error", result)
         self.assertEqual(result["grpc_status"], "FAILED_PRECONDITION")
-        self.assertEqual(result["details"][0]["address"], addresses[1])
+        self.assertTrue(result["recovery_required"])
+        self.assertEqual(
+            {detail["address"] for detail in result["details"]}, set(addresses)
+        )
         for address in addresses:
             self.assertEqual(wrapper._dp_stubs[address].SleepServing.await_count, 2)
             wrapper._dp_stubs[address].WakeUpServing.assert_not_awaited()
@@ -1080,6 +1099,138 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("commit wake_up", result["error"])
         for address in addresses:
             self.assertEqual(wrapper._dp_stubs[address].WakeUpServing.await_count, 2)
+
+    async def test_independent_wrappers_compete_for_instance_lease(self):
+        store = _FakeStore()
+        holder, _ = self._build_wrapper(lifecycle_store=store)
+        loser, _ = self._build_wrapper(lifecycle_store=store)
+        address = loser.control_addresses[0]
+        loser._dp_stubs[address].GetSleepStatus = AsyncMock()
+        loser._dp_stubs[address].SleepServing = AsyncMock()
+
+        record, error = holder._acquire_lifecycle_lease("sleep")
+        self.assertFalse(error)
+        result = await loser.sleep_serving({})
+
+        self.assertEqual(result["grpc_status"], "FAILED_PRECONDITION")
+        self.assertIn("holds the instance lease", result["error"])
+        loser._dp_stubs[address].GetSleepStatus.assert_not_awaited()
+        loser._dp_stubs[address].SleepServing.assert_not_awaited()
+        holder._release_lifecycle_lease(record)
+
+    async def test_required_instance_store_unavailable_fails_closed(self):
+        wrapper, _ = self._build_wrapper()
+        wrapper._require_instance_lease = True
+        address = wrapper.control_addresses[0]
+        wrapper._dp_stubs[address].GetSleepStatus = AsyncMock()
+        wrapper._dp_stubs[address].SleepServing = AsyncMock()
+
+        result = await wrapper.sleep_serving({})
+
+        self.assertEqual(result["grpc_status"], "FAILED_PRECONDITION")
+        self.assertIn("coordination is unavailable", result["error"])
+        wrapper._dp_stubs[address].GetSleepStatus.assert_not_awaited()
+        wrapper._dp_stubs[address].SleepServing.assert_not_awaited()
+
+    async def test_instance_lease_release_requires_exact_owner_record(self):
+        store = _FakeStore()
+        holder, _ = self._build_wrapper(lifecycle_store=store)
+        other, _ = self._build_wrapper(lifecycle_store=store)
+
+        record, error = holder._acquire_lifecycle_lease("sleep")
+        self.assertFalse(error)
+        other._release_lifecycle_lease(other._lease_record("sleep"))
+        self.assertEqual(
+            store.values[holder.LIFECYCLE_LEASE_KEY],
+            record,
+        )
+
+        holder._release_lifecycle_lease(record)
+        self.assertEqual(store.values[holder.LIFECYCLE_LEASE_KEY], "")
+
+    async def test_partial_sleep_commit_retries_only_draining_rank(self):
+        addresses = ["127.0.0.1:10001", "127.0.0.1:10009"]
+        wrapper, pb2 = self._build_wrapper(control_addresses=addresses)
+        for address in addresses:
+            wrapper._dp_stubs[address].SleepServing = AsyncMock(
+                return_value=pb2.EmptyPB()
+            )
+        wrapper._dp_stubs[addresses[0]].GetSleepStatus = AsyncMock(
+            side_effect=[
+                self._status_pb(pb2, state="RUNNING"),
+                self._status_pb(pb2, state="SLEEPING"),
+                self._status_pb(pb2, state="SLEEPING"),
+            ]
+        )
+        wrapper._dp_stubs[addresses[1]].GetSleepStatus = AsyncMock(
+            side_effect=[
+                self._status_pb(pb2, state="RUNNING"),
+                self._status_pb(pb2, state="DRAINING"),
+                self._status_pb(pb2, state="SLEEPING"),
+            ]
+        )
+
+        result = await wrapper.sleep_serving({})
+
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(wrapper._dp_stubs[addresses[0]].SleepServing.await_count, 2)
+        self.assertEqual(wrapper._dp_stubs[addresses[1]].SleepServing.await_count, 3)
+
+    async def test_partial_wake_commit_retries_only_waking_rank(self):
+        addresses = ["127.0.0.1:10001", "127.0.0.1:10009"]
+        wrapper, pb2 = self._build_wrapper(control_addresses=addresses)
+        for address in addresses:
+            wrapper._dp_stubs[address].WakeUpServing = AsyncMock(
+                return_value=pb2.EmptyPB()
+            )
+        wrapper._dp_stubs[addresses[0]].GetSleepStatus = AsyncMock(
+            side_effect=[
+                self._status_pb(pb2, state="SLEEPING"),
+                self._status_pb(pb2, state="RUNNING"),
+                self._status_pb(pb2, state="RUNNING"),
+            ]
+        )
+        wrapper._dp_stubs[addresses[1]].GetSleepStatus = AsyncMock(
+            side_effect=[
+                self._status_pb(pb2, state="SLEEPING"),
+                self._status_pb(pb2, state="WAKING_UP"),
+                self._status_pb(pb2, state="RUNNING"),
+            ]
+        )
+
+        result = await wrapper.wake_up_serving()
+
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(wrapper._dp_stubs[addresses[0]].WakeUpServing.await_count, 2)
+        self.assertEqual(wrapper._dp_stubs[addresses[1]].WakeUpServing.await_count, 3)
+
+    async def test_commit_error_or_unreachable_requires_recovery(self):
+        for terminal in ("ERROR", "UNREACHABLE"):
+            with self.subTest(terminal=terminal):
+                wrapper, pb2 = self._build_wrapper()
+                address = wrapper.control_addresses[0]
+                wrapper._dp_stubs[address].SleepServing = AsyncMock(
+                    return_value=pb2.EmptyPB()
+                )
+                terminal_status = (
+                    self._status_pb(pb2, state="ERROR")
+                    if terminal == "ERROR"
+                    else self._aio_error(
+                        grpc.StatusCode.UNAVAILABLE, "rank unavailable"
+                    )
+                )
+                wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(
+                    side_effect=[
+                        self._status_pb(pb2, state="RUNNING"),
+                        terminal_status,
+                    ]
+                )
+
+                result = await wrapper.sleep_serving({})
+
+                self.assertNotEqual(result.get("status"), "ok")
+                self.assertTrue(result["recovery_required"])
+                self.assertIn("RECOVERY_REQUIRED", result["error"])
 
 
 class SleepControlAddressTest(unittest.TestCase):

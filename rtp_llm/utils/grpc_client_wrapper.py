@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 import grpc
@@ -72,6 +73,9 @@ def _normalize_json_request(req: Any) -> Dict[str, Any]:
 class GrpcClientWrapper:
     """Wrapper for direct gRPC calls to replace async_request_server"""
 
+    LIFECYCLE_LEASE_KEY = "rtp_llm_instance_lifecycle_lease"
+    COMMIT_MAX_ATTEMPTS = 3
+
     def __init__(
         self,
         server_port: int,
@@ -79,6 +83,9 @@ class GrpcClientWrapper:
         control_addresses: Optional[List[str]] = None,
         expected_control_address_count: Optional[int] = None,
         control_address_resolver: Optional[Callable[[], List[str]]] = None,
+        lifecycle_store: Optional[Any] = None,
+        lifecycle_store_factory: Optional[Callable[[], Optional[Any]]] = None,
+        require_instance_lease: bool = False,
     ):
         self.server_port = server_port
         self.address = f"localhost:{server_port}"
@@ -95,17 +102,14 @@ class GrpcClientWrapper:
         )
         self.expected_control_address_count = expected_control_address_count
         self._control_address_resolver = control_address_resolver
-        # NOTE: this lock only serializes sleep/wake_up coordination WITHIN this
-        # frontend process. There are multiple frontend server processes (see
-        # start_server.py), each with its own GrpcClientWrapper and its own lock,
-        # so it does NOT provide cross-process mutual exclusion. Cross-process
-        # correctness is enforced by the authoritative backend state machine
-        # (SleepLifecycleController: transition_mutex_ serializes each transition,
-        # sleep_epoch disambiguates, and illegal transitions are rejected with
-        # FAILED_PRECONDITION). Interleaved prepare/commit from two frontends
-        # therefore converge to either idempotent success or a clean precondition
-        # failure — never a corrupt/partially-released state. Do not treat this
-        # lock as the instance-wide lifecycle lock.
+        self._lifecycle_store = lifecycle_store
+        self._lifecycle_store_factory = lifecycle_store_factory
+        self._require_instance_lease = (
+            require_instance_lease or lifecycle_store is not None
+        )
+        self._lifecycle_holder = uuid.uuid4().hex
+        # This lock handles re-entrancy within one frontend. The TCPStore lease
+        # below is the authoritative instance-wide serialization mechanism.
         self._lifecycle_lock = asyncio.Lock()
         self._dp_channels: Dict[str, Any] = {}
         self._dp_stubs: Dict[str, Any] = {}
@@ -321,11 +325,166 @@ class GrpcClientWrapper:
     async def _broadcast_control_rpc(
         self, rpc_name: str, request: Any, timeout_s: float
     ) -> List[Dict[str, Any]]:
+        return await self._broadcast_control_rpc_to(
+            self.control_addresses, rpc_name, request, timeout_s
+        )
+
+    async def _broadcast_control_rpc_to(
+        self,
+        addresses: List[str],
+        rpc_name: str,
+        request: Any,
+        timeout_s: float,
+    ) -> List[Dict[str, Any]]:
         tasks = [
             self._call_control_rpc(address, rpc_name, request, timeout_s)
-            for address in self.control_addresses
+            for address in addresses
         ]
         return await asyncio.gather(*tasks)
+
+    def _lease_record(self, operation: str) -> str:
+        return json.dumps(
+            {"holder": self._lifecycle_holder, "operation": operation},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _get_lifecycle_store(self) -> Optional[Any]:
+        if self._lifecycle_store is None and self._lifecycle_store_factory is not None:
+            try:
+                self._lifecycle_store = self._lifecycle_store_factory()
+            except Exception as e:
+                logging.error("failed to establish lifecycle TCPStore: %s", e)
+        return self._lifecycle_store
+
+    def _acquire_lifecycle_lease(
+        self, operation: str
+    ) -> tuple[Optional[str], Dict[str, Any]]:
+        store = self._get_lifecycle_store()
+        if store is None:
+            if not self._require_instance_lease:
+                return None, {}
+            return None, {
+                "error": "instance-wide lifecycle coordination is unavailable",
+                "grpc_status": "FAILED_PRECONDITION",
+            }
+        record = self._lease_record(operation)
+        try:
+            current = store.compare_set(self.LIFECYCLE_LEASE_KEY, "", record)
+            if isinstance(current, bytes):
+                current = current.decode("utf-8")
+        except Exception as e:
+            return None, {
+                "error": f"instance-wide lifecycle coordination failed: {e}",
+                "grpc_status": "FAILED_PRECONDITION",
+            }
+        if current != record:
+            return None, {
+                "error": "another lifecycle operation holds the instance lease",
+                "grpc_status": "FAILED_PRECONDITION",
+            }
+        return record, {}
+
+    def _release_lifecycle_lease(self, record: Optional[str]) -> None:
+        if record is None or self._lifecycle_store is None:
+            return
+        try:
+            self._lifecycle_store.compare_set(self.LIFECYCLE_LEASE_KEY, record, "")
+        except Exception as e:
+            # Fail closed: an uncertain/non-released record must continue blocking
+            # lifecycle operations until the instance (and its TCPStore) restarts.
+            logging.error("failed to release instance lifecycle lease: %s", e)
+
+    async def _raw_sleep_statuses(self) -> List[Dict[str, Any]]:
+        return await self._broadcast_control_rpc(
+            "GetSleepStatus", pb2.EmptyPB(), timeout_s=3
+        )
+
+    async def _initial_lifecycle_status(self, operation: str) -> Dict[str, Any]:
+        self._refresh_control_addresses_if_needed()
+        statuses = await self._raw_sleep_statuses()
+        status = self._aggregate_sleep_status(statuses)
+        _report_sleep_status_metrics(status)
+        if "error" in status:
+            return self._recovery_required(
+                operation, "could not establish the initial rank state", statuses
+            )
+        state = str(status.get("state", ""))
+        known_states = {
+            "RUNNING",
+            "DRAINING",
+            "SUSPENDING",
+            "SLEEPING",
+            "WAKING_UP",
+        }
+        if state not in known_states:
+            return self._recovery_required(
+                operation, "observed an invalid initial rank state", statuses
+            )
+        return status
+
+    def _recovery_required(
+        self, operation: str, reason: str, statuses: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        details = []
+        for status in statuses:
+            detail = {"address": status.get("address", "")}
+            if "error" in status:
+                detail["error"] = status["error"]
+                if "grpc_status" in status:
+                    detail["grpc_status"] = status["grpc_status"]
+            else:
+                detail["state"] = status.get("state", "")
+            details.append(detail)
+        return {
+            "error": f"RECOVERY_REQUIRED: {operation} {reason}",
+            "grpc_status": "FAILED_PRECONDITION",
+            "recovery_required": True,
+            "details": details,
+        }
+
+    async def _converge_commit(
+        self,
+        operation: str,
+        rpc_name: str,
+        commit_request: Any,
+        timeout_s: float,
+        transitional_state: str,
+        final_state: str,
+    ) -> Dict[str, Any]:
+        pending = list(self.control_addresses)
+        last_statuses: List[Dict[str, Any]] = []
+        for _ in range(self.COMMIT_MAX_ATTEMPTS):
+            await self._broadcast_control_rpc_to(
+                pending, rpc_name, commit_request, timeout_s
+            )
+            last_statuses = await self._raw_sleep_statuses()
+            if len(last_statuses) != len(self.control_addresses):
+                return self._recovery_required(
+                    operation, "status coverage is incomplete", last_statuses
+                )
+            if any("error" in status for status in last_statuses):
+                return self._recovery_required(
+                    operation, "status probe failed", last_statuses
+                )
+            states = [str(status.get("state", "")) for status in last_statuses]
+            allowed_states = {transitional_state, final_state}
+            if any(state not in allowed_states for state in states):
+                return self._recovery_required(
+                    operation, "observed an unrecoverable rank state", last_statuses
+                )
+            pending = [
+                status["address"]
+                for status, state in zip(last_statuses, states)
+                if state == transitional_state
+            ]
+            if not pending:
+                return {"status": "ok"}
+        return self._recovery_required(
+            operation,
+            f"did not converge after {self.COMMIT_MAX_ATTEMPTS} commit attempts",
+            last_statuses,
+        )
 
     def _aggregate_sleep_status(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         successes = [result for result in results if "error" not in result]
@@ -402,7 +561,14 @@ class GrpcClientWrapper:
         """Trigger engine sleep on every lifecycle control rank."""
         start_time = time.time() * 1000
         async with self._lifecycle_lock:
-            result = await self._sleep_serving_locked(req)
+            lease_record, lease_error = self._acquire_lifecycle_lease("sleep")
+            if lease_error:
+                result = lease_error
+            else:
+                try:
+                    result = await self._sleep_serving_locked(req)
+                finally:
+                    self._release_lifecycle_lease(lease_record)
         # sleep is a rare control-plane action: the synchronous response is the
         # authoritative outcome and a failure is handled as an incident, so a
         # single grep-able log line per call is the useful signal (no QPS metric).
@@ -445,6 +611,7 @@ class GrpcClientWrapper:
                 return {
                     "error": "sleep level=0 state-preserving sleep is defined but not implemented",
                     "grpc_status": "UNIMPLEMENTED",
+                    "supported_levels": [1],
                     "supported_modes": ["wait", "abort"],
                 }
             # level 1 (host backup) and level 2 (discard weights) are both valid
@@ -475,7 +642,7 @@ class GrpcClientWrapper:
                     "error": "sleep tags must be non-empty strings",
                     "grpc_status": "INVALID_ARGUMENT",
                 }
-            status = await self.get_sleep_status()
+            status = await self._initial_lifecycle_status("sleep")
             if "error" in status:
                 return status
             if not bool(status.get("effective", False)):
@@ -541,25 +708,14 @@ class GrpcClientWrapper:
             # the ~weights-sized raw backup to disk, which can take far longer than
             # a level-1 tms pause. Reuse the drain-derived headroom so a slow dump
             # does not spuriously trip the commit deadline.
-            commit_results = await self._broadcast_control_rpc(
-                "SleepServing", commit_request, timeout_s
+            return await self._converge_commit(
+                operation="commit sleep",
+                rpc_name="SleepServing",
+                commit_request=commit_request,
+                timeout_s=timeout_s,
+                transitional_state="DRAINING",
+                final_state="SLEEPING",
             )
-            failures = [result for result in commit_results if "error" in result]
-            if failures:
-                return {
-                    "error": "Failed to commit sleep on some control ranks",
-                    "grpc_status": failures[0].get("grpc_status", "UNKNOWN"),
-                    "details": _error_details(commit_results),
-                }
-            status = await self.get_sleep_status()
-            if "error" in status:
-                return status
-            if status.get("state") != "SLEEPING":
-                return {
-                    "error": "Sleep did not converge on all control ranks",
-                    "grpc_status": "FAILED_PRECONDITION",
-                }
-            return {"status": "ok"}
         except grpc.aio.AioRpcError as e:
             logging.error(f"Sleep serving failed: {e.details()}")
             return {
@@ -574,7 +730,14 @@ class GrpcClientWrapper:
         """Trigger engine wake_up on every lifecycle control rank."""
         start_time = time.time() * 1000
         async with self._lifecycle_lock:
-            result = await self._wake_up_serving_locked(req)
+            lease_record, lease_error = self._acquire_lifecycle_lease("wake_up")
+            if lease_error:
+                result = lease_error
+            else:
+                try:
+                    result = await self._wake_up_serving_locked(req)
+                finally:
+                    self._release_lifecycle_lease(lease_record)
         duration_ms = time.time() * 1000 - start_time
         if "error" in result:
             logging.warning(
@@ -602,7 +765,7 @@ class GrpcClientWrapper:
                     "error": f"wake_up {unsupported_field} is unsupported",
                     "grpc_status": "INVALID_ARGUMENT",
                 }
-            status = await self.get_sleep_status()
+            status = await self._initial_lifecycle_status("wake_up")
             if "error" in status:
                 return status
             if not bool(status.get("effective", False)):
@@ -632,25 +795,14 @@ class GrpcClientWrapper:
             # the ~weights-sized raw backup from disk (read + H2D copy), which can
             # take far longer than a level-1 tms resume. Give it the same headroom
             # as wake prepare so a slow restore does not trip the commit deadline.
-            commit_results = await self._broadcast_control_rpc(
-                "WakeUpServing", commit_request, timeout_s=600
+            return await self._converge_commit(
+                operation="commit wake_up",
+                rpc_name="WakeUpServing",
+                commit_request=commit_request,
+                timeout_s=600,
+                transitional_state="WAKING_UP",
+                final_state="RUNNING",
             )
-            failures = [result for result in commit_results if "error" in result]
-            if failures:
-                return {
-                    "error": "Failed to commit wake_up on some control ranks",
-                    "grpc_status": failures[0].get("grpc_status", "UNKNOWN"),
-                    "details": _error_details(commit_results),
-                }
-            status = await self.get_sleep_status()
-            if "error" in status:
-                return status
-            if status.get("state") != "RUNNING":
-                return {
-                    "error": "Wake_up did not converge on all control ranks",
-                    "grpc_status": "FAILED_PRECONDITION",
-                }
-            return {"status": "ok"}
         except grpc.aio.AioRpcError as e:
             logging.error(f"Wake_up serving failed: {e.details()}")
             return {

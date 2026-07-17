@@ -24,6 +24,7 @@ from rtp_llm.config.engine_config import EngineConfig
 from rtp_llm.config.py_config_modules import PyEnvConfigs
 from rtp_llm.config.uvicorn_config import get_uvicorn_logging_config
 from rtp_llm.distribute.distributed_server import (
+    get_global_tcp_store,
     get_global_world_info_from_store,
     get_world_info,
 )
@@ -115,12 +116,26 @@ class FrontendApp(object):
         if not control_addresses:
             control_addresses = local_control_addresses
         expected_control_address_count = engine_config.parallelism_config.world_size
+        require_instance_lease = (
+            self.server_config.frontend_server_count > 1
+            or engine_config.parallelism_config.world_size > 1
+        )
+
+        def connect_lifecycle_store():
+            return get_global_tcp_store(
+                server_config=py_env_configs.server_config,
+                distribute_config=py_env_configs.distribute_config,
+                parallelism_config=engine_config.parallelism_config,
+            )
+
         self.grpc_client = GrpcClientWrapper(
             self.server_config.rpc_server_port,
             dp_addresses=dp_addresses,
             control_addresses=control_addresses,
             expected_control_address_count=expected_control_address_count,
             control_address_resolver=resolve_global_control_addresses,
+            lifecycle_store_factory=connect_lifecycle_store,
+            require_instance_lease=require_instance_lease,
         )
         logging.info(
             "sleep coordinator control_addresses=%s, expected_control_address_count=%s",

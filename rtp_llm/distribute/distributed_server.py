@@ -203,6 +203,39 @@ def get_global_world_info_from_store(
     return world_info
 
 
+def get_global_tcp_store(
+    server_config: ServerConfig,
+    distribute_config: DistributeConfig,
+    parallelism_config: ParallelismConfig,
+    timeout_seconds: int = 3,
+) -> Optional[Any]:
+    """Connect to the instance TCPStore without registering as a backend rank."""
+    try:
+        if parallelism_config.world_size == 1:
+            master_ip = server_config.ip or socket.gethostbyname(socket.gethostname())
+            master_server_port = server_config.start_port
+        else:
+            master_ip, master_server_port = get_master(
+                distribute_config, parallelism_config
+            )
+            if master_server_port == "":
+                master_server_port = server_config.start_port
+        if not master_ip:
+            raise ValueError("master ip is empty")
+        store_port = int(master_server_port) - 1
+        return TCPStore(
+            host_name=master_ip,
+            port=store_port,
+            world_size=None,
+            is_master=False,
+            timeout=timedelta(seconds=timeout_seconds),
+            wait_for_workers=False,
+        )
+    except Exception as e:
+        logging.warning("failed to connect instance TCPStore: %s", e)
+        return None
+
+
 def get_local_world_info(
     server_config: ServerConfig,
     distribute_config: DistributeConfig,
@@ -294,23 +327,26 @@ class DistributedServer(object):
             ),
             initialized=False,
         )
+        self.py_env_configs = py_env_configs
+        self.rank = pc.world_rank if rank == -1 else rank
+        self.world_size = pc.world_size if world_size == -1 else world_size
+        self._initialized = True
 
         if pc.world_size == 1:
-            logging.info("world_size == 1, do not start distributed_server")
+            logging.info("world_size == 1, start TCPStore for instance coordination")
             self.master_server_port = server_config.start_port
             self._nccl_comm_config = _build_nccl_comm_config(
                 self.worker_info.ip, server_config.start_port, pc.dp_rank
             )
+            self.store = TCPStore(
+                host_name=self.worker_info.ip,
+                port=self.master_server_port - 1,
+                world_size=None,
+                is_master=True,
+                wait_for_workers=False,
+                timeout=timedelta(seconds=distribute_config.dist_comm_timeout or 300),
+            )
             return
-
-        if rank == -1:
-            rank = pc.world_rank
-        if world_size == -1:
-            world_size = pc.world_size
-        self._initialized = True
-        self.py_env_configs = py_env_configs
-        self.rank = rank
-        self.world_size = world_size
 
         self.master_ip, master_server_port = get_master(
             self.py_env_configs.distribute_config,
@@ -335,8 +371,8 @@ class DistributedServer(object):
         store = TCPStore(
             host_name=self._nccl_comm_config.nccl_ip,
             port=self.master_server_port - 1,
-            world_size=world_size,
-            is_master=(rank == 0),
+            world_size=self.world_size,
+            is_master=(self.rank == 0),
             wait_for_workers=wait_for_workers,
             timeout=init_process_timeout,
         )
