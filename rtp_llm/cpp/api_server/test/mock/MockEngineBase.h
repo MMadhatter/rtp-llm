@@ -9,9 +9,7 @@ namespace rtp_llm {
 
 class MockEngineBase: public EngineBase {
 public:
-    MockEngineBase(): EngineBase(EngineInitParams()) {
-        sleepController().setEnabled(true);
-    }
+    MockEngineBase(): EngineBase(EngineInitParams()) {}
     ~MockEngineBase() override = default;
 
 public:

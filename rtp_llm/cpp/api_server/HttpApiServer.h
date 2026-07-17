@@ -25,7 +25,6 @@ class WorkerStatusService;
 class ModelStatusService;
 class SysCmdService;
 class TokenizerService;
-class SleepService;
 
 class HttpApiServer {
 public:
@@ -81,7 +80,6 @@ private:
     bool registerWorkerStatusService();
     bool registerModelStatusService();
     bool registerSysCmdService();
-    bool registerSleepService();
     bool registerTokenizerService();
     bool registerChatService();
     bool registerInferenceService();
@@ -112,7 +110,6 @@ private:
     std::shared_ptr<WorkerStatusService>     worker_status_service_;
     std::shared_ptr<ModelStatusService>      model_status_service_;
     std::shared_ptr<SysCmdService>           sys_cmd_service_;
-    std::shared_ptr<SleepService>            sleep_service_;
     std::shared_ptr<TokenizerService>        tokenizer_service_;
     std::shared_ptr<ChatService>             chat_service_;
     std::shared_ptr<InferenceService>        inference_service_;

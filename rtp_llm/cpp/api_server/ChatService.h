@@ -58,7 +58,6 @@ private:
                                    const std::string&                                      body,
                                    int64_t                                                 request_id,
                                    int64_t                                                 start_time_us);
-    bool acquireOrReject(const std::unique_ptr<http_server::HttpResponseWriter>& writer, AdmissionLease& lease) const;
     static std::string sseResponse(const std::string& response) {
         return "data: " + response + "\n\n";
     }

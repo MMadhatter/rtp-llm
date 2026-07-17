@@ -10,7 +10,6 @@
 #include "rtp_llm/cpp/api_server/ErrorResponse.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/api_server/AccessLogWrapper.h"
-#include "rtp_llm/cpp/engine_base/sleep/AdmissionGate.h"
 
 using namespace autil::legacy;
 using namespace autil::legacy::json;
@@ -121,24 +120,6 @@ InferenceService::InferenceService(const std::shared_ptr<EngineBase>&           
     model_config_(model_config),
     metric_reporter_(metric_reporter) {}
 
-bool InferenceService::acquireOrReject(const std::unique_ptr<http_server::HttpResponseWriter>& writer,
-                                       AdmissionLease&                                         lease) const {
-    if (!engine_) {
-        return false;
-    }
-    AdmissionGate gate(&engine_->sleepController());
-    auto          admission = gate.acquire();
-    if (admission.detail.admitted) {
-        lease = std::move(admission.lease);
-        return false;
-    }
-    writer->SetWriteType(http_server::HttpResponseWriter::WriteType::Normal);
-    writer->AddHeader("Content-Type", "application/json");
-    writer->SetStatus(503, "Service Unavailable");
-    writer->Write(AdmissionGate::toJson(admission.detail));
-    return true;
-}
-
 void checkMasterWorker(bool isInternal) {
     if (isInternal) {
         if (!ParallelInfo::globalParallelInfo().isWorker()) {
@@ -166,10 +147,6 @@ void InferenceService::inference(const std::unique_ptr<http_server::HttpResponse
     request_id = request_counter_->incAndReturn();
     try {
         checkMasterWorker(isInternal);
-        AdmissionLease admission_lease;
-        if (acquireOrReject(writer, admission_lease)) {
-            return;
-        }
         inferResponse(request_id, writer, request);
     } catch (const std::exception& e) {
         HttpApiServerException::handleException(e, request_id, metric_reporter_, request, writer);

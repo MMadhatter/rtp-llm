@@ -69,7 +69,6 @@ private:
                                                      const std::string&                     text,
                                                      const std::vector<std::string>&        urls,
                                                      const std::shared_ptr<GenerateConfig>& generate_config);
-    bool acquireOrReject(const std::unique_ptr<http_server::HttpResponseWriter>& writer, AdmissionLease& lease) const;
 
     std::string doneResponse();
     std::string sseResponse(const std::string& response);

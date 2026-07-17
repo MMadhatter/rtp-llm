@@ -1,9 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <functional>
-#include <memory>
-#include <string>
 #include "rtp_llm/cpp/api_server/http_server/http_server/HttpServer.h"
 #include "rtp_llm/cpp/api_server/http_server/http_server/HttpResponseWriter.h"
 #include "rtp_llm/cpp/api_server/http_server/http_server/HttpRequest.h"
@@ -12,9 +9,7 @@ namespace rtp_llm {
 
 class HealthService {
 public:
-    using ReadinessStateProvider = std::function<std::string()>;
-
-    explicit HealthService(ReadinessStateProvider readiness_state_provider = {});
+    HealthService()  = default;
     ~HealthService() = default;
 
 public:
@@ -26,8 +21,7 @@ public:
     void stop();
 
 private:
-    std::atomic_bool       is_stopped_{false};
-    ReadinessStateProvider readiness_state_provider_;
+    std::atomic_bool is_stopped_{false};
 };
 
 bool registerHealthServiceStatic(http_server::HttpServer& http_server, std::shared_ptr<HealthService> health_service);
