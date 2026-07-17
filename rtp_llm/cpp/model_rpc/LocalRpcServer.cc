@@ -405,7 +405,12 @@ void LocalRpcServer::installSleepHooks() {
             try {
                 c10::cuda::CUDACachingAllocator::emptyCache();
             } catch (const std::exception& e) {
-                (void)cudaGetLastError();  // clear sticky error left by the failed free
+                // clear sticky error left by the failed free so it can't poison the next wake
+#if USING_CUDA
+                (void)cudaGetLastError();
+#elif USING_ROCM
+                (void)hipGetLastError();
+#endif
                 RTP_LLM_LOG_WARNING("releaseRestorableGpuMemory: best-effort emptyCache() failed (%s); "
                                     "continuing, GPU regions already released via VMM pause",
                                     e.what());

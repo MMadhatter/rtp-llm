@@ -95,13 +95,22 @@ class ModelLoader:
             weights = self._load_from_ft_style(device)
         else:
             weights = self._load_weight(device)
-            self.force_clean_cuda_memory()
 
         # Dynamic lm_head/positional weights and static EPLB buffers may
         # allocate new GPU tensors outside WeightModule.load().
         with weights_region():
             self._load_dynamic_weights(weights, device)
             self._init_eplb_weight(weights, device)
+
+        # weights_region wraps the whole load pipeline, so the transient
+        # intermediates (raw read / dequant / TP-split / .to(device)) it
+        # produces get freed here but leave their caching-allocator segments
+        # cached. empty_cache() returns those freed segments to the driver so
+        # only the live resident weights stay resident -- and, under sleep mode,
+        # only they keep the "weights" tag (cudaFree untracks the rest in
+        # torch_memory_saver). One-time at load; covers scratch, fastsafetensors
+        # and the dynamic/eplb region alike.
+        self.force_clean_cuda_memory()
         return weights
 
     def load_lora_weights(self, adapter_name: str, lora_path: str, device: str = "cpu"):

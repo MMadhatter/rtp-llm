@@ -703,6 +703,76 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(commit_request.prepare_only)
             self.assertTrue(commit_request.commit_only)
 
+    async def test_wake_up_from_uniform_sleeping_state_proceeds(self):
+        # #1 contract (positive): when every control rank reports the SAME
+        # SLEEPING state, wake is a well-defined atomic transition and must
+        # proceed through prepare + commit to RUNNING.
+        addresses = ["127.0.0.1:10001", "127.0.0.1:10009"]
+        wrapper, pb2 = self._build_wrapper(control_addresses=addresses)
+        for address in addresses:
+            wrapper._dp_stubs[address].WakeUpServing = AsyncMock(
+                return_value=pb2.EmptyPB()
+            )
+            wrapper._dp_stubs[address].GetSleepStatus = AsyncMock(
+                side_effect=[
+                    self._status_pb(
+                        pb2,
+                        state="SLEEPING",
+                        sleep_epoch=1,
+                        kv_memory_state="PAUSED",
+                        device_kv_cache_valid=False,
+                        gpu_resource_state="RELEASED",
+                    ),
+                    self._status_pb(
+                        pb2,
+                        state="RUNNING",
+                        sleep_epoch=1,
+                        kv_memory_state="ACTIVE",
+                        device_kv_cache_valid=True,
+                        gpu_resource_state="ACTIVE",
+                    ),
+                ]
+            )
+
+        result = await wrapper.wake_up_serving()
+
+        self.assertEqual(result, {"status": "ok"})
+        for address in addresses:
+            self.assertEqual(wrapper._dp_stubs[address].WakeUpServing.await_count, 2)
+
+    async def test_wake_up_rejects_mixed_initial_rank_state_as_recovery_required(self):
+        # #1 contract (negative): a mixed PRE-condition -- one rank already
+        # SLEEPING while another is still DRAINING -- is a fault, not a
+        # recoverable divergence. sleep/wake are atomic and level-2 discarded GPU
+        # memory with no backup, so the ranks cannot be reconciled into a known-
+        # good state. wake_up must return RECOVERY_REQUIRED *before* issuing any
+        # prepare RPC (never hang, never silently half-wake); the operator
+        # restarts the instance.
+        addresses = ["127.0.0.1:10001", "127.0.0.1:10009"]
+        wrapper, pb2 = self._build_wrapper(control_addresses=addresses)
+        wrapper._dp_stubs[addresses[0]].GetSleepStatus = AsyncMock(
+            return_value=self._status_pb(pb2, state="SLEEPING", sleep_epoch=1)
+        )
+        wrapper._dp_stubs[addresses[1]].GetSleepStatus = AsyncMock(
+            return_value=self._status_pb(pb2, state="DRAINING", sleep_epoch=1)
+        )
+        for address in addresses:
+            wrapper._dp_stubs[address].WakeUpServing = AsyncMock(
+                return_value=pb2.EmptyPB()
+            )
+
+        result = await wrapper.wake_up_serving()
+
+        self.assertIn("error", result)
+        self.assertIn("RECOVERY_REQUIRED", result["error"])
+        self.assertEqual(result["grpc_status"], "FAILED_PRECONDITION")
+        self.assertTrue(result["recovery_required"])
+        self.assertEqual(
+            {detail["address"] for detail in result["details"]}, set(addresses)
+        )
+        for address in addresses:
+            wrapper._dp_stubs[address].WakeUpServing.assert_not_awaited()
+
     async def test_wake_up_serving_phase_rejected_before_status_probe(self):
         wrapper, pb2 = self._build_wrapper()
         address = wrapper.control_addresses[0]
@@ -753,6 +823,7 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
             "active_cache_transfer_count",
             "gpu_resource_state",
             "last_error",
+            "process_id",
         }
         self.assertEqual(expected_keys, set(result.keys()))
         self.assertEqual(result["state"], "RUNNING")

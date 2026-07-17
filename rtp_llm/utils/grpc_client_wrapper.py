@@ -401,6 +401,23 @@ class GrpcClientWrapper:
         )
 
     async def _initial_lifecycle_status(self, operation: str) -> Dict[str, Any]:
+        """Probe the pre-condition state shared by every control rank.
+
+        Contract (intended, not a limitation): sleep and wake_up are atomic,
+        uninterruptible instance-wide transitions with no addressable
+        intermediate state. Either every control rank is in the same state, or
+        the instance is faulted. A mixed rank state -- e.g. some ranks SLEEPING
+        while others are still DRAINING/WAKING_UP -- is therefore reported as
+        ``RECOVERY_REQUIRED`` (FAILED_PRECONDITION) and the caller must restart
+        the instance; we deliberately do NOT try to reconcile the ranks forward
+        or backward here. Rationale: level-2 sleep discards GPU memory with no
+        backup, so a diverged set of ranks cannot be reconstructed into a known-
+        good state -- silently waking into a wrong/partial state is more
+        dangerous than an honest restart. In-progress divergence during a single
+        commit is a separate, recoverable case handled by ``_converge_commit``
+        (which retries laggards up to a bound); this gate only fires when the
+        ranks are already inconsistent *before* the operation begins.
+        """
         self._refresh_control_addresses_if_needed()
         statuses = await self._raw_sleep_statuses()
         status = self._aggregate_sleep_status(statuses)
