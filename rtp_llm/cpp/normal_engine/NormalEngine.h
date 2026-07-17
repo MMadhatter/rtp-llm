@@ -70,7 +70,7 @@ private:
     bool                            collectiveSleepQuiesceEnabled() const;
     absl::Status                    maybeReachCollectiveSleepQuiesce();
     void                            enterPausedState();
-    void                            markPauseQuiesced();
+    void                            markPauseQuiesced(uint64_t pause_epoch);
 
     void initExecutor(const EngineInitParams& params, std::unique_ptr<ProposeModelEngineInitParams>& propose_params);
 
@@ -78,16 +78,20 @@ private:
     bool isEagle() override;
 
 private:
-    autil::ThreadPtr                              loop_thread_;
-    std::atomic<bool>                             running_{false};
-    std::mutex                                    process_mutex_;
-    std::mutex                                    collective_quiesce_state_mutex_;
-    torch::Tensor                                 collective_quiesce_state_;
-    torch::Tensor                                 collective_quiesce_result_;
-    bool                                          collective_quiesce_prev_pending_ = false;
-    std::mutex                                    pause_mutex_;
-    std::condition_variable                       pause_cv_;
-    bool                                          pause_quiesced_{false};
+    autil::ThreadPtr        loop_thread_;
+    std::atomic<bool>       running_{false};
+    std::mutex              process_mutex_;
+    std::mutex              collective_quiesce_state_mutex_;
+    torch::Tensor           collective_quiesce_state_;
+    torch::Tensor           collective_quiesce_result_;
+    bool                    collective_quiesce_prev_pending_ = false;
+    std::mutex              pause_mutex_;
+    std::condition_variable pause_cv_;
+    // Monotonic quiesce acknowledgement: the highest pause epoch a quiesce has
+    // completed for. pauseAndWaitQuiesced() waits for this to reach the epoch it
+    // captured. Monotonic-and-epoch-stamped so a fresh pause() (which only bumps
+    // pause_epoch_) can never race-erase a quiesce already recorded for that epoch.
+    uint64_t                                      quiesced_pause_epoch_{0};
     std::atomic<uint64_t>                         pause_epoch_{0};
     std::atomic<uint64_t>                         processed_pause_epoch_{0};
     std::unique_ptr<Executor>                     executor_;

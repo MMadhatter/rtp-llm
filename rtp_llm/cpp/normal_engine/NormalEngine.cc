@@ -385,14 +385,20 @@ absl::Status NormalEngine::stop() {
 }
 
 void NormalEngine::pause() {
-    bool expected = false;
-    if (pause_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        auto epoch = pause_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-        {
-            std::lock_guard<std::mutex> lock(pause_mutex_);
-            pause_quiesced_ = false;
+    {
+        // Bump the epoch under pause_mutex_ so it is published together with pause_=true.
+        // A quiesce reader (enterPausedState) that observes pause_=true then loads the epoch
+        // under the same lock is guaranteed to see the bumped value, so it can never
+        // acknowledge a stale epoch and strand pauseAndWaitQuiesced() until timeout.
+        // Bumping the epoch is also the sole "reset" of the quiesce ack: quiesced_pause_epoch_
+        // stays below this new epoch until a real quiesce records it, with no separate reset
+        // step that a concurrent acknowledgement could clobber.
+        std::lock_guard<std::mutex> lock(pause_mutex_);
+        bool                        expected = false;
+        if (pause_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            auto epoch = pause_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            RTP_LLM_LOG_INFO("normal engine pause requested, epoch=%lu", epoch);
         }
-        RTP_LLM_LOG_INFO("normal engine pause requested, epoch=%lu", epoch);
     }
     if (scheduler_) {
         scheduler_->wake();
@@ -400,27 +406,52 @@ void NormalEngine::pause() {
 }
 
 void NormalEngine::restart() {
-    pause_.store(false, std::memory_order_release);
+    // Clear pause_ under pause_mutex_ so the store cannot slip into the window
+    // between a waiter's predicate check and its wait: holding the lock forces
+    // the waiter to either observe pause_=false before parking or receive the
+    // notify while parked. A bare store+notify here could be lost.
     {
         std::lock_guard<std::mutex> lock(pause_mutex_);
-        pause_quiesced_ = false;
+        pause_.store(false, std::memory_order_release);
     }
     pause_cv_.notify_all();
 }
 
-void NormalEngine::markPauseQuiesced() {
+void NormalEngine::markPauseQuiesced(uint64_t pause_epoch) {
     {
         std::lock_guard<std::mutex> lock(pause_mutex_);
-        pause_quiesced_ = true;
+        // Monotonic: only ever advance. A stale/late caller for an older epoch cannot
+        // pull the ack backwards and strand a waiter that captured a newer epoch.
+        if (pause_epoch > quiesced_pause_epoch_) {
+            quiesced_pause_epoch_ = pause_epoch;
+        }
     }
     pause_cv_.notify_all();
 }
 
 void NormalEngine::enterPausedState() {
-    markPauseQuiesced();
     std::unique_lock<std::mutex> lock(pause_mutex_);
-    pause_cv_.wait(lock, [this] { return !pause_.load(std::memory_order_acquire) || !running_.load(); });
-    pause_quiesced_ = false;
+    // Loop, re-reading the epoch under the lock on every wake, so that a pause
+    // epoch published *while we are parked here* is still acknowledged. A rapid
+    // restart() (pause_ cleared) immediately followed by a new pause() (pause_
+    // re-set, epoch bumped) would otherwise leave us waiting in a call that only
+    // ever recorded the previous epoch, stranding the new epoch's coordinator
+    // until its deadline. Loading the epoch under the lock also rules out a stale
+    // pre-bump value, since pause() bumps it under the same lock.
+    while (running_.load()) {
+        if (!pause_.load(std::memory_order_acquire)) {
+            break;
+        }
+        const uint64_t epoch = pause_epoch_.load(std::memory_order_acquire);
+        if (epoch > quiesced_pause_epoch_) {
+            quiesced_pause_epoch_ = epoch;
+            pause_cv_.notify_all();
+        }
+        pause_cv_.wait(lock, [this, epoch] {
+            return !pause_.load(std::memory_order_acquire) || pause_epoch_.load(std::memory_order_acquire) > epoch
+                   || !running_.load();
+        });
+    }
 }
 
 absl::Status NormalEngine::runExecutorProcess(const std::list<GenerateStreamPtr>& streams) {
@@ -451,6 +482,26 @@ bool NormalEngine::collectiveSleepQuiesceEnabled() const {
            && (parallelism_config.dp_size > 1 || parallelism_config.ep_size > 1);
 }
 
+// Why a per-step collective (all-reduce) is unavoidable here, despite the cost of touching
+// the DP/TP path:
+//
+// Under DP/EP (world_size > 1 with dp_size > 1 or ep_size > 1), every step's forward pass
+// itself issues collectives (all-reduce / all-to-all) over the SAME DP_AND_TP communicator.
+// A collective only completes when every rank in the group participates. Sleep therefore
+// cannot be a rank-local decision: if the coordinator merely set each rank's pause_ flag and
+// let ranks stop independently, a rank that stopped one step before its peers would leave
+// those peers' next forward-pass collective blocked forever on the departed rank -- a
+// fleet-wide hang, not a clean sleep.
+//
+// The ranks must instead agree, on the identical step, that "everyone has received the pause
+// AND everyone is drained" before any of them stops. There is no lock-free, rank-local way to
+// reach that agreement across a collective group -- consensus has to travel over the same
+// communicator the forward path uses. So we are forced to fold a tiny consensus all-reduce
+// into the step loop; it is the only construct that guarantees all ranks observe the same
+// quiesce verdict on the same step and can then stop together. (The single-rank / pure-TP
+// deployment escapes this entirely -- see releasePendingTpCollectiveForPause() /
+// enterPausedState(), which need no per-step collective.) The code below is all about paying
+// for this unavoidable collective as cheaply as possible on the normal serving path.
 absl::Status NormalEngine::maybeReachCollectiveSleepQuiesce() {
     if (!collectiveSleepQuiesceEnabled()) {
         return absl::OkStatus();
@@ -572,7 +623,7 @@ absl::Status NormalEngine::releasePendingTpCollectiveForPause(uint64_t pause_epo
     // Rank0 may be blocked in scheduler_->schedule() while worker ranks are
     // waiting in tpSyncModelInputs. The RPC thread's empty sync step releases
     // those workers, and rank0 itself is not touching GPU while scheduler-blocked.
-    markPauseQuiesced();
+    markPauseQuiesced(pause_epoch);
     return absl::OkStatus();
 }
 
@@ -594,12 +645,12 @@ absl::Status NormalEngine::pauseAndWaitQuiesced(int64_t timeout_ms) {
     }
 
     std::unique_lock<std::mutex> lock(pause_mutex_);
-    if (pause_quiesced_ || !pause_.load(std::memory_order_acquire)) {
+    if (quiesced_pause_epoch_ >= pause_epoch || !pause_.load(std::memory_order_acquire)) {
         return absl::OkStatus();
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout_ms);
-    if (!pause_cv_.wait_until(lock, deadline, [this] {
-            return pause_quiesced_ || !pause_.load(std::memory_order_acquire) || !running_.load();
+    if (!pause_cv_.wait_until(lock, deadline, [this, pause_epoch] {
+            return quiesced_pause_epoch_ >= pause_epoch || !pause_.load(std::memory_order_acquire) || !running_.load();
         })) {
         return absl::Status(absl::StatusCode::kDeadlineExceeded,
                             "normal engine pause quiesce timeout after " + std::to_string(effective_timeout_ms)
