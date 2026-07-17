@@ -81,6 +81,10 @@ private:
     autil::ThreadPtr                              loop_thread_;
     std::atomic<bool>                             running_{false};
     std::mutex                                    process_mutex_;
+    std::mutex                                    collective_quiesce_state_mutex_;
+    torch::Tensor                                 collective_quiesce_state_;
+    torch::Tensor                                 collective_quiesce_result_;
+    bool                                          collective_quiesce_prev_pending_ = false;
     std::mutex                                    pause_mutex_;
     std::condition_variable                       pause_cv_;
     bool                                          pause_quiesced_{false};

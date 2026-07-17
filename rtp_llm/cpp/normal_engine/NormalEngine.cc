@@ -456,30 +456,76 @@ absl::Status NormalEngine::maybeReachCollectiveSleepQuiesce() {
         return absl::OkStatus();
     }
 
-    const bool    pending     = pause_.load(std::memory_order_acquire);
-    const int64_t unfinished  = pending && parallelism_config.tp_rank == 0 && scheduler_ ?
-                                    std::max<int64_t>(0, scheduler_->onflightStreams()) :
-                                    0;
-    const int64_t not_pending = pending ? 0 : 1;
+    const bool pending = pause_.load(std::memory_order_acquire);
 
     // data[0] = number of ranks that have received the pause request.
     // data[1] = number of ranks not ready (either not pending or still has inflight streams).
     // Quiesce is reached when all ranks are pending (data[0] == world_size) and
     // none are blocked (data[1] == 0).
-    auto state = torch::empty({2}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
-    auto data  = state.data_ptr<int64_t>();
-    data[0]    = pending ? 1 : 0;
-    data[1]    = unfinished + not_pending;
+    //
+    // The all-reduce MUST be issued on EVERY step regardless of pending, because the
+    // decision to call it has to be rank-symmetric: gating it on the per-rank pause_
+    // flag would let a rank that received sleep first block inside the collective while
+    // peers still run normal forwards, hanging the fleet. But its two costs are kept off
+    // the normal serving path: a non-pending rank's contribution is the constant [0, 1]
+    // ("not pausing, counts as one not-ready"), so the input buffer is filled once and
+    // reduced out-of-place into a separate result buffer (input preserved -> no per-step
+    // fill), and the device->host copy that reads the consensus only runs while a sleep
+    // is actually pending. On the normal path the only residual work is the async
+    // 16-byte all-reduce itself.
+    bool reached = false;
+    {
+        // step() normally runs only on the engine loop thread. Keep the reusable
+        // buffers safe if another caller enters the execute path concurrently.
+        std::lock_guard<std::mutex> lock(collective_quiesce_state_mutex_);
+        c10::DeviceGuard            device_guard(c10::Device(c10::kCUDA, static_cast<c10::DeviceIndex>(getDeviceId())));
+        if (!collective_quiesce_state_.defined()) {
+            const auto options = torch::TensorOptions()
+                                     .dtype(torch::kInt64)
+                                     .device(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(getDeviceId())));
+            collective_quiesce_state_  = torch::empty({2}, options);
+            collective_quiesce_result_ = torch::empty({2}, options);
+            // Steady-state not-pausing contribution: [pending=0, not_ready=1].
+            collective_quiesce_state_.select(0, 0).fill_(0);
+            collective_quiesce_state_.select(0, 1).fill_(1);
+            collective_quiesce_prev_pending_ = false;
+        }
 
-    auto reduced = execAllReduce({state, ReduceOp::Sum, false, ParallelMode::DP_AND_TP}).buffer;
-    if (reduced.device().is_cuda()) {
-        reduced = reduced.cpu();
+        if (pending) {
+            const int64_t unfinished =
+                parallelism_config.tp_rank == 0 && scheduler_ ? std::max<int64_t>(0, scheduler_->onflightStreams()) : 0;
+            collective_quiesce_state_.select(0, 0).fill_(1);
+            collective_quiesce_state_.select(0, 1).fill_(unfinished);
+        } else if (collective_quiesce_prev_pending_) {
+            // Left the pause window (sleep cancelled): reset the input back to the
+            // [0, 1] constant once so later normal steps need no fill.
+            collective_quiesce_state_.select(0, 0).fill_(0);
+            collective_quiesce_state_.select(0, 1).fill_(1);
+        }
+        collective_quiesce_prev_pending_ = pending;
+
+        // Out-of-place reduce into a dedicated result buffer so the input keeps its
+        // constant value across steps (a non-pending rank must always contribute a
+        // correct [0, 1], because a pending peer reads the summed result).
+        auto reduced =
+            execAllReduce(
+                {collective_quiesce_state_, ReduceOp::Sum, false, ParallelMode::DP_AND_TP, collective_quiesce_result_})
+                .buffer;
+
+        // Only the pausing path needs the consensus value; reading it forces a
+        // device->host sync, so keep that off the normal serving path.
+        if (pending) {
+            if (reduced.device().is_cuda()) {
+                reduced = reduced.cpu();
+            }
+            auto          reduced_data    = reduced.data_ptr<int64_t>();
+            const int64_t pending_sum     = reduced_data[0];
+            const int64_t not_ready_count = reduced_data[1];
+            reached                       = pending_sum == parallelism_config.world_size && not_ready_count == 0;
+        }
     }
-    auto          reduced_data    = reduced.data_ptr<int64_t>();
-    const int64_t pending_sum     = reduced_data[0];
-    const int64_t not_ready_count = reduced_data[1];
 
-    if (pending && pending_sum == parallelism_config.world_size && not_ready_count == 0) {
+    if (reached) {
         const auto pause_epoch = pause_epoch_.load(std::memory_order_acquire);
         processed_pause_epoch_.store(pause_epoch, std::memory_order_release);
         RTP_LLM_LOG_INFO("normal engine collective sleep quiesce reached, epoch=%lu, world_size=%ld",
