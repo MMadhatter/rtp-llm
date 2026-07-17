@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.config.quant_config import Fp8PerChannelCompressedQuantConfig
+from rtp_llm.config.sleep_mode_compatibility import reject_dynamic_lora_mutation
 from rtp_llm.lora.lora_weights import LoRAWeights
 from rtp_llm.model_loader.ffn_weight import iter_stacked_moe_weights
 from rtp_llm.model_loader.load_config import LoadConfig, LoadMethod
@@ -19,7 +20,11 @@ from rtp_llm.model_loader.model_weight_info import (
     ModelWeights,
 )
 from rtp_llm.model_loader.tensor_source import DatabaseTensorSource, TensorCollector
-from rtp_llm.model_loader.weight_memory_saver import weights_region
+from rtp_llm.model_loader.weight_memory_saver import (
+    is_enabled,
+    sleep_mode_level,
+    weights_region,
+)
 from rtp_llm.model_loader.weight_module import CustomAtomicWeight, WeightModule
 from rtp_llm.ops import TaskType, VitSeparation
 from rtp_llm.utils.database import BaseDatabase, CkptDatabase
@@ -100,6 +105,9 @@ class ModelLoader:
         return weights
 
     def load_lora_weights(self, adapter_name: str, lora_path: str, device: str = "cpu"):
+        reject_dynamic_lora_mutation(
+            enable_sleep_mode=is_enabled(), sleep_mode_level=sleep_mode_level()
+        )
         lora_weights = LoRAWeights(self._load_config.num_layers)
         # set lora rank
         self._load_config.database.load_lora(adapter_name, lora_path)
