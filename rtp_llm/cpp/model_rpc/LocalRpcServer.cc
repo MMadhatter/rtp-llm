@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <c10/core/InferenceMode.h>
 #if USING_CUDA
+#include <ATen/cuda/CachingHostAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime_api.h>
@@ -581,6 +582,55 @@ void LocalRpcServer::installSleepHooks() {
                 RTP_LLM_LOG_WARNING("releaseRestorableGpuMemory: best-effort emptyCache() failed (%s); "
                                     "continuing, GPU regions already released via VMM pause",
                                     e.what());
+            }
+        }
+#endif
+        // CUDA process restore on GB300 can fail with CUDA_ERROR_NOT_SUPPORTED
+        // when PyTorch's pinned-host allocator retains free cached blocks backed
+        // by cudaHostAlloc/cudaHostRegister. Tensor.item() is one hidden source:
+        // it allocates a pinned scalar staging buffer and returns it to the host
+        // cache, while torch/device emptyCache above does not release it. The
+        // checkpoint call itself succeeds, making this easy to misdiagnose as an
+        // NVLS restore failure.
+        //
+        // Flush unused pinned-host blocks for every sleep level, next to the
+        // device allocator emptyCache above. Host empty_cache only releases
+        // cached/free blocks; live host tensors remain allocated. Do not
+        // require the allocator's total allocation count to reach zero: the
+        // engine intentionally retains pinned input/control tensors across
+        // sleep. The restore failure reproduced on GB300 came from a free
+        // cached D2H staging block, which empty_cache releases.
+#if USING_CUDA
+        {
+            try {
+                auto* host_allocator = at::getHostAllocator(at::kCUDA);
+                RTP_LLM_CHECK_WITH_INFO(host_allocator != nullptr, "CUDA host allocator is unavailable");
+                const auto before = host_allocator->get_stats();
+                host_allocator->empty_cache();
+                const auto after = host_allocator->get_stats();
+                RTP_LLM_LOG_INFO(
+                    "sleep level-%d CUDA pinned-host cache flush: "
+                    "active_bytes=%lld->%lld allocated_bytes=%lld->%lld "
+                    "active_requests=%lld->%lld allocations=%lld->%lld",
+                    opt.level,
+                    static_cast<long long>(before.active_bytes.current),
+                    static_cast<long long>(after.active_bytes.current),
+                    static_cast<long long>(before.allocated_bytes.current),
+                    static_cast<long long>(after.allocated_bytes.current),
+                    static_cast<long long>(before.active_requests.current),
+                    static_cast<long long>(after.active_requests.current),
+                    static_cast<long long>(before.allocations.current),
+                    static_cast<long long>(after.allocations.current));
+            } catch (const std::exception& e) {
+                (void)cudaGetLastError();
+                if (opt.level == 3) {
+                    RTP_LLM_LOG_ERROR(
+                        "level-3 CUDA pinned-host cache flush failed; refusing process checkpoint: %s", e.what());
+                    ok = false;
+                } else {
+                    RTP_LLM_LOG_WARNING(
+                        "sleep level-%d CUDA pinned-host cache flush failed (ignored): %s", opt.level, e.what());
+                }
             }
         }
 #endif

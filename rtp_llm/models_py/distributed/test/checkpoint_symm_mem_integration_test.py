@@ -32,6 +32,9 @@ _PHASE_TIMEOUT_SECONDS = 180
 _EXIT_TIMEOUT_SECONDS = 30
 _LOCK_TIMEOUT_MS = 60_000
 _SYMM_MEM_MODE = os.environ.get("RTP_LLM_CHECKPOINT_TEST_SYMM_MEM", "all")
+_FLUSH_HOST_CACHE = (
+    os.environ.get("RTP_LLM_CHECKPOINT_TEST_FLUSH_HOST_CACHE", "1") == "1"
+)
 
 
 def _symmetric_memory_enabled(generation):
@@ -150,6 +153,8 @@ def _run_collective_generation(torch, dist, symm_mem, rank, init_path, generatio
             if dist.is_initialized():
                 raise RuntimeError("process group survived generation teardown")
         torch.cuda.empty_cache()
+        if _FLUSH_HOST_CACHE:
+            torch._C._host_emptyCache()
 
 
 def _checkpoint_worker(rank, init_paths, connection):
