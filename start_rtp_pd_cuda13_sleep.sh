@@ -73,6 +73,18 @@ export LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:$BAZEL_BIN_DIR:$TOR
 export DETERMINISTIC_GEMM=1
 export ENABLE_STABLE_SCATTER_ADD=ON
 
+# 4c. Collective / allocator config under test (overridable).
+#   - NCCL_NVLS_ENABLE=1                 : keep NCCL NVLS (multicast) collectives on
+#     (the L3 multicast keeper already injects this; set here for explicitness).
+#   - TORCH_SYMM_MEM_DISABLE_MULTICAST=0 : keep torch symmetric memory (Mega MoE
+#     barrier) on the multicast fabric (normal functionality); the L3 multicast
+#     keeper preserves its handle across the process checkpoint.
+#   - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True : torch expandable VA segments.
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
+export TORCH_SYMM_MEM_DISABLE_MULTICAST="${TORCH_SYMM_MEM_DISABLE_MULTICAST:-0}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+echo "[start_pd] collective/alloc env: NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE TORCH_SYMM_MEM_DISABLE_MULTICAST=$TORCH_SYMM_MEM_DISABLE_MULTICAST PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+
 # 5. Common model / runtime config (shared by both roles)
 MODEL_DIR="${MODEL_DIR:?set MODEL_DIR to the DeepSeek-V4-Flash checkpoint}"
 SLEEP_MODE_LEVEL="${SLEEP_MODE_LEVEL:-1}"

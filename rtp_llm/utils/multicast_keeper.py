@@ -250,14 +250,27 @@ class MulticastKeeperRuntime:
             raise MulticastKeeperConfigError(
                 "world_size must be greater than or equal to local_world_size"
             )
-        # The production container exposes exactly the GPUs assigned to this
-        # instance, densely numbered in its CUDA device namespace. Keeper and
-        # backend ranks therefore share [0, local_world_size) unconditionally;
-        # no CUDA_VISIBLE_DEVICES or keeper-specific GPU override is needed.
-        self.gpus = tuple(range(local_world_size))
+        # GPU ordinals the CUDA-free holder adds to the multicast group. These
+        # live in the holder's own CUDA namespace -- i.e. the container's device
+        # set, NOT host ordinals: the container runtime (NVIDIA_VISIBLE_DEVICES)
+        # already renumbers the assigned host GPUs to a container-local set, and
+        # the holder is a child in the same container. Both production and this
+        # test then pin each rank with torch.cuda.set_device(local_rank)
+        # (setup_cuda_device_and_accl_env) under the process CUDA_VISIBLE_DEVICES,
+        # so the device rank r binds NVLS memory on is cuDeviceGet(r) == the
+        # holder-namespace ordinal CVD[r] (or r when CVD is unset). That is the
+        # ordinal the CVD-stripped holder must cuDeviceGet and the value the
+        # shim's FABRIC contract validates CVD against (mc_shim_unified.c
+        # validate_fabric_team_contract), so deriving from CVD keeps all three in
+        # the same namespace. A hardcoded range(local_world_size) only holds when
+        # CVD is unset/dense; a role pinned to a non-dense CVD subset (e.g. decode
+        # 4,5 / prefill 6,7 in one namespace) would then add the wrong devices and
+        # cuMulticastBindMem fails with CUDA error 101 'invalid device ordinal'.
+        self.gpus = self._resolve_gpu_ordinals(local_world_size)
         _LOGGER.info(
-            "multicast keeper using container-local GPU ordinals: %s",
+            "multicast keeper GPU ordinals (holder CUDA namespace): %s (CUDA_VISIBLE_DEVICES=%s)",
             ",".join(str(gpu) for gpu in self.gpus),
+            self._env.get("CUDA_VISIBLE_DEVICES", "<unset>"),
         )
 
         self.world_size = int(world_size)
@@ -365,6 +378,48 @@ class MulticastKeeperRuntime:
         self.socket_path = socket_path
         self.ready_path = directory / "holder.ready"
         self.log_path = directory / "holder.log"
+
+    def _resolve_gpu_ordinals(self, local_world_size: int) -> Tuple[int, ...]:
+        """CUDA device ordinals (holder/container namespace) the ranks bind on.
+
+        Not host ordinals: the container runtime renumbers assigned GPUs to a
+        container-local set and the holder shares that namespace. Each rank pins
+        via ``torch.cuda.set_device(local_rank)``, so the device rank ``r`` uses
+        is ``cuDeviceGet(r)`` under the process ``CUDA_VISIBLE_DEVICES`` ==
+        ``int(CVD[r])`` (or ``r`` when CVD is unset) in the CVD-stripped holder
+        namespace. That is exactly what the holder must ``cuDeviceGet`` and what
+        the shim FABRIC contract compares CVD against, so it is the correct
+        source of truth -- NVML/PCI indices are a different enumeration and are
+        intentionally not used. Non-integer CVD (e.g. MIG UUIDs, which the
+        integer-only shim contract cannot validate anyway) or a list shorter than
+        ``local_world_size`` fall back to the dense ``0..N-1`` range with a
+        warning.
+        """
+        visible = (self._env.get("CUDA_VISIBLE_DEVICES") or "").strip()
+        if not visible:
+            return tuple(range(local_world_size))
+        try:
+            ordinals = [
+                int(token) for token in visible.split(",") if token.strip() != ""
+            ]
+        except ValueError:
+            _LOGGER.warning(
+                "CUDA_VISIBLE_DEVICES=%r is not an integer ordinal list; falling "
+                "back to dense range(%d) for the multicast keeper",
+                visible,
+                local_world_size,
+            )
+            return tuple(range(local_world_size))
+        if len(ordinals) < local_world_size:
+            _LOGGER.warning(
+                "CUDA_VISIBLE_DEVICES=%r lists %d device(s) < local_world_size=%d; "
+                "falling back to dense range for the multicast keeper",
+                visible,
+                len(ordinals),
+                local_world_size,
+            )
+            return tuple(range(local_world_size))
+        return tuple(ordinals[:local_world_size])
 
     def _holder_command(self) -> Sequence[str]:
         if self.socket_path is None or self.ready_path is None:

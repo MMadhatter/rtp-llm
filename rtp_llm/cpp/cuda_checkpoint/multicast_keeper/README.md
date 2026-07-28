@@ -196,10 +196,17 @@ bazelisk test //rtp_llm/utils/test:multicast_keeper_runtime_test \
 6. Rebuild NCCL and symmetric-memory resources. The shim reimports the cached
    multicast object from the surviving holder.
 
-The production container exposes exactly the GPUs assigned to the instance.
-The supervisor therefore derives the creator list as the dense container-local
-CUDA ordinals `0..local_world_size-1`; no GPU-list environment variable is
-required.
+Each backend rank pins its device with `torch.cuda.set_device(local_rank)`, so
+the device rank `r` binds NVLS memory on is `cuDeviceGet(r)` under the rank's
+`CUDA_VISIBLE_DEVICES` — i.e. the CUDA default ordinal `CVD[r]` (or `r` when CVD
+is unset). The supervisor therefore derives the creator/holder GPU list from
+`CUDA_VISIBLE_DEVICES` (`MulticastKeeperRuntime._resolve_physical_gpus`): a
+production container that exposes its GPUs densely from 0 yields
+`0..local_world_size-1`, while a role pinned to a non-dense subset (e.g. decode
+`4,5` and prefill `6,7` sharing one box) yields that subset. This keeps the
+holder's multicast group on the same devices the ranks use; a hardcoded dense
+range would make `cuMulticastBindMem` fail with CUDA error 101 'invalid device
+ordinal' on the non-dense layout.
 
 ## Configuration
 
