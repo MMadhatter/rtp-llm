@@ -215,6 +215,55 @@ verify the deterministic device-memory pattern after restoration. Symbol
 presence or a successful `Restore` without a successful `Unlock` is not treated
 as checkpoint/restore support.
 
+## PyTorch pinned-host cache
+
+A GB300 failure was isolated from NVLS and the multicast keeper to PyTorch's
+pinned-host caching allocator. The observed sequence was:
+
+1. Level 3 checkpoint succeeded and released GPU memory.
+2. Wake failed in `cuCheckpointProcessRestore` with CUDA error 801
+   (`operation not supported`).
+3. A minimal PyTorch process reproduced the failure after `Tensor.item()`
+   created a D2H scalar staging allocation and returned the now-unused pinned
+   block to PyTorch's host cache.
+4. Flushing the host cache before checkpoint made the minimal
+   checkpoint/restore sequence pass.
+
+RTP-LLM therefore calls
+`at::getHostAllocator(at::kCUDA)->empty_cache()` beside the CUDA device
+allocator flush after requests and transfers have drained. It runs for every
+sleep level. A Level 3 flush failure stops the process checkpoint; Level 1/2
+log the failure and continue because they do not use the process checkpoint
+API.
+
+The flush releases only unoccupied cached pinned blocks. It intentionally does
+not release ordinary pageable CPU tensors or pinned tensors that still have
+live owners. Do not require the host allocator's active allocation counters to
+reach zero. NVIDIA documents that host memory allocated by `cudaMallocHost`
+and similar APIs remains valid while CUDA is checkpointed, and PyTorch defines
+its host-cache flush as releasing unoccupied cached memory:
+
+- <https://developer.nvidia.com/blog/checkpointing-cuda-applications-with-criu/>
+- <https://docs.pytorch.org/docs/stable/generated/torch.accelerator.memory.empty_host_cache.html>
+
+Keep `pinned_reserve_segment_size_mb` at its default value of zero for Level 3
+until that non-reclaimable allocator mode has been validated separately.
+RTP-LLM does not set it. Known subsystem-owned resources still follow their
+normal lifecycle: outstanding asynchronous copies must be drained, registered
+MRs must be deregistered, and disposable KV host backing must be released
+before checkpoint.
+
+A successful flush produces one line per rank:
+
+```text
+sleep level-3 CUDA pinned-host cache flush: active_bytes=...->... allocated_bytes=...->... active_requests=...->... allocations=...->...
+```
+
+Non-zero active counters are expected when the engine intentionally retains
+live pinned tensors. To reproduce the old cached-block path in the manual
+checkpoint integration test, set
+`RTP_LLM_CHECKPOINT_TEST_FLUSH_HOST_CACHE=0`; the default is `1`.
+
 ## Level 3 failure diagnostics
 
 The test environment does not need a working checkpoint Driver API to produce a
@@ -244,6 +293,11 @@ Interpret the last completed line as follows:
 - `Multicast keeper health probe failed` includes holder identity, topology,
   PID/socket information, and the holder log tail captured before private state
   cleanup.
+- `CUDA pinned-host cache flush` confirms the PyTorch host-cache cleanup ran.
+  If restore still fails with 801 after this line, do not infer that every live
+  host tensor must be destroyed. First verify the complete native
+  Lock/Checkpoint/Restore/Unlock lifecycle on that exact driver and platform,
+  then inspect the multicast keeper and other CUDA object types.
 
 For a Driver compatibility issue, retain the native probe output together with
 `nvidia-smi -q`, `uname -a`, the wheel filename, and the filtered Level 3 logs.
