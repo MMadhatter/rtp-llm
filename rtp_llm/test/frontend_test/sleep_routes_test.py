@@ -84,6 +84,7 @@ class _FakeCheckpointController:
         self.events = []
         self.checkpoint_calls = []
         self.restore_calls = []
+        self.restore_holder_calls = []
         self.checkpoint_side_effect = None
         self.restore_side_effect = None
 
@@ -121,6 +122,7 @@ class _FakeCheckpointController:
     ):
         self.events.append(("restore_all", tuple(control_addresses)))
         self.restore_calls.append(tuple(control_addresses))
+        self.restore_holder_calls.append(holder_instance)
         if self.restore_side_effect is not None:
             self.restore_side_effect()
         existed = self.manifest is not None
@@ -2823,6 +2825,74 @@ class GrpcClientWrapperSleepTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertLess(restore_index, first_status_index)
         self.assertEqual(len(controller.restore_calls), 1)
+
+    async def test_level3_wake_on_another_frontend_uses_shared_instance_identity(self):
+        store = _FakeStore()
+        controller = _FakeCheckpointController()
+        addresses = ["127.0.0.1:10001", "127.0.0.1:10009"]
+        writer, pb2 = self._build_wrapper(
+            control_addresses=addresses,
+            lifecycle_store=store,
+            checkpoint_controller=controller,
+            single_node=True,
+        )
+        for rank, address in enumerate(addresses):
+            writer._dp_stubs[address].GetSleepStatus = AsyncMock(
+                return_value=self._status_pb(
+                    pb2,
+                    world_rank=rank,
+                    role="PREFILL",
+                    instance_generation_uuid=f"generation-shared-{rank}",
+                    process_id=2001 + rank,
+                    process_starttime=3001 + rank,
+                )
+            )
+        await writer._resolve_instance_identity()
+        # holder_instance is published by the backend only after Level3 prepare
+        # pins the keeper, so update the already-existing shared identity record.
+        writer._instance_holder = "holder-shared"
+        writer._persist_shared_instance_identity()
+
+        reader, reader_pb2 = self._build_wrapper(
+            control_addresses=addresses,
+            lifecycle_store=store,
+            checkpoint_controller=controller,
+            single_node=True,
+        )
+        events = []
+        rank_statuses = self._configure_level3_backend(reader, reader_pb2, events)
+        for status in rank_statuses.values():
+            status.update(
+                state="SLEEPING",
+                sleep_epoch=1,
+                kv_memory_state="PAUSED",
+                device_kv_cache_valid=False,
+                gpu_resource_state="RELEASED",
+            )
+        original_restore = controller.restore_all
+
+        def restore(*args, **kwargs):
+            events.append(("restore_all",))
+            return original_restore(*args, **kwargs)
+
+        controller.restore_all = restore
+        controller.manifest = {"state": "CHECKPOINTED", "pids": [2001, 2002]}
+
+        result = await reader.wake_up_serving()
+
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(reader._instance_role, "PREFILL")
+        self.assertEqual(reader._instance_generation, "generation-shared-0")
+        self.assertEqual(
+            reader._manifest_namespace(), "PREFILL/generation-shared-0"
+        )
+        self.assertEqual(reader._instance_holder, "holder-shared")
+        self.assertEqual(controller.restore_holder_calls, ["holder-shared"])
+        restore_index = events.index(("restore_all",))
+        first_status_index = next(
+            i for i, event in enumerate(events) if event[0] == "backend_status"
+        )
+        self.assertLess(restore_index, first_status_index)
 
     async def test_level3_restore_failure_never_calls_backend(self):
         controller = _FakeCheckpointController()

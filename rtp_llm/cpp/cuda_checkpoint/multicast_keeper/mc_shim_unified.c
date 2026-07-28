@@ -24,6 +24,7 @@
 
 typedef int                CUresult;
 typedef unsigned long long CUmemGenericAllocationHandle;
+typedef unsigned long long CUdeviceptr;
 typedef int                CUdevice;
 typedef void*              CUcontext;
 
@@ -45,6 +46,14 @@ typedef CUresult (*import_fn)(CUmemGenericAllocationHandle*, void*, int);
 typedef CUresult (*export_fn)(void*, CUmemGenericAllocationHandle, int, unsigned long long);
 typedef CUresult (*mccreate_fn)(CUmemGenericAllocationHandle*, const CUmulticastObjectProp*);
 typedef CUresult (*mcadd_fn)(CUmemGenericAllocationHandle, CUdevice);
+typedef CUresult (*mcbind_fn)(CUmemGenericAllocationHandle,
+                             size_t,
+                             CUmemGenericAllocationHandle,
+                             size_t,
+                             size_t,
+                             unsigned long long);
+typedef CUresult (*mcunbind_fn)(CUmemGenericAllocationHandle, CUdevice, size_t, size_t);
+typedef CUresult (*memmap_fn)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
 typedef CUresult (*memrelease_fn)(CUmemGenericAllocationHandle);
 typedef CUresult (*init_fn)(unsigned int);
 typedef CUresult (*device_get_count_fn)(int*);
@@ -60,6 +69,9 @@ static import_fn          real_import     = NULL;
 static export_fn          real_export     = NULL;
 static mccreate_fn        real_mccreate   = NULL;
 static mcadd_fn           real_mcadd      = NULL;
+static mcbind_fn          real_mcbind     = NULL;
+static mcunbind_fn        real_mcunbind   = NULL;
+static memmap_fn          real_memmap     = NULL;
 static memrelease_fn      real_memrelease = NULL;
 static void*              g_libcuda       = NULL;
 static int                g_cuda_version  = 0;
@@ -76,6 +88,7 @@ typedef struct keeper_handle {
 
 typedef struct raw_fabric_import {
     CUmemGenericAllocationHandle handle;
+    CUmemGenericAllocationHandle keeper_handle;
     unsigned char                fabric[RTP_MC_FABRIC_HANDLE_BYTES];
     int                          keeper_registered;
 } raw_fabric_import;
@@ -691,25 +704,45 @@ static int remember_raw_fabric_import(CUmemGenericAllocationHandle handle, const
     return 0;
 }
 
-static int mark_raw_fabric_registered(CUmemGenericAllocationHandle handle) {
+static int mark_raw_fabric_registered(CUmemGenericAllocationHandle handle,
+                                      CUmemGenericAllocationHandle keeper_handle) {
     pthread_mutex_lock(&g_lock);
     int index = find_raw_fabric_import_locked(handle);
     if (index >= 0) {
         g_raw_fabric_imports[index].keeper_registered = 1;
+        g_raw_fabric_imports[index].keeper_handle     = keeper_handle;
     }
     pthread_mutex_unlock(&g_lock);
     return index >= 0 ? 0 : -1;
 }
 
-static int get_raw_fabric_import(CUmemGenericAllocationHandle handle, unsigned char* fabric, int* keeper_registered) {
+static int get_raw_fabric_import(CUmemGenericAllocationHandle  handle,
+                                 unsigned char*                 fabric,
+                                 int*                           keeper_registered,
+                                 CUmemGenericAllocationHandle* keeper_handle) {
     pthread_mutex_lock(&g_lock);
     int index = find_raw_fabric_import_locked(handle);
     if (index >= 0) {
         memcpy(fabric, g_raw_fabric_imports[index].fabric, RTP_MC_FABRIC_HANDLE_BYTES);
         *keeper_registered = g_raw_fabric_imports[index].keeper_registered;
+        if (keeper_handle != NULL) {
+            *keeper_handle = g_raw_fabric_imports[index].keeper_handle;
+        }
     }
     pthread_mutex_unlock(&g_lock);
     return index >= 0 ? 0 : -1;
+}
+
+static CUmemGenericAllocationHandle translated_raw_fabric_handle(CUmemGenericAllocationHandle handle) {
+    CUmemGenericAllocationHandle translated = handle;
+    pthread_mutex_lock(&g_lock);
+    int index = find_raw_fabric_import_locked(handle);
+    if (index >= 0 && g_raw_fabric_imports[index].keeper_registered
+        && g_raw_fabric_imports[index].keeper_handle != 0) {
+        translated = g_raw_fabric_imports[index].keeper_handle;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return translated;
 }
 
 static void discard_raw_fabric_import_locked(CUmemGenericAllocationHandle handle) {
@@ -953,15 +986,17 @@ static int device_is_visible(CUdevice device) {
 }
 
 static CUresult hook_mcadd(CUmemGenericAllocationHandle handle, CUdevice device) {
-    unsigned char raw_fabric[RTP_MC_FABRIC_HANDLE_BYTES];
-    int           raw_registered = 0;
-    int           raw_import     = keeper_enabled() && get_raw_fabric_import(handle, raw_fabric, &raw_registered) == 0;
+    unsigned char                raw_fabric[RTP_MC_FABRIC_HANDLE_BYTES];
+    int                          raw_registered = 0;
+    CUmemGenericAllocationHandle local_handle   = 0;
+    int raw_import = keeper_enabled()
+                     && get_raw_fabric_import(handle, raw_fabric, &raw_registered, &local_handle) == 0;
     if (raw_import) {
         if (!device_is_visible(device)) {
             log_message(1, "refusing non-visible multicast device=%d", device);
             return CUDA_ERROR_INVALID_VALUE;
         }
-        if (raw_registered) {
+        if (raw_registered && local_handle != 0) {
             return CUDA_SUCCESS;
         }
 
@@ -1003,19 +1038,24 @@ static CUresult hook_mcadd(CUmemGenericAllocationHandle handle, CUdevice device)
             // last ref here would make a retry attempt AddDevice a second time.
             return CUDA_ERROR_INVALID_VALUE;
         }
-        if (real_memrelease == NULL) {
-            real_memrelease = (memrelease_fn)driver_symbol("cuMemRelease");
-        }
-        if (real_memrelease == NULL) {
-            return CUDA_ERROR_INVALID_VALUE;
-        }
-        CUresult release_result = real_memrelease(temporary);
-        if (release_result != CUDA_SUCCESS || mark_raw_fabric_registered(handle) != 0) {
+        // Keep the holder-returned node-local POSIX import alive. PyTorch stores
+        // the original raw FABRIC handle, so BindMem/Map/Unbind below translate
+        // that stable public value to this local handle. Releasing it here and
+        // continuing on the raw handle makes cuMulticastBindMem hang on MNNVL
+        // systems after the holder has performed the node-local AddDevice.
+        if (mark_raw_fabric_registered(handle, temporary) != 0) {
+            if (real_memrelease == NULL) {
+                real_memrelease = (memrelease_fn)driver_symbol("cuMemRelease");
+            }
+            if (real_memrelease != NULL) {
+                (void)real_memrelease(temporary);
+            }
             return CUDA_ERROR_INVALID_VALUE;
         }
         log_message(0,
-                    "promoted raw FABRIC multicast handle=0x%llx object=%llu",
+                    "promoted raw FABRIC multicast handle=0x%llx local_handle=0x%llx object=%llu",
                     (unsigned long long)handle,
+                    (unsigned long long)temporary,
                     (unsigned long long)resolved_token.object_id);
         return CUDA_SUCCESS;
     }
@@ -1036,6 +1076,65 @@ static CUresult hook_mcadd(CUmemGenericAllocationHandle handle, CUdevice device)
         real_mcadd = (mcadd_fn)driver_symbol("cuMulticastAddDevice");
     }
     return real_mcadd == NULL ? CUDA_ERROR_INVALID_VALUE : real_mcadd(handle, device);
+}
+
+static CUresult hook_mcbind(CUmemGenericAllocationHandle multicast_handle,
+                            size_t                       multicast_offset,
+                            CUmemGenericAllocationHandle memory_handle,
+                            size_t                       memory_offset,
+                            size_t                       size,
+                            unsigned long long           flags) {
+    if (real_mcbind == NULL) {
+        real_mcbind = (mcbind_fn)driver_symbol("cuMulticastBindMem");
+    }
+    if (real_mcbind == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUmemGenericAllocationHandle translated = translated_raw_fabric_handle(multicast_handle);
+    if (translated != multicast_handle) {
+        log_message(0,
+                    "cuMulticastBindMem translated raw=0x%llx local=0x%llx size=%zu",
+                    (unsigned long long)multicast_handle,
+                    (unsigned long long)translated,
+                    size);
+    }
+    return real_mcbind(translated, multicast_offset, memory_handle, memory_offset, size, flags);
+}
+
+static CUresult hook_mcunbind(CUmemGenericAllocationHandle multicast_handle,
+                              CUdevice                     device,
+                              size_t                       multicast_offset,
+                              size_t                       size) {
+    if (real_mcunbind == NULL) {
+        real_mcunbind = (mcunbind_fn)driver_symbol("cuMulticastUnbind");
+    }
+    if (real_mcunbind == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUmemGenericAllocationHandle translated = translated_raw_fabric_handle(multicast_handle);
+    return real_mcunbind(translated, device, multicast_offset, size);
+}
+
+static CUresult hook_memmap(CUdeviceptr                  ptr,
+                            size_t                       size,
+                            size_t                       offset,
+                            CUmemGenericAllocationHandle handle,
+                            unsigned long long           flags) {
+    if (real_memmap == NULL) {
+        real_memmap = (memmap_fn)driver_symbol("cuMemMap");
+    }
+    if (real_memmap == NULL) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUmemGenericAllocationHandle translated = translated_raw_fabric_handle(handle);
+    if (translated != handle) {
+        log_message(0,
+                    "cuMemMap translated raw=0x%llx local=0x%llx size=%zu",
+                    (unsigned long long)handle,
+                    (unsigned long long)translated,
+                    size);
+    }
+    return real_memmap(ptr, size, offset, translated, flags);
 }
 
 static CUresult
@@ -1178,7 +1277,20 @@ static CUresult hook_memrelease(CUmemGenericAllocationHandle handle) {
     if (real_memrelease == NULL) {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    CUmemGenericAllocationHandle translated = translated_raw_fabric_handle(handle);
+    CUresult translated_result              = CUDA_SUCCESS;
+    if (translated != handle) {
+        translated_result = real_memrelease(translated);
+    }
     CUresult result = real_memrelease(handle);
+    if (translated_result != CUDA_SUCCESS) {
+        log_message(1,
+                    "cuMemRelease local multicast handle failed raw=0x%llx local=0x%llx result=%d",
+                    (unsigned long long)handle,
+                    (unsigned long long)translated,
+                    translated_result);
+        result = translated_result;
+    }
     if (result == CUDA_SUCCESS) {
         pthread_mutex_lock(&g_lock);
         int index = g_handle_count == 0 ? -1 : find_keeper_handle(handle);
@@ -1300,6 +1412,27 @@ static void* swap_symbol(const char* symbol, void* resolved) {
         log_message(0, "hooked %s resolved=%p", symbol, resolved);
         return (void*)hook_mcadd;
     }
+    if (strcmp(symbol, "cuMulticastBindMem") == 0) {
+        if (resolved != (void*)hook_mcbind) {
+            real_mcbind = (mcbind_fn)resolved;
+        }
+        log_message(0, "hooked %s resolved=%p", symbol, resolved);
+        return (void*)hook_mcbind;
+    }
+    if (strcmp(symbol, "cuMulticastUnbind") == 0) {
+        if (resolved != (void*)hook_mcunbind) {
+            real_mcunbind = (mcunbind_fn)resolved;
+        }
+        log_message(0, "hooked %s resolved=%p", symbol, resolved);
+        return (void*)hook_mcunbind;
+    }
+    if (strcmp(symbol, "cuMemMap") == 0) {
+        if (resolved != (void*)hook_memmap) {
+            real_memmap = (memmap_fn)resolved;
+        }
+        log_message(0, "hooked %s resolved=%p", symbol, resolved);
+        return (void*)hook_memmap;
+    }
     if (strcmp(symbol, "cuMemRelease") == 0) {
         if (resolved != (void*)hook_memrelease) {
             real_memrelease = (memrelease_fn)resolved;
@@ -1317,6 +1450,30 @@ CUresult cuMulticastCreate(CUmemGenericAllocationHandle* handle, const CUmultica
 
 CUresult cuMulticastAddDevice(CUmemGenericAllocationHandle handle, CUdevice device) {
     return hook_mcadd(handle, device);
+}
+
+CUresult cuMulticastBindMem(CUmemGenericAllocationHandle multicast_handle,
+                            size_t                       multicast_offset,
+                            CUmemGenericAllocationHandle memory_handle,
+                            size_t                       memory_offset,
+                            size_t                       size,
+                            unsigned long long           flags) {
+    return hook_mcbind(multicast_handle, multicast_offset, memory_handle, memory_offset, size, flags);
+}
+
+CUresult cuMulticastUnbind(CUmemGenericAllocationHandle multicast_handle,
+                           CUdevice                     device,
+                           size_t                       multicast_offset,
+                           size_t                       size) {
+    return hook_mcunbind(multicast_handle, device, multicast_offset, size);
+}
+
+CUresult cuMemMap(CUdeviceptr                  ptr,
+                  size_t                       size,
+                  size_t                       offset,
+                  CUmemGenericAllocationHandle handle,
+                  unsigned long long           flags) {
+    return hook_memmap(ptr, size, offset, handle, flags);
 }
 
 CUresult cuMemExportToShareableHandle(void*                        shareable_handle,

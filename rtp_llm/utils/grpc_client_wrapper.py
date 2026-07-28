@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib
 import json
 import logging
@@ -478,6 +479,7 @@ class GrpcClientWrapper:
 
     LIFECYCLE_LEASE_KEY = "rtp_llm_instance_lifecycle_lease"
     LIFECYCLE_RECOVERY_KEY = "rtp_llm_instance_lifecycle_recovery"
+    INSTANCE_IDENTITY_KEY = "rtp_llm_instance_identity"
     DISTRIBUTED_CHECKPOINT_KEY = "rtp_llm_distributed_checkpoint_manifest"
     COMMIT_MAX_ATTEMPTS = 3
     LIFECYCLE_STATUS_MAX_ATTEMPTS = 3
@@ -564,6 +566,11 @@ class GrpcClientWrapper:
         # shared TCPStore cannot collide across PD roles or instance generations.
         self._instance_role: Optional[str] = None
         self._instance_generation: Optional[str] = None
+        # The holder identity is backend-reported, but a Level3 wake may land
+        # on a different frontend worker after every backend rank is frozen.
+        # Keep it in the same shared identity record as role/generation so that
+        # worker can still pass the durable holder fence to restore_all().
+        self._instance_holder: Optional[str] = None
 
     def _uses_distributed_checkpoint(self) -> bool:
         if not self._level3_enabled:
@@ -870,6 +877,11 @@ class GrpcClientWrapper:
     def _distributed_checkpoint_key(self) -> str:
         return f"{self.DISTRIBUTED_CHECKPOINT_KEY}{self._key_namespace_suffix()}"
 
+    def _instance_identity_key(self) -> str:
+        addresses = "|".join(sorted(self.control_addresses))
+        digest = hashlib.sha256(addresses.encode("utf-8")).hexdigest()[:20]
+        return f"{self.INSTANCE_IDENTITY_KEY}/{digest}"
+
     @staticmethod
     def _distributed_manifest_target_states(manifest: Dict[str, Any]) -> str:
         targets = sorted(
@@ -928,7 +940,7 @@ class GrpcClientWrapper:
         }
         if len(holders) == 1:
             return holders.pop()
-        return None
+        return self._instance_holder
 
     def _keeper_team(self) -> Optional[str]:
         if self._instance_role is None and self._instance_generation is None:
@@ -964,15 +976,96 @@ class GrpcClientWrapper:
             self._instance_role = role
         if generation is not None:
             self._instance_generation = str(generation)
+        holders = {
+            str(status.get("holder_instance"))
+            for status in statuses
+            if status.get("holder_instance")
+        }
+        if len(holders) == 1:
+            self._instance_holder = holders.pop()
         return ""
 
-    async def _resolve_instance_identity(self) -> None:
-        """Best-effort: populate instance identity from backend sleep status.
+    def _load_shared_instance_identity(self) -> bool:
+        store = self._get_lifecycle_store()
+        if store is None:
+            return False
+        try:
+            record = self._decode_store_value(
+                store.compare_set(self._instance_identity_key(), "", "")
+            )
+            if not record:
+                return False
+            payload = json.loads(record)
+            if not isinstance(payload, dict):
+                raise ValueError("identity record is not an object")
+            expected_addresses = sorted(self.control_addresses)
+            if payload.get("control_addresses") != expected_addresses:
+                raise ValueError("identity record control addresses do not match")
+            role = str(payload.get("role", "") or "")
+            generation = str(payload.get("generation", "") or "")
+            if not role or not generation:
+                raise ValueError("identity record is incomplete")
+            self._instance_role = role
+            self._instance_generation = generation
+            holder = str(payload.get("holder_instance", "") or "")
+            self._instance_holder = holder or None
+            logging.info(
+                "loaded shared backend identity: role=%s generation=%s holder=%s",
+                role,
+                generation,
+                holder or "unset",
+            )
+            return True
+        except Exception as e:
+            logging.warning("failed to load shared backend instance identity: %s", e)
+            return False
 
-        Failures are non-fatal (the backend may be checkpointed on wake); the
-        identity resolved during sleep persists on this instance for later wake.
+    def _persist_shared_instance_identity(self) -> None:
+        if not self._instance_role or not self._instance_generation:
+            return
+        store = self._get_lifecycle_store()
+        if store is None:
+            return
+        key = self._instance_identity_key()
+        desired = json.dumps(
+            {
+                "control_addresses": sorted(self.control_addresses),
+                "role": self._instance_role,
+                "generation": self._instance_generation,
+                "holder_instance": self._instance_holder or "",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        try:
+            current = self._decode_store_value(store.compare_set(key, "", desired))
+            if current == desired:
+                return
+            observed = self._decode_store_value(
+                store.compare_set(key, current, desired)
+            )
+            if observed != desired:
+                raise RuntimeError("identity record changed concurrently")
+            logging.info(
+                "persisted shared backend identity: role=%s generation=%s holder=%s",
+                self._instance_role,
+                self._instance_generation,
+                self._instance_holder or "unset",
+            )
+        except Exception as e:
+            logging.warning("failed to persist shared backend instance identity: %s", e)
+
+    async def _resolve_instance_identity(self) -> None:
+        """Populate instance identity from shared state or live backend status.
+
+        Every frontend worker must use the same generation-scoped manifest. The
+        worker that drives sleep publishes the backend identity to TCPStore so a
+        different worker can still resolve it after CUDA checkpoint has frozen
+        all backend ranks.
         """
         if self._instance_generation or self._instance_role:
+            return
+        if self._load_shared_instance_identity():
             return
         try:
             statuses = await self._raw_sleep_statuses()
@@ -985,6 +1078,8 @@ class GrpcClientWrapper:
             error = self._apply_instance_identity(statuses)
         if error:
             logging.warning("backend instance identity is inconsistent: %s", error)
+        else:
+            self._persist_shared_instance_identity()
 
     def _get_lifecycle_store(self) -> Optional[Any]:
         if self._lifecycle_store is None and self._lifecycle_store_factory is not None:
@@ -2529,6 +2624,15 @@ class GrpcClientWrapper:
         self._terminal_sleep_status = self._aggregate_sleep_status(
             self._terminal_sleep_statuses
         )
+        # The engine publishes holder_instance only after the Level3 prepare
+        # phase pins the keeper. Refresh the shared record here; the earlier
+        # identity probe normally sees an empty holder while ranks are RUNNING.
+        holder_instance = self._keeper_holder_instance(
+            self._terminal_sleep_statuses
+        )
+        if holder_instance:
+            self._instance_holder = holder_instance
+            self._persist_shared_instance_identity()
         logging.info(
             "level3 backend sleep barrier reached: statuses=%s",
             [
@@ -2691,9 +2795,14 @@ class GrpcClientWrapper:
                     "error": precondition_error,
                     "grpc_status": "FAILED_PRECONDITION",
                 }
-            if self._uses_distributed_checkpoint():
-                await self._resolve_instance_identity()
             checkpoint_status = await self._checkpoint_status_if_any()
+            if checkpoint_status is None:
+                # First honor an already-known/unscoped durable state without
+                # touching backend ranks: they may already be checkpointed.
+                # Only resolve identity when no current manifest/recovery state
+                # is visible; the shared record is tried before any backend RPC.
+                await self._resolve_instance_identity()
+                checkpoint_status = await self._checkpoint_status_if_any()
             if checkpoint_status is not None:
                 if checkpoint_status.get("state") == "CHECKPOINTED":
                     return {"status": "ok"}
@@ -2978,8 +3087,11 @@ class GrpcClientWrapper:
                 "supported_modes": [],
             }
         async with self._lifecycle_lock:
-            if self._uses_distributed_checkpoint():
-                await self._resolve_instance_identity()
+            if self._level3_enabled:
+                # Do not probe a backend that may already be CUDA-checkpointed.
+                # Another frontend publishes the identity before checkpoint, so
+                # the shared record is the authoritative wake-time lookup.
+                self._load_shared_instance_identity()
             lease_record, lease_error = self._acquire_lifecycle_lease("wake_up")
             if lease_error:
                 result = lease_error
@@ -3163,11 +3275,15 @@ class GrpcClientWrapper:
         """Get aggregate sleep lifecycle status from every control rank."""
         try:
             self._refresh_control_addresses_if_needed()
-            if self._uses_distributed_checkpoint():
-                await self._resolve_instance_identity()
             checkpoint_status = (
                 await self._checkpoint_status_if_any() if self._level3_enabled else None
             )
+            if self._level3_enabled and checkpoint_status is None:
+                # A frozen backend must never be probed merely to resolve key
+                # namespacing. Honor any visible durable state first, then load
+                # shared identity (which itself precedes backend probing).
+                await self._resolve_instance_identity()
+                checkpoint_status = await self._checkpoint_status_if_any()
             if checkpoint_status is not None:
                 return checkpoint_status
             request = pb2.EmptyPB()
