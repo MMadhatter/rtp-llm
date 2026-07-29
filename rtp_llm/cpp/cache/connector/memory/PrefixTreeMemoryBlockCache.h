@@ -90,6 +90,7 @@ public:
     std::vector<CacheKeyType> cacheKeys() const;
     std::vector<CacheKeyType> cacheKeysUnorderedForStatus() const;
     size_t size() const;
+    void clear();
 
 private:
     struct RetiredItem {

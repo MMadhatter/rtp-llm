@@ -352,6 +352,26 @@ class V4Transformer(nn.Module):
                 if ic is not None:
                     ic.set_cp_ctx(cp_ctx)
 
+    def release_runtime_host_caches(self) -> tuple[int, int]:
+        """Drop request-scoped Context-Parallel metadata before checkpoint.
+
+        The next prefill binds fresh CP metadata before entering the layer
+        loop, so wake does not need to reconstruct this state eagerly.
+
+        Returns:
+            ``(had_cp_info, had_cp_context)`` for lifecycle diagnostics.
+        """
+        had_cp_info = int(getattr(self, "_cp_info", None) is not None)
+        had_cp_context = int(
+            any(
+                getattr(getattr(layer, "attn", None), "_cp_ctx", None) is not None
+                for layer in getattr(self, "layers", ())
+            )
+        )
+        self.set_cp_info(None, 1, 0)
+        self._propagate_cp_ctx(None)
+        return had_cp_info, had_cp_context
+
     def _hc_head_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """Reduce the hc axis for ``[B, S, hc, d]`` or flat ``[T, hc, d]``."""
         return self.head_hc.head(x)

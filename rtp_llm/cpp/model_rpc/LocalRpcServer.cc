@@ -649,6 +649,14 @@ void LocalRpcServer::installSleepHooks() {
             const auto status = flushAndVerifyCudaPinnedHostMemory(&before, &after);
             if (!status.ok()) {
                 (void)cudaGetLastError();
+                try {
+                    py::gil_scoped_acquire acquire;
+                    py::module_::import("rtp_llm.utils.sleep_gpu_reclaim")
+                        .attr("log_live_pinned_host_tensors")();
+                } catch (const std::exception& e) {
+                    RTP_LLM_LOG_WARNING(
+                        "[PinnedHost][python-live] diagnostic failed (ignored): %s", e.what());
+                }
                 RTP_LLM_LOG_ERROR(
                     "[PinnedHost][checkpoint-gate] FAIL level=3 local_rank=%d "
                     "owners_suspended=1 torch_backing_empty=0 backing_allocations=%lld "

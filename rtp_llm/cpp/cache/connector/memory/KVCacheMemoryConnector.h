@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -72,10 +73,9 @@ public:
     std::vector<CacheKeyType> cacheKeys() const;
     std::vector<CacheKeyType> cacheKeysForStatus() const;
 
-    // Sleep/wake_up: discard the pinned host memory-cache buffer on sleep and
-    // reallocate it on wake. Drops the cache-key->block LRU (block_cache_) since it
-    // indexes into the freed buffer. Runs under malloc_mutex_. No-op-safe if the
-    // block pool was never created.
+    // Sleep/wake_up: discard every pinned host memory-cache pool on sleep and
+    // reallocate them on wake. Drops cache indexes because they point into the
+    // released pools. Runs under malloc_mutex_; no-op-safe when no pool exists.
     bool releaseMemoryCacheBacking();
     bool restoreMemoryCacheBacking();
 
@@ -88,6 +88,9 @@ public:
     PinnedHostMemoryStats pinnedHostMemoryStats() const;
 
 private:
+    static constexpr size_t kMemoryPoolCount = 5;
+    using MemoryPools = std::array<std::shared_ptr<BlockPool>, kMemoryPoolCount>;
+
     struct LayerRegionSlot {
         int               layer_id{-1};
         KVCacheRegionName region_name{KVCacheRegionName::DEFAULT};
@@ -263,6 +266,7 @@ private:
 
     void                       initBlockPool();
     void                       initDiskBlockPools();
+    MemoryPools                memoryPools() const;
     bool                       diskCacheEnabled() const;
     int64_t                    copyPlanTimeoutMs(const std::shared_ptr<CopyPlan>& copy_plan) const;
     std::shared_ptr<BlockPool> createBlockPool(size_t block_size, size_t pool_size_mb) const;

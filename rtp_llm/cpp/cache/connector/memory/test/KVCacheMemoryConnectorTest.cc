@@ -3426,6 +3426,30 @@ TEST_F(KVCacheMemoryConnectorDualPoolTest, Init_CreatesDualPools) {
     EXPECT_GT(conn->complete_block_size_, conn->incomplete_block_size_);
 }
 
+TEST_F(KVCacheMemoryConnectorDualPoolTest, SleepReleaseRestoreCoversBothHostPools) {
+    auto cfg   = createHybridCacheConfig();
+    allocator_ = std::make_shared<HybridTypeKVCacheAllocator>(cfg, AllocationType::DEVICE);
+    ASSERT_TRUE(allocator_->init());
+    auto conn = createConnector(cfg);
+
+    ASSERT_TRUE(conn->isDualPool());
+    ASSERT_NE(conn->complete_pool_, nullptr);
+    ASSERT_NE(conn->incomplete_pool_, nullptr);
+    ASSERT_NE(conn->complete_pool_->getBaseAddress(), nullptr);
+    ASSERT_NE(conn->incomplete_pool_->getBaseAddress(), nullptr);
+
+    ASSERT_TRUE(conn->releaseMemoryCacheBacking());
+    EXPECT_EQ(conn->complete_pool_->getBaseAddress(), nullptr);
+    EXPECT_EQ(conn->incomplete_pool_->getBaseAddress(), nullptr);
+    EXPECT_TRUE(conn->cacheKeys().empty());
+
+    ASSERT_TRUE(conn->restoreMemoryCacheBacking());
+    EXPECT_NE(conn->complete_pool_->getBaseAddress(), nullptr);
+    EXPECT_NE(conn->incomplete_pool_->getBaseAddress(), nullptr);
+    EXPECT_EQ(conn->complete_pool_->freeBlocksNum(), conn->complete_pool_->totalBlocksNum());
+    EXPECT_EQ(conn->incomplete_pool_->freeBlocksNum(), conn->incomplete_pool_->totalBlocksNum());
+}
+
 TEST_F(KVCacheMemoryConnectorDualPoolTest, Init_PureFullUsesSinglePool) {
     // Pure FULL config: no typed slots, should use single pool
     CacheConfig config;

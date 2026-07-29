@@ -288,6 +288,34 @@ def _args_from_model_config(
 class DeepSeekV4Model(GptModelBase):
     """Framework-facing model: owns a V4Transformer, feeds framework IO into it."""
 
+    def release_runtime_host_caches(self) -> None:
+        """Drop request-scoped CP metadata retained by the persistent model.
+
+        ``forward_prefill`` binds the current ``PyContextParallelParams`` to
+        the transformer and propagates a derived ``CPContext`` to its runtime
+        modules. Those objects deliberately outlive the forward, so clearing
+        only ``PyWrappedModel::attention_inputs_`` leaves their pinned CPU
+        metadata alive.
+        """
+        params_entries = len(self.params_dict)
+        super().release_runtime_host_caches()
+        v4 = getattr(self, "v4", None)
+        if v4 is None:
+            logging.info(
+                "[PinnedHost][owner] DeepSeekV4Model released "
+                "attention_params=%d cp_info=0 cp_context=0",
+                params_entries,
+            )
+            return
+        had_cp_info, had_cp_context = v4.release_runtime_host_caches()
+        logging.info(
+            "[PinnedHost][owner] DeepSeekV4Model released "
+            "attention_params=%d cp_info=%d cp_context=%d",
+            params_entries,
+            had_cp_info,
+            had_cp_context,
+        )
+
     def __init__(
         self,
         model_config: ModelConfig,

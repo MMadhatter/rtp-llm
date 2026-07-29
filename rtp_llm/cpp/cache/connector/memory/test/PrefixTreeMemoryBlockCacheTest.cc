@@ -52,6 +52,25 @@ PrefixTreeMemoryBlockCache::CacheItem diskItem(CacheKeyType         key,
 
 }  // namespace
 
+TEST(PrefixTreeMemoryBlockCacheTest, ClearDropsAllRuntimeState) {
+    PrefixTreeMemoryBlockCache cache;
+    ASSERT_TRUE(
+        cache.putCommitted(2, childDep(1, 1), item(2, CacheBlockKind::STATE_SWA_KV, 12)).first);
+    ASSERT_TRUE(
+        cache.putCommitted(1, rootDep(), item(1, CacheBlockKind::COMPRESSED_KV, 11)).first);
+    ASSERT_EQ(cache.size(), 2);
+
+    cache.clear();
+
+    EXPECT_EQ(cache.size(), 0);
+    EXPECT_TRUE(cache.cacheKeys().empty());
+    EXPECT_TRUE(cache.cacheKeysUnorderedForStatus().empty());
+    EXPECT_FALSE(cache.contains(1, CacheBlockKind::COMPRESSED_KV));
+    EXPECT_FALSE(cache.contains(2, CacheBlockKind::STATE_SWA_KV));
+    EXPECT_FALSE(cache.popOldestEvictable(CacheBlockKind::COMPRESSED_KV).has_value());
+    EXPECT_FALSE(cache.popOldestEvictable(CacheBlockKind::STATE_SWA_KV).has_value());
+}
+
 TEST(PrefixTreeMemoryBlockCacheTest, ContainsAndMatchAreKindAware) {
     PrefixTreeMemoryBlockCache cache;
     ASSERT_TRUE(cache.putCommitted(1, rootDep(), item(1, CacheBlockKind::COMPRESSED_KV, 11)).first);

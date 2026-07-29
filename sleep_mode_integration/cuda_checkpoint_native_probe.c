@@ -533,6 +533,7 @@ static int run_self_pinned_host_probe(
     int release_before_checkpoint,
     int use_pageable_host_memory) {
     size_t pinned_bytes = 64 * 1024 * 1024;
+    size_t transfer_bytes;
     const char* pinned_bytes_value = getenv("RTP_CKPT_PINNED_BYTES");
     CUdevice device = -1;
     CUcontext context = NULL;
@@ -552,16 +553,17 @@ static int run_self_pinned_host_probe(
         errno = 0;
         parsed = strtoull(pinned_bytes_value, &end, 10);
         if (errno != 0 || end == pinned_bytes_value || *end != '\0' ||
-            parsed > SIZE_MAX || parsed < sizeof(expected)) {
+            parsed > SIZE_MAX || parsed == 0) {
             fprintf(
                 stderr,
-                "RTP_CKPT_PINNED_BYTES must be an integer in [%zu, %zu]\n",
-                sizeof(expected),
+                "RTP_CKPT_PINNED_BYTES must be an integer in [1, %zu]\n",
                 (size_t)SIZE_MAX);
             return 2;
         }
         pinned_bytes = (size_t)parsed;
     }
+    transfer_bytes =
+        pinned_bytes < sizeof(expected) ? pinned_bytes : sizeof(expected);
 
     for (size_t index = 0; index < PATTERN_WORDS; ++index) {
         expected[index] = pattern_at(index);
@@ -576,7 +578,10 @@ static int run_self_pinned_host_probe(
             "pinned cuCtxSetCurrent", cuCtxSetCurrent(context)) ||
         !require_success(
             "pinned cuMemAlloc",
-            cuMemAlloc(&allocation, sizeof(expected)))) {
+            cuMemAlloc(&allocation, sizeof(expected))) ||
+        !require_success(
+            "pinned seed device data",
+            cuMemcpyHtoD(allocation, expected, sizeof(expected)))) {
         goto cleanup;
     }
     if (use_pageable_host_memory) {
@@ -591,7 +596,7 @@ static int run_self_pinned_host_probe(
                    cuMemHostAlloc(&pinned, pinned_bytes, 0))) {
         goto cleanup;
     }
-    memcpy(pinned, expected, sizeof(expected));
+    memcpy(pinned, expected, transfer_bytes);
 
     if (keep_stream_and_event) {
         if (!require_success(
@@ -605,7 +610,7 @@ static int run_self_pinned_host_probe(
                 cuMemcpyHtoDAsync(
                     allocation,
                     pinned,
-                    sizeof(expected),
+                    transfer_bytes,
                     stream)) ||
             !require_success(
                 "pinned cuEventRecord", cuEventRecord(event, stream)) ||
@@ -618,7 +623,7 @@ static int run_self_pinned_host_probe(
                    cuMemcpyHtoD(
                        allocation,
                        pinned,
-                       sizeof(expected))) ||
+                       transfer_bytes)) ||
                !require_success(
                    "pinned cuCtxSynchronize", cuCtxSynchronize())) {
         goto cleanup;

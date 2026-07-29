@@ -25,11 +25,132 @@ throw there would be mistaken for a hook failure and push the controller to ERRO
 import gc
 import logging
 import os
+import warnings
+from collections import Counter
 
 import torch
 
 _MiB = 1024.0 * 1024.0
 _GiB = 1024.0**3
+
+
+def _pinned_tensor_owner_hints(tensor: torch.Tensor, max_hints: int = 8) -> list[str]:
+    """Return bounded, string-only hints for Python owners of ``tensor``.
+
+    The diagnostic is used only after the Level-3 zero-allocation gate has
+    already failed.  Never retain a referrer object in the returned value:
+    doing so would make the diagnostic itself extend a pinned tensor's
+    lifetime.
+    """
+    hints: list[str] = []
+    try:
+        referrers = gc.get_referrers(tensor)
+    except Exception:
+        return hints
+    for referrer in referrers:
+        if len(hints) >= max_hints:
+            break
+        if isinstance(referrer, dict):
+            names = [
+                str(key)
+                for key, value in referrer.items()
+                if value is tensor and isinstance(key, (str, int))
+            ]
+            if names:
+                hints.append("dict_keys=" + ",".join(names[:4]))
+            continue
+        owner_type = type(referrer)
+        module = getattr(owner_type, "__module__", "")
+        name = getattr(owner_type, "__qualname__", owner_type.__name__)
+        hints.append(f"{module}.{name}" if module else name)
+    return hints
+
+
+def log_live_pinned_host_tensors(limit: int = 64) -> dict[str, int]:
+    """Log Python-visible live pinned CPU tensors after a failed L3 gate.
+
+    PyTorch's host allocator reports only aggregate backing-block counts.  This
+    scan attributes the Python-visible subset by storage, tensor shape, and
+    immediate owner hints. C++-only tensors are intentionally reported as the
+    difference between allocator backing counts and the unique storages logged
+    here by the C++ caller.
+    """
+    gc.collect()
+    unique: dict[int, dict[str, object]] = {}
+    scanned = 0
+    # Some torch.distributed compatibility objects emit a FutureWarning from
+    # their custom isinstance path. This failure-only diagnostic must not add
+    # unrelated warnings to the checkpoint log.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        for obj in gc.get_objects():
+            try:
+                if not isinstance(obj, torch.Tensor):
+                    continue
+                scanned += 1
+                if obj.device.type != "cpu" or not obj.is_pinned():
+                    continue
+                tensor_bytes = int(obj.numel()) * int(obj.element_size())
+                storage = obj.untyped_storage()
+                storage_ptr = int(storage.data_ptr())
+                storage_bytes = int(storage.nbytes())
+                hints = _pinned_tensor_owner_hints(obj)
+                entry = unique.get(storage_ptr)
+                if entry is None:
+                    unique[storage_ptr] = {
+                        "dtype": str(obj.dtype),
+                        "shape": tuple(int(dim) for dim in obj.shape),
+                        "tensor_bytes": tensor_bytes,
+                        "storage_bytes": storage_bytes,
+                        "hints": hints,
+                    }
+                    continue
+                entry_hints = entry["hints"]
+                assert isinstance(entry_hints, list)
+                for hint in hints:
+                    if hint not in entry_hints and len(entry_hints) < 8:
+                        entry_hints.append(hint)
+                if tensor_bytes > int(entry["tensor_bytes"]):
+                    entry["dtype"] = str(obj.dtype)
+                    entry["shape"] = tuple(int(dim) for dim in obj.shape)
+                    entry["tensor_bytes"] = tensor_bytes
+            except Exception:
+                continue
+
+    by_size = Counter(int(entry["storage_bytes"]) for entry in unique.values())
+    logging.error(
+        "[PinnedHost][python-live] scanned_tensors=%d unique_pinned_storages=%d "
+        "pinned_bytes=%d size_histogram=%s",
+        scanned,
+        len(unique),
+        sum(int(entry["storage_bytes"]) for entry in unique.values()),
+        dict(sorted(by_size.items())),
+    )
+    for index, (storage_ptr, entry) in enumerate(
+        sorted(
+            unique.items(),
+            key=lambda item: int(item[1]["storage_bytes"]),
+            reverse=True,
+        )
+    ):
+        if index >= max(0, int(limit)):
+            break
+        logging.error(
+            "[PinnedHost][python-live][%d] storage_ptr=0x%x storage_bytes=%d "
+            "tensor_bytes=%d dtype=%s shape=%s owners=%s",
+            index,
+            storage_ptr,
+            int(entry["storage_bytes"]),
+            int(entry["tensor_bytes"]),
+            entry["dtype"],
+            entry["shape"],
+            entry["hints"],
+        )
+    return {
+        "scanned_tensors": scanned,
+        "unique_pinned_storages": len(unique),
+        "pinned_bytes": sum(int(entry["storage_bytes"]) for entry in unique.values()),
+    }
 
 
 def _clear_module_device_caches() -> list[str]:
