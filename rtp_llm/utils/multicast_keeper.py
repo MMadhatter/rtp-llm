@@ -34,6 +34,7 @@ BIN_DIR_ENV = "RTP_LLM_MC_KEEPER_BIN_DIR"
 LOCAL_GPU_ENV = "RTP_LLM_MC_LOCAL_GPUS"
 FABRIC_TEAM_ENV = "RTP_LLM_MC_FABRIC_TEAM_SIZE"
 SYMM_MEM_HANDLE_POLICY_ENV = "RTP_LLM_MC_SYMM_MEM_HANDLE_POLICY"
+SYMM_MEM_BROKER_ACTIVE_ENV = "RTP_LLM_MC_SYMM_MEM_BROKER_ACTIVE"
 SOCKET_ENV = "RTP_LLM_CUDA_CKPT_MULTICAST_SOCKET"
 KEEPER_DIR_ENV = "NEKYIA_KEEPER_DIR"
 
@@ -67,13 +68,15 @@ class MulticastKeeperHealthError(MulticastKeeperError):
 
 
 class MulticastKeeperMode(str, Enum):
-    """Transport selected from the global and node-local worker topology."""
+    """Holder placement selected from global and node-local worker topology."""
 
     SINGLE_NODE = "single_node"
     # Compatibility alias for callers that imported the old, overly specific
     # name. Single-node placement can use either POSIX or FABRIC handles.
     SINGLE_NODE_POSIX = "single_node"
-    CROSS_NODE_FABRIC = "cross_node_fabric"
+    CROSS_NODE = "cross_node"
+    # Compatibility alias for callers that imported the old transport name.
+    CROSS_NODE_FABRIC = "cross_node"
 
 
 @dataclass(frozen=True)
@@ -278,7 +281,7 @@ class MulticastKeeperRuntime:
         self.local_world_size = int(local_world_size)
         self.role = role
         self.mode = (
-            MulticastKeeperMode.CROSS_NODE_FABRIC
+            MulticastKeeperMode.CROSS_NODE
             if self.world_size > self.local_world_size
             else MulticastKeeperMode.SINGLE_NODE
         )
@@ -667,6 +670,8 @@ class MulticastKeeperRuntime:
         # torch.distributed ProcessGroup immediately before its first SymmMem
         # allocation. Never inherit a stale parent-process decision.
         child_env.pop(SYMM_MEM_HANDLE_POLICY_ENV, None)
+        # The collective allocation scope owns this shorter-lived marker.
+        child_env.pop(SYMM_MEM_BROKER_ACTIVE_ENV, None)
         child_env.setdefault("TORCH_SYMM_MEM_DISABLE_MULTICAST", "0")
         child_env.setdefault(
             "RTP_LLM_MC_REQUEST_TIMEOUT_MS", str(self.request_timeout_ms)
@@ -785,6 +790,7 @@ __all__ = [
     "MulticastKeeperMode",
     "MulticastKeeperRuntime",
     "SYMM_MEM_HANDLE_POLICY_ENV",
+    "SYMM_MEM_BROKER_ACTIVE_ENV",
     "discover_artifacts",
     "is_enabled",
 ]

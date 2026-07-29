@@ -7,10 +7,10 @@ SymmetricMemory allocation and this module publishes the resulting process-wide
 handle policy to the preloaded keeper shim.
 
 PyTorch's CUDA symmetric-memory allocator caches its handle type for the
-process lifetime.  Consequently a Level3 rank cannot first allocate a
-single-node POSIX group and later allocate a cross-node FABRIC group.  We reject
-that unsupported mix at startup instead of silently selecting the wrong CUDA
-handle type.
+process lifetime. Consequently a Level3 rank cannot first force a complete
+node-local group to POSIX and later let a subgroup select its native handle
+type. We reject that unsupported mix at startup instead of silently selecting
+the wrong CUDA handle type.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ import torch.distributed as dist
 
 KEEPER_ENABLE_ENV = "RTP_LLM_CUDA_CKPT_MULTICAST_KEEPER"
 LOCAL_GPUS_ENV = "RTP_LLM_MC_LOCAL_GPUS"
-FABRIC_TEAM_SIZE_ENV = "RTP_LLM_MC_FABRIC_TEAM_SIZE"
 HANDLE_POLICY_ENV = "RTP_LLM_MC_SYMM_MEM_HANDLE_POLICY"
+BACKING_BROKER_ACTIVE_ENV = "RTP_LLM_MC_SYMM_MEM_BROKER_ACTIVE"
 
 
 class SymmMemGroupScope(str, Enum):
@@ -38,7 +38,9 @@ class SymmMemGroupScope(str, Enum):
 
 class SymmMemHandlePolicy(str, Enum):
     LOCAL_POSIX = "local_posix"
-    FABRIC = "fabric"
+    # Preserve Torch/CUDA's native choice. The shim brokers an allocation only
+    # if the resulting CUDA request actually asks for a FABRIC handle.
+    NATIVE = "native"
 
 
 @dataclass(frozen=True)
@@ -145,36 +147,13 @@ def _group_ranks(group: Any) -> Tuple[int, ...]:
     return ranks
 
 
-def _validate_keeper_contract(
-    scope: SymmMemGroupScope,
-    ranks: Tuple[int, ...],
-    local_ranks: Tuple[int, ...],
-) -> None:
-    """Reject layouts the current node-local holder cannot represent safely."""
+def _is_complete_local_group(
+    ranks: Tuple[int, ...], local_ranks: Tuple[int, ...]
+) -> bool:
+    """Return whether POSIX multicast can use the holder's full GPU team."""
 
-    if scope is SymmMemGroupScope.LOCAL:
-        local_gpu_count = _parse_local_gpu_count()
-        if len(ranks) != local_gpu_count or set(ranks) != set(local_ranks):
-            raise RuntimeError(
-                "Level3 multicast keeper currently requires a local SymmMem "
-                "group to cover every rank/GPU assigned to this node: "
-                f"group_ranks={list(ranks)}, local_ranks={list(local_ranks)}, "
-                f"keeper_local_gpu_count={local_gpu_count}"
-            )
-        return
-
-    try:
-        fabric_team_size = int(os.environ[FABRIC_TEAM_SIZE_ENV])
-    except (KeyError, ValueError):
-        raise RuntimeError(
-            f"{FABRIC_TEAM_SIZE_ENV} must contain the explicit FABRIC group size"
-        ) from None
-    if len(ranks) != fabric_team_size:
-        raise RuntimeError(
-            "Level3 multicast keeper FABRIC contract does not match the actual "
-            f"SymmMem group: group_ranks={list(ranks)}, "
-            f"configured_team_size={fabric_team_size}"
-        )
+    local_gpu_count = _parse_local_gpu_count()
+    return len(ranks) == local_gpu_count and set(ranks) == set(local_ranks)
 
 
 def configure_group_scope(
@@ -204,13 +183,19 @@ def configure_group_scope(
             if set(ranks).issubset(local_ranks)
             else SymmMemGroupScope.CROSS_NODE
         )
+        complete_local_group = (
+            scope is SymmMemGroupScope.LOCAL
+            and _is_complete_local_group(ranks, local_ranks)
+        )
         requested_policy = (
             SymmMemHandlePolicy.LOCAL_POSIX
-            if scope is SymmMemGroupScope.LOCAL
-            else SymmMemHandlePolicy.FABRIC
+            if complete_local_group
+            else SymmMemHandlePolicy.NATIVE
         )
-        _validate_keeper_contract(scope, ranks, local_ranks)
-
+        # A subgroup (local or cross-node) is not necessarily an NVLS/FABRIC
+        # group. Defer the keeper contract until CUDA actually requests a
+        # FABRIC or multicast handle. Non-FABRIC groups retain their normal
+        # teardown/rebuild path.
         if _selected_policy is None:
             _selected_policy = requested_policy
             os.environ[HANDLE_POLICY_ENV] = requested_policy.value
@@ -225,9 +210,9 @@ def configure_group_scope(
             )
         elif _selected_policy is not requested_policy:
             raise RuntimeError(
-                "one process cannot mix local POSIX and cross-node FABRIC "
-                "SymmMem groups under PyTorch's process-wide CUDA symmetric-"
-                "memory allocator: "
+                "one process cannot mix a forced complete-local POSIX group "
+                "with a native-handle subgroup under PyTorch's process-wide "
+                "CUDA symmetric-memory allocator: "
                 f"selected_policy={_selected_policy.value}, owner={owner}, "
                 f"requested_scope={scope.value}, group_ranks={list(ranks)}"
             )
@@ -276,31 +261,72 @@ def _release_fabric_backing_fences(owner: str) -> int:
     return released
 
 
+def _pending_fabric_backing_fences(owner: str) -> int:
+    import ctypes
+
+    try:
+        pending = ctypes.CDLL(None).rtp_llm_mc_pending_fabric_backings
+    except AttributeError:
+        raise RuntimeError(
+            "multicast keeper shim does not export "
+            "rtp_llm_mc_pending_fabric_backings"
+        ) from None
+    pending.argtypes = []
+    pending.restype = ctypes.c_int
+    count = int(pending())
+    if count < 0:
+        raise RuntimeError(f"failed to inspect FABRIC backing fences for {owner}")
+    return count
+
+
 @contextmanager
 def symm_mem_allocation_scope(group: Any, *, owner: str):
-    """Keep broker creators alive exactly through cross-node rendezvous.
+    """Keep real FABRIC broker creators alive through group rendezvous.
 
-    The post-rendezvous group barrier guarantees every peer has imported all
-    raw FABRIC identities before their exporting helper processes exit. This is
-    initialization/wake-only coordination; it is not on the inference hot path.
+    A native non-FABRIC allocation leaves no pending creator and bypasses the
+    keeper-specific barrier entirely. For a real FABRIC backing, the barrier
+    guarantees every peer has imported all raw identities before their
+    exporting helper processes exit. This is initialization/wake-only
+    coordination; it is not on the inference hot path.
     """
 
     decision = configure_group_scope(group, owner=owner)
-    fabric = decision is not None and decision.policy is SymmMemHandlePolicy.FABRIC
+    native_policy = (
+        decision is not None and decision.policy is SymmMemHandlePolicy.NATIVE
+    )
+    previous_active = os.environ.get(BACKING_BROKER_ACTIVE_ENV)
+    if native_policy:
+        os.environ[BACKING_BROKER_ACTIVE_ENV] = "1"
     try:
-        yield decision
-    except BaseException:
-        if fabric:
-            try:
-                _release_fabric_backing_fences(owner)
-            except Exception:
-                logging.exception(
-                    "[MulticastKeeper][SymmMemScope] failed to abort FABRIC "
-                    "backing creators owner=%s",
-                    owner,
-                )
-        raise
-    if fabric:
+        try:
+            yield decision
+        except BaseException:
+            if native_policy:
+                try:
+                    if _pending_fabric_backing_fences(owner):
+                        _release_fabric_backing_fences(owner)
+                except Exception:
+                    logging.exception(
+                        "[MulticastKeeper][SymmMemScope] failed to abort FABRIC "
+                        "backing creators owner=%s",
+                        owner,
+                    )
+            raise
+    finally:
+        if native_policy:
+            if previous_active is None:
+                os.environ.pop(BACKING_BROKER_ACTIVE_ENV, None)
+            else:
+                os.environ[BACKING_BROKER_ACTIVE_ENV] = previous_active
+
+    pending = _pending_fabric_backing_fences(owner) if native_policy else 0
+    if native_policy and pending == 0:
+        logging.info(
+            "[MulticastKeeper][SymmMemScope] native non-FABRIC allocation "
+            "bypassed keeper coordination owner=%s",
+            owner,
+        )
+    if pending:
         try:
             dist.barrier(group=group)
         except BaseException:
@@ -323,9 +349,11 @@ def _reset_for_test() -> None:
         _rank_topology = None
         _selected_policy = None
         os.environ.pop(HANDLE_POLICY_ENV, None)
+        os.environ.pop(BACKING_BROKER_ACTIVE_ENV, None)
 
 
 __all__ = [
+    "BACKING_BROKER_ACTIVE_ENV",
     "HANDLE_POLICY_ENV",
     "SymmMemGroupDecision",
     "SymmMemGroupScope",

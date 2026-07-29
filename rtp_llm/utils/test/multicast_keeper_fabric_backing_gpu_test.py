@@ -9,6 +9,7 @@ from pathlib import Path
 
 from rtp_llm.utils.multicast_keeper import (
     ENABLE_ENV,
+    SYMM_MEM_BROKER_ACTIVE_ENV,
     SYMM_MEM_HANDLE_POLICY_ENV,
     KeeperArtifacts,
     MulticastKeeperRuntime,
@@ -103,6 +104,9 @@ cuda.cuMemAddressFree.restype = ctypes.c_int
 release_fences = process.rtp_llm_mc_release_fabric_backings
 release_fences.argtypes = []
 release_fences.restype = ctypes.c_int
+pending_fences = process.rtp_llm_mc_pending_fabric_backings
+pending_fences.argtypes = []
+pending_fences.restype = ctypes.c_int
 
 assert cuda.cuInit(0) == 0
 prop = AllocationProp(
@@ -126,7 +130,9 @@ assert any(fabric)
 print("FABRIC_TOKEN=" + bytes(fabric).hex(), flush=True)
 
 assert sys.stdin.readline().strip() == "rendezvous-complete"
+assert pending_fences() == 1
 assert release_fences() == 1
+assert pending_fences() == 0
 address = ctypes.c_ulonglong()
 size = 2 * 1024 * 1024
 assert cuda.cuMemAddressReserve(ctypes.byref(address), size, 0, 0, 0) == 0
@@ -137,6 +143,92 @@ assert cuda.cuMemUnmap(address, size) == 0
 assert cuda.cuMemAddressFree(address, size) == 0
 assert cuda.cuMemRelease(origin) == 0
 print("fabric-backing-origin-ok", flush=True)
+"""
+
+
+_NON_FABRIC_BACKING = r"""
+import ctypes
+import os
+
+
+class Location(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+
+class AllocFlags(ctypes.Structure):
+    _fields_ = [
+        ("compressionType", ctypes.c_ubyte),
+        ("gpuDirectRDMACapable", ctypes.c_ubyte),
+        ("usage", ctypes.c_ushort),
+        ("reserved", ctypes.c_ubyte * 4),
+    ]
+
+
+class AllocationProp(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("requestedHandleTypes", ctypes.c_int),
+        ("location", Location),
+        ("win32HandleMetaData", ctypes.c_void_p),
+        ("allocFlags", AllocFlags),
+    ]
+
+
+cuda = ctypes.CDLL("libcuda.so.1")
+process = ctypes.CDLL(None)
+cuda.cuInit.argtypes = [ctypes.c_uint]
+cuda.cuInit.restype = ctypes.c_int
+cuda.cuMemCreate.argtypes = [
+    ctypes.POINTER(ctypes.c_ulonglong),
+    ctypes.c_size_t,
+    ctypes.POINTER(AllocationProp),
+    ctypes.c_ulonglong,
+]
+cuda.cuMemCreate.restype = ctypes.c_int
+cuda.cuMemRelease.argtypes = [ctypes.c_ulonglong]
+cuda.cuMemRelease.restype = ctypes.c_int
+release_fences = process.rtp_llm_mc_release_fabric_backings
+release_fences.argtypes = []
+release_fences.restype = ctypes.c_int
+pending_fences = process.rtp_llm_mc_pending_fabric_backings
+pending_fences.argtypes = []
+pending_fences.restype = ctypes.c_int
+
+assert cuda.cuInit(0) == 0
+
+# A FABRIC allocation outside the explicit SymmMem allocation window is not
+# owned by this broker, even though the process-wide handle policy is native.
+active = os.environ.pop("RTP_LLM_MC_SYMM_MEM_BROKER_ACTIVE")
+direct_fabric_prop = AllocationProp(
+    type=1,
+    requestedHandleTypes=8,
+    location=Location(type=1, id=0),
+)
+direct_fabric = ctypes.c_ulonglong()
+assert cuda.cuMemCreate(
+    ctypes.byref(direct_fabric),
+    2 * 1024 * 1024,
+    ctypes.byref(direct_fabric_prop),
+    0,
+) == 0
+assert pending_fences() == 0
+assert cuda.cuMemRelease(direct_fabric) == 0
+os.environ["RTP_LLM_MC_SYMM_MEM_BROKER_ACTIVE"] = active
+
+# A non-FABRIC request inside the allocation window also passes through.
+prop = AllocationProp(
+    type=1,
+    requestedHandleTypes=1,
+    location=Location(type=1, id=0),
+)
+allocation = ctypes.c_ulonglong()
+assert cuda.cuMemCreate(
+    ctypes.byref(allocation), 2 * 1024 * 1024, ctypes.byref(prop), 0
+) == 0
+assert pending_fences() == 0
+assert release_fences() == 0
+assert cuda.cuMemRelease(allocation) == 0
+print("non-symm-and-non-fabric-backings-bypassed-keeper", flush=True)
 """
 
 
@@ -268,7 +360,8 @@ class MulticastKeeperFabricBackingGpuTest(unittest.TestCase):
         try:
             runtime.start()
             child_env = runtime.subprocess_env(env)
-            child_env[SYMM_MEM_HANDLE_POLICY_ENV] = "fabric"
+            child_env[SYMM_MEM_HANDLE_POLICY_ENV] = "native"
+            child_env[SYMM_MEM_BROKER_ACTIVE_ENV] = "1"
             origin = subprocess.Popen(
                 [sys.executable, "-c", _FABRIC_BACKING_ORIGIN],
                 env=child_env,
@@ -323,6 +416,66 @@ class MulticastKeeperFabricBackingGpuTest(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     origin.kill()
                     origin.wait(timeout=5)
+            runtime.stop()
+
+    def test_non_fabric_backing_bypasses_keeper(self) -> None:
+        if platform.machine().lower() not in {"aarch64", "x86_64"}:
+            self.skipTest("unsupported ELF architecture")
+
+        cuda = ctypes.CDLL("libcuda.so.1")
+        cuda.cuInit.argtypes = [ctypes.c_uint]
+        cuda.cuInit.restype = ctypes.c_int
+        cuda.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        cuda.cuDeviceGetCount.restype = ctypes.c_int
+        count = ctypes.c_int()
+        if cuda.cuInit(0) != 0 or cuda.cuDeviceGetCount(ctypes.byref(count)) != 0:
+            self.skipTest("CUDA driver is unavailable")
+        if count.value < 1:
+            self.skipTest("no CUDA device is visible")
+
+        artifacts = KeeperArtifacts(
+            holder=self._artifact("keeper_lite_holder"),
+            creator=self._artifact("keeper_lite_creator"),
+            shim=self._artifact("mc_shim_unified.so"),
+        )
+        env = dict(os.environ)
+        env[ENABLE_ENV] = "1"
+        runtime = MulticastKeeperRuntime(
+            count.value,
+            count.value,
+            "prefill",
+            env=env,
+            artifacts=artifacts,
+        )
+        try:
+            runtime.start()
+            child_env = runtime.subprocess_env(env)
+            child_env[SYMM_MEM_HANDLE_POLICY_ENV] = "native"
+            child_env[SYMM_MEM_BROKER_ACTIVE_ENV] = "1"
+            completed = subprocess.run(
+                [sys.executable, "-c", _NON_FABRIC_BACKING],
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                completed.returncode,
+                f"stdout={completed.stdout}\nstderr={completed.stderr}\n"
+                f"holder={runtime.log_tail(80)}",
+            )
+            self.assertIn(
+                "non-symm-and-non-fabric-backings-bypassed-keeper",
+                completed.stdout,
+            )
+            self.assertEqual(0, runtime.health().entries)
+            holder_log = runtime.log_tail(80)
+            self.assertNotIn("fabric_backing_ready", holder_log)
+            self.assertNotIn("fabric_backing_released", holder_log)
+        finally:
             runtime.stop()
 
 

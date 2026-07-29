@@ -19,6 +19,7 @@ from rtp_llm.utils.multicast_keeper import (
     HOLDER_ENV,
     LOCAL_GPU_ENV,
     SHIM_ENV,
+    SYMM_MEM_BROKER_ACTIVE_ENV,
     SYMM_MEM_HANDLE_POLICY_ENV,
     KeeperArtifacts,
     MulticastKeeperConfigError,
@@ -241,7 +242,7 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
             env=self._env(),
             artifacts=self.artifacts,
         )
-        self.assertEqual(MulticastKeeperMode.CROSS_NODE_FABRIC, uneven.mode)
+        self.assertEqual(MulticastKeeperMode.CROSS_NODE, uneven.mode)
         self.assertEqual(3, uneven.fabric_team_size)
 
     def test_config_resolves_holder_gpu_ordinals_from_visibility(self):
@@ -287,7 +288,7 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
             state_root=self.root,
         )
         self.assertIsNotNone(runtime)
-        self.assertEqual(MulticastKeeperMode.CROSS_NODE_FABRIC, runtime.mode)
+        self.assertEqual(MulticastKeeperMode.CROSS_NODE, runtime.mode)
         self.assertEqual(2, runtime.local_world_size)
         self.assertEqual(4, runtime.fabric_team_size)
 
@@ -340,6 +341,7 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
                 "TORCH_SYMM_MEM_DISABLE_MULTICAST": "custom",
                 "RTP_LLM_MC_REQUEST_TIMEOUT_MS": "77",
                 SYMM_MEM_HANDLE_POLICY_ENV: "stale-parent-policy",
+                SYMM_MEM_BROKER_ACTIVE_ENV: "1",
             }
             child = runtime.subprocess_env(base)
             self.assertEqual(f"/opt/tms.so:/opt/a.so:{shim}", child["LD_PRELOAD"])
@@ -350,6 +352,7 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
             self.assertEqual("0,2", child["RTP_LLM_MC_LOCAL_GPUS"])
             self.assertEqual("8", child["RTP_LLM_MC_FABRIC_TEAM_SIZE"])
             self.assertNotIn(SYMM_MEM_HANDLE_POLICY_ENV, child)
+            self.assertNotIn(SYMM_MEM_BROKER_ACTIVE_ENV, child)
             self.assertEqual(
                 str(runtime.socket_path), child["RTP_LLM_CUDA_CKPT_MULTICAST_SOCKET"]
             )
@@ -467,7 +470,7 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
         )
         cases = (
             (2, MulticastKeeperMode.SINGLE_NODE, 2),
-            (4, MulticastKeeperMode.CROSS_NODE_FABRIC, 4),
+            (4, MulticastKeeperMode.CROSS_NODE, 4),
         )
         for world_size, expected_mode, expected_team_size in cases:
             with self.subTest(mode=expected_mode):

@@ -1082,7 +1082,9 @@ static int is_fabric_backing_request(const CUmemAllocationProp* properties, unsi
         return 0;
     }
     const char* policy = getenv("RTP_LLM_MC_SYMM_MEM_HANDLE_POLICY");
-    if (policy == NULL || strcmp(policy, "fabric") != 0) {
+    const char* active = getenv("RTP_LLM_MC_SYMM_MEM_BROKER_ACTIVE");
+    if (policy == NULL || strcmp(policy, "native") != 0 || active == NULL
+        || strcmp(active, "1") != 0) {
         return 0;
     }
     static const unsigned char zero_flags[8] = {0};
@@ -1094,10 +1096,11 @@ static int is_fabric_backing_request(const CUmemAllocationProp* properties, unsi
 }
 
 // A restored GB300 rank can import and use a new FABRIC allocation but the
-// driver may reject creating it in that restored process (CUDA 800). For an
-// explicitly cross-node SymmMem group, delegate only this exact generic backing
-// allocation to the keeper's short-lived CUDA child. The response carries both
-// a POSIX fd and the matching raw FABRIC token. Import the POSIX fd so this rank
+// driver may reject creating it in that restored process (CUDA 800). For a
+// native-handle SymmMem group that actually requests FABRIC, delegate only this
+// exact generic backing allocation to the keeper's short-lived CUDA child.
+// Non-FABRIC requests bypass the keeper unchanged. The response carries both a
+// POSIX fd and the matching raw FABRIC token. Import the POSIX fd so this rank
 // owns the allocation after the child exits, and remember the FABRIC identity
 // for PyTorch's later handle exchange (CUDA cannot re-export the POSIX-imported
 // handle as FABRIC itself). The holder retains no allocation fd; it tracks only
@@ -1714,6 +1717,19 @@ static int keeper_send_backing_release(const rtp_mc_token* token) {
     }
     log_message(0, "FABRIC backing release completed object=%llu", (unsigned long long)token->object_id);
     return 0;
+}
+
+// Let the allocation scope distinguish a native non-FABRIC group from a real
+// FABRIC backing without inferring topology in Python. A zero result means the
+// group bypassed the backing broker and needs no keeper-specific barrier.
+int rtp_llm_mc_pending_fabric_backings(void) {
+    if (!keeper_enabled()) {
+        return 0;
+    }
+    pthread_mutex_lock(&g_lock);
+    size_t pending_count = g_pending_backing_count;
+    pthread_mutex_unlock(&g_lock);
+    return (int)pending_count;
 }
 
 // Called by the SymmMem allocation scope after every rank has completed
