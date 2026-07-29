@@ -741,6 +741,20 @@ bool KVCacheManager::restoreMemoryCacheBacking() {
     return coordinator_->restoreMemoryCacheBacking();
 }
 
+bool KVCacheManager::suspendPinnedHostMemory() {
+    if (!coordinator_) {
+        return true;
+    }
+    return coordinator_->suspendPinnedHostMemory();
+}
+
+bool KVCacheManager::resumePinnedHostMemory() {
+    if (!coordinator_) {
+        return true;
+    }
+    return coordinator_->resumePinnedHostMemory();
+}
+
 // 系统资源管理
 
 void KVCacheManager::regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store) {

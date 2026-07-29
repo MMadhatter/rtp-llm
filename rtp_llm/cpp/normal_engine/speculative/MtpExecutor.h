@@ -54,6 +54,8 @@ public:
     absl::Status drainAsyncRunners() override;
     void         invalidateCudaGraphs() override;
     void         recaptureCudaGraphs() override;
+    absl::Status suspendPinnedHostMemory() override;
+    absl::Status resumePinnedHostMemory() override;
     bool         updateEplbConfig(const EPLBConfig& config) override;
 
     void setTargetModel(std::unique_ptr<ModelBase> model) {
@@ -190,6 +192,7 @@ protected:
                                    const MergedOutput&                          draft_prefill_output);
 
     void releaseAllModelBuffers();
+    absl::Status rebuildKvCacheLayerToGroupPinnedTensors();
 
 private:
     std::unique_ptr<ModelBase>                                               model_;
@@ -238,6 +241,9 @@ private:
     // group id tensors
     torch::Tensor target_kv_cache_layer_to_group;
     torch::Tensor draft_kv_cache_layer_to_group;
+    std::vector<int32_t> target_kv_cache_layer_to_group_values_;
+    std::vector<int32_t> draft_kv_cache_layer_to_group_values_;
+    bool                 pinned_host_memory_suspended_{false};
 
     torch::Tensor d2t_map_;
 

@@ -15,6 +15,19 @@ cc_test_wrapper(
 )
 
 cc_test_wrapper(
+    name = "pinned_host_memory_verifier_test",
+    srcs = [
+        "PinnedHostMemoryVerifierTest.cc",
+    ],
+    copts = copts(),
+    deps = [
+        "//rtp_llm/cpp/engine_base/sleep:pinned_host_memory_stats",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test_wrapper(
     name = "drain_manager_test",
     srcs = [
         "DrainManagerTest.cc",

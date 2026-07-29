@@ -151,8 +151,20 @@ public:
         ++recapture_count;
     }
 
+    absl::Status suspendPinnedHostMemory() override {
+        ++suspend_pinned_count;
+        return absl::OkStatus();
+    }
+
+    absl::Status resumePinnedHostMemory() override {
+        ++resume_pinned_count;
+        return absl::OkStatus();
+    }
+
     int invalidate_count{0};
     int recapture_count{0};
+    int suspend_pinned_count{0};
+    int resume_pinned_count{0};
 };
 
 TEST_F(NormalEngineTest, testCudaGraphLifecyclePropagatesForTwoCycles) {
@@ -171,6 +183,28 @@ TEST_F(NormalEngineTest, testCudaGraphLifecyclePropagatesForTwoCycles) {
         EXPECT_EQ(model_view->invalidate_count, cycle);
         engine->recaptureCudaGraphs();
         EXPECT_EQ(model_view->recapture_count, cycle);
+    }
+}
+
+TEST_F(NormalEngineTest, testPinnedHostLifecyclePropagatesAndIsIdempotent) {
+    CustomConfig config;
+    auto         engine = createMockEngine(config);
+    ASSERT_TRUE(engine->stop().ok());
+
+    auto* executor = dynamic_cast<NormalExecutor*>(engine->executor_.get());
+    ASSERT_NE(executor, nullptr);
+    auto  model      = std::make_unique<CudaGraphLifecycleMockModel>();
+    auto* model_view = model.get();
+    executor->setModel(std::move(model));
+
+    for (int cycle = 1; cycle <= 2; ++cycle) {
+        ASSERT_TRUE(engine->suspendPinnedHostMemory().ok());
+        ASSERT_TRUE(engine->suspendPinnedHostMemory().ok());
+        EXPECT_EQ(model_view->suspend_pinned_count, cycle);
+
+        ASSERT_TRUE(engine->resumePinnedHostMemory().ok());
+        ASSERT_TRUE(engine->resumePinnedHostMemory().ok());
+        EXPECT_EQ(model_view->resume_pinned_count, cycle);
     }
 }
 

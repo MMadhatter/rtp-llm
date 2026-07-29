@@ -32,6 +32,11 @@ struct StagedMemoryCopyScratch;
 
 class KVCacheMemoryConnector: public KVCacheConnector {
 public:
+    struct PinnedHostMemoryStats {
+        size_t allocation_count{0};
+        size_t bytes{0};
+    };
+
     KVCacheMemoryConnector(const CacheConfig&                       cache_config,
                            const KVCacheConfig&                     kv_cache_config,
                            const ParallelismConfig&                 parallelism_config,
@@ -73,6 +78,14 @@ public:
     // block pool was never created.
     bool releaseMemoryCacheBacking();
     bool restoreMemoryCacheBacking();
+
+    // Level-3 checkpoint lifecycle for raw pinned staging owned by this connector.
+    // The caller must freeze and drain KV transfers before suspend. While suspended,
+    // staged copies are rejected so a late transfer cannot recreate cudaHostAlloc
+    // memory between the final verification and CUDA checkpoint.
+    bool                  suspendPinnedHostMemory();
+    bool                  resumePinnedHostMemory();
+    PinnedHostMemoryStats pinnedHostMemoryStats() const;
 
 private:
     struct LayerRegionSlot {
@@ -291,6 +304,7 @@ private:
     mutable std::mutex                                      malloc_mutex_;
     mutable std::mutex                                      staged_copy_scratch_mutex_;
     std::map<int, std::unique_ptr<StagedMemoryCopyScratch>> staged_copy_scratch_by_device_;
+    bool                                                    staged_copy_suspended_{false};
     std::shared_ptr<MemoryDiskBlockCache>                   block_cache_;
     std::shared_ptr<PrefixTreeMemoryBlockCache>             prefix_block_cache_;
     std::unique_ptr<DiskMountGuard>                         disk_mount_guard_;

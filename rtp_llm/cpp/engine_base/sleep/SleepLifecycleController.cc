@@ -539,6 +539,25 @@ SleepResult SleepLifecycleController::sleep(const SleepOptions& opt) {
             setLastError("releaseKvMemoryBacking failed");
         }
     }
+    // releaseKvMemoryBacking may own a long-lived pinned CPU memory-cache tier.
+    // Run the strict Level-3 pinned-host teardown and zero-allocation gate only
+    // after that backing has been discarded, but before process checkpoint can
+    // be reached.
+    if (opt.level == 3 && ok) {
+        bool local_done = true;
+        if (hooks_.suspendPinnedHostMemory) {
+            local_done = invokeHookNoThrow("suspendPinnedHostMemory", hooks_.suspendPinnedHostMemory);
+            if (!local_done) {
+                setLastError("suspendPinnedHostMemory failed");
+            }
+        }
+        const bool global_done = coordinateResourcePhaseNoThrow(
+            hooks_, "pinned_host_suspend_done", sleep_epoch_.load(std::memory_order_acquire), local_done);
+        if (!global_done && local_done) {
+            setLastError("pinned host suspend done gate failed");
+        }
+        ok = global_done;
+    }
     if (ok && hooks_.releaseRestorableGpuMemory) {
         ok = invokeHookNoThrow("releaseRestorableGpuMemory", hooks_.releaseRestorableGpuMemory, opt);
         if (!ok) {
@@ -706,6 +725,21 @@ SleepResult SleepLifecycleController::wakeUp(const WakeUpOptions& opt) {
             }
             ok = global_done;
         }
+    }
+    if (!opt.commit_only && ok && active_sleep_level_.load(std::memory_order_acquire) == 3) {
+        bool local_done = true;
+        if (hooks_.resumePinnedHostMemory) {
+            local_done = invokeHookNoThrow("resumePinnedHostMemory", hooks_.resumePinnedHostMemory);
+            if (!local_done) {
+                setLastError("resumePinnedHostMemory failed");
+            }
+        }
+        const bool global_done = coordinateResourcePhaseNoThrow(
+            hooks_, "pinned_host_resume_done", sleep_epoch_.load(std::memory_order_acquire), local_done);
+        if (!global_done && local_done) {
+            setLastError("pinned host resume done gate failed");
+        }
+        ok = global_done;
     }
     if (!opt.commit_only && ok && active_sleep_level_.load(std::memory_order_acquire) == 3
         && hooks_.rebuildRdmaTransports) {

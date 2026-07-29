@@ -1063,6 +1063,22 @@ void CudaGraphRunner::invalidateCapturedGraphs() {
                      capture_generation_.load(std::memory_order_acquire));
 }
 
+void CudaGraphRunner::suspendPinnedHostMemory() {
+    if (enable_cuda_graph_) {
+        // The normal Level-3 order invalidates first. Keep this method safe
+        // when called directly so graph-owned pinned capture metadata is never
+        // left live merely because the caller skipped the separate graph hook.
+        invalidateCapturedGraphs();
+        return;
+    }
+
+    // initCapture() builds a small capture_mem_hold_ even when graph replay is
+    // disabled. invalidateCapturedGraphs() intentionally does nothing in that
+    // mode, so release the otherwise process-lifetime pinned cu_seqlens here.
+    py::gil_scoped_acquire gil;
+    releaseCapturedGraphResources();
+}
+
 void CudaGraphRunner::recaptureCapturedGraphs() {
     if (!enable_cuda_graph_) {
         return;

@@ -42,6 +42,8 @@ public:
     absl::Status drainAsyncRunners() override;
     void         invalidateCudaGraphs() override;
     void         recaptureCudaGraphs() override;
+    absl::Status suspendPinnedHostMemory() override;
+    absl::Status resumePinnedHostMemory() override;
     void         reportMetrics(const StreamGroups&             stream_groups,
                                RtpLLMExecutorMetricsCollector& executor_collector,
                                RtpLLMTokenPSMetricsCollector&  tps_collector,
@@ -123,6 +125,7 @@ private:
     std::function<void()> profile_step_start_;
     std::function<void()> profile_step_finish_;
     std::atomic<bool>     last_pause_signal_{false};
+    bool                  pinned_host_memory_suspended_{false};
 
     // Stream-async worker owns a CUDA stream/thread for pinned D2H,
     // per-stream update, and KV release off the main thread.

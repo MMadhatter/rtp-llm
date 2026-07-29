@@ -26,6 +26,16 @@ void bitwiseAndInplace(int32_t* dst, const int32_t* src, size_t words) {
 
 SpecLogitsVerifyRunner::SpecLogitsVerifyRunner(): copy_stream_(cuda_graph::graphGetStreamFromPool(true)) {}
 
+absl::Status SpecLogitsVerifyRunner::suspendPinnedHostMemory() {
+    draft_tokens_cpu_ = torch::Tensor();
+    spec_cap_cpu_     = torch::Tensor();
+    return absl::OkStatus();
+}
+
+absl::Status SpecLogitsVerifyRunner::resumePinnedHostMemory() {
+    return absl::OkStatus();
+}
+
 void SpecLogitsVerifyRunner::ensureBuffersFit(size_t total_streams,
                                               int    propose_step,
                                               size_t vocab_size,

@@ -64,6 +64,10 @@ public:
     bool releaseMemoryCacheBacking();
     bool restoreMemoryCacheBacking();
 
+    // Level-3 checkpoint lifecycle for connector-owned raw pinned host staging.
+    bool suspendPinnedHostMemory();
+    bool resumePinnedHostMemory();
+
     bool freezeExternalTransfers();
     bool teardownRdmaTransports();
     bool rebuildRdmaTransports();

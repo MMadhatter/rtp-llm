@@ -25,6 +25,7 @@
 #include <hip/hip_runtime.h>
 #endif
 #include "autil/EnvUtil.h"
+#include "rtp_llm/cpp/engine_base/sleep/PinnedHostMemoryVerifier.h"
 #include "rtp_llm/cpp/engine_base/sleep/SleepMemoryPolicy.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
@@ -519,6 +520,49 @@ void LocalRpcServer::installSleepHooks() {
         logSleepMemorySnapshot("sleep/after_kv_release", local_rank);
         return success;
     };
+    hooks.suspendPinnedHostMemory = [engine, local_rank]() {
+        OptionalSleepDeviceGuard device_guard(local_rank);
+        bool                     engine_ok      = true;
+        bool                     kv_pd_ok       = true;
+        bool                     flashinfer_ok  = true;
+        const auto               engine_status  = engine->suspendPinnedHostMemory();
+        if (!engine_status.ok()) {
+            RTP_LLM_LOG_ERROR("level-3 engine pinned-host teardown failed: %s",
+                              engine_status.ToString().c_str());
+            engine_ok = false;
+        }
+        if (auto cache_manager = engine->getCacheManager()) {
+            if (!cache_manager->suspendPinnedHostMemory()) {
+                RTP_LLM_LOG_ERROR("level-3 KV/PD connector pinned-host teardown failed");
+                kv_pd_ok = false;
+            }
+        }
+#if USING_CUDA
+        try {
+            py::gil_scoped_acquire acquire;
+            const auto cleared_flashinfer_params =
+                py::module_::import("librtp_compute_ops.rtp_llm_ops")
+                    .attr("clear_flashinfer_attn_params_cache")()
+                    .cast<size_t>();
+            RTP_LLM_LOG_INFO("level-3 FlashInfer cached params released: local_rank=%d count=%zu",
+                             local_rank,
+                             cleared_flashinfer_params);
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_ERROR("level-3 FlashInfer cached params release failed: %s", e.what());
+            flashinfer_ok = false;
+        }
+#endif
+        const bool ok = engine_ok && kv_pd_ok && flashinfer_ok;
+        RTP_LLM_LOG_INFO(
+            "[PinnedHost][owners] level=3 phase=suspend local_rank=%d "
+            "engine=%s kv_pd_connector=%s flashinfer_cache=%s result=%s",
+            local_rank,
+            engine_ok ? "PASS" : "FAIL",
+            kv_pd_ok ? "PASS" : "FAIL",
+            flashinfer_ok ? "PASS" : "FAIL",
+            ok ? "PASS" : "FAIL");
+        return ok;
+    };
     // Weights always use VMM backing. Level 1/2 also preserve CUDA graphs and
     // therefore manage their VMM tag; Level 3 destroys graphs and uses ordinary
     // allocator memory for each fresh capture.
@@ -585,23 +629,54 @@ void LocalRpcServer::installSleepHooks() {
             }
         }
 #endif
-        // CUDA process restore on GB300 can fail with CUDA_ERROR_NOT_SUPPORTED
-        // when PyTorch's pinned-host allocator retains free cached blocks backed
-        // by cudaHostAlloc/cudaHostRegister. Tensor.item() is one hidden source:
-        // it allocates a pinned scalar staging buffer and returns it to the host
-        // cache, while torch/device emptyCache above does not release it. The
-        // checkpoint call itself succeeds, making this easy to misdiagnose as an
-        // NVLS restore failure.
+        // GB300 process restore returns CUDA_ERROR_NOT_SUPPORTED when any
+        // cudaHostAlloc/cudaHostRegister-backed allocation remains live across
+        // checkpoint. Level 3 therefore has a fail-closed contract: all owners
+        // were explicitly suspended above, then the caching host allocator must
+        // reach an exact zero after its free cache is flushed. This terminal
+        // gate runs after all other sleep-side Python/C++ cleanup so no later
+        // hook can recreate pinned memory before checkpoint.
         //
-        // Flush unused pinned-host blocks for every sleep level, next to the
-        // device allocator emptyCache above. Host empty_cache only releases
-        // cached/free blocks; live host tensors remain allocated. Do not
-        // require the allocator's total allocation count to reach zero: the
-        // engine intentionally retains pinned input/control tensors across
-        // sleep. The restore failure reproduced on GB300 came from a free
-        // cached D2H staging block, which empty_cache releases.
+        // Level 1/2 do not checkpoint the process. Preserve their best-effort
+        // free-cache flush without requiring persistent input/control tensors
+        // to be destroyed.
 #if USING_CUDA
-        {
+        if (opt.level == 3) {
+            PinnedHostAllocatorSnapshot before;
+            PinnedHostAllocatorSnapshot after;
+            const auto status = flushAndVerifyCudaPinnedHostMemory(&before, &after);
+            if (!status.ok()) {
+                (void)cudaGetLastError();
+                RTP_LLM_LOG_ERROR(
+                    "[PinnedHost][checkpoint-gate] FAIL level=3 local_rank=%d "
+                    "owners_suspended=1 torch_backing_empty=0 backing_allocations=%lld "
+                    "backing_bytes=%lld active_requests_telemetry=%lld "
+                    "active_bytes_telemetry=%lld active_counters_stale=%d "
+                    "action=refuse_checkpoint before={%s} error=%s",
+                    local_rank,
+                    static_cast<long long>(after.allocations),
+                    static_cast<long long>(after.allocated_bytes),
+                    static_cast<long long>(after.active_requests),
+                    static_cast<long long>(after.active_bytes),
+                    static_cast<int>(after.hasStaleActiveCounters()),
+                    before.debugString().c_str(),
+                    status.ToString().c_str());
+                ok = false;
+            } else {
+                RTP_LLM_LOG_INFO(
+                    "[PinnedHost][checkpoint-gate] PASS level=3 local_rank=%d "
+                    "owners_suspended=1 torch_backing_empty=1 backing_allocations=%lld "
+                    "backing_bytes=%lld active_requests_telemetry=%lld "
+                    "active_bytes_telemetry=%lld active_counters_stale=%d "
+                    "action=allow_checkpoint",
+                    local_rank,
+                    static_cast<long long>(after.allocations),
+                    static_cast<long long>(after.allocated_bytes),
+                    static_cast<long long>(after.active_requests),
+                    static_cast<long long>(after.active_bytes),
+                    static_cast<int>(after.hasStaleActiveCounters()));
+            }
+        } else {
             try {
                 auto* host_allocator = at::getHostAllocator(at::kCUDA);
                 RTP_LLM_CHECK_WITH_INFO(host_allocator != nullptr, "CUDA host allocator is unavailable");
@@ -621,16 +696,17 @@ void LocalRpcServer::installSleepHooks() {
                     static_cast<long long>(after.active_requests.current),
                     static_cast<long long>(before.allocations.current),
                     static_cast<long long>(after.allocations.current));
+                RTP_LLM_LOG_INFO(
+                    "[PinnedHost][cache-only] level=%d local_rank=%d owner_teardown=SKIPPED "
+                    "reason=no_process_checkpoint backing_allocations=%lld backing_bytes=%lld",
+                    opt.level,
+                    local_rank,
+                    static_cast<long long>(after.allocations.current),
+                    static_cast<long long>(after.allocated_bytes.current));
             } catch (const std::exception& e) {
                 (void)cudaGetLastError();
-                if (opt.level == 3) {
-                    RTP_LLM_LOG_ERROR(
-                        "level-3 CUDA pinned-host cache flush failed; refusing process checkpoint: %s", e.what());
-                    ok = false;
-                } else {
-                    RTP_LLM_LOG_WARNING(
-                        "sleep level-%d CUDA pinned-host cache flush failed (ignored): %s", opt.level, e.what());
-                }
+                RTP_LLM_LOG_WARNING(
+                    "sleep level-%d CUDA pinned-host cache flush failed (ignored): %s", opt.level, e.what());
             }
         }
 #endif
@@ -716,6 +792,26 @@ void LocalRpcServer::installSleepHooks() {
         auto cache_manager = engine->getCacheManager();
         return !cache_manager
                || (cache_manager->rebuildMemoryOwnerBeforeMrReg() && cache_manager->rebuildRdmaTransports());
+    };
+    hooks.resumePinnedHostMemory = [engine, local_rank]() {
+        OptionalSleepDeviceGuard device_guard(local_rank);
+        bool                     ok = true;
+        if (auto cache_manager = engine->getCacheManager()) {
+            if (!cache_manager->resumePinnedHostMemory()) {
+                RTP_LLM_LOG_ERROR("level-3 KV/PD connector pinned-host restore failed");
+                ok = false;
+            }
+        }
+        const auto engine_status = engine->resumePinnedHostMemory();
+        if (!engine_status.ok()) {
+            RTP_LLM_LOG_ERROR("level-3 engine pinned-host restore failed: %s",
+                              engine_status.ToString().c_str());
+            ok = false;
+        }
+        RTP_LLM_LOG_INFO("level-3 pinned-host owner restore complete: local_rank=%d success=%d",
+                         local_rank,
+                         static_cast<int>(ok));
+        return ok;
     };
     hooks.restartEngine = [engine]() {
         engine->restart();

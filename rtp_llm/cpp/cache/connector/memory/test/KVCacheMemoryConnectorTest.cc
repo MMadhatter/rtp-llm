@@ -32,6 +32,7 @@
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/config/EplbConfig.h"
 #include "rtp_llm/cpp/config/ModelConfig.h"
+#include "rtp_llm/models_py/bindings/NoBlockCopy.h"
 
 namespace rtp_llm::test {
 
@@ -3771,6 +3772,63 @@ TEST_F(KVCacheMemoryConnectorTest, cacheKeys_ConcurrentWithReleaseRestore_NoCras
     EXPECT_TRUE(connector_->cacheKeys().empty());
     putItemsToCache({2001, 2002}, mem_block_size);
     EXPECT_EQ(connector_->cacheKeys().size(), 2u);
+}
+
+TEST_F(KVCacheMemoryConnectorTest, pinnedHostScratch_SuspendAndResumeRecreatesLazily) {
+    constexpr size_t kBytes = 4096;
+    std::vector<char> host(kBytes, 'p');
+    void*             device = nullptr;
+    ASSERT_EQ(cudaMalloc(&device, kBytes), cudaSuccess);
+
+    auto run_staged_copy = [&]() {
+        StagedMemoryCopyParams params;
+        params.host_base    = host.data();
+        params.host_bytes   = host.size();
+        params.device_index = 0;
+        params.direction    = StagedMemoryCopyDirection::H2D;
+        params.tiles.push_back({device, 0, kBytes});
+
+        std::lock_guard<std::mutex> lock(connector_->staged_copy_scratch_mutex_);
+        ASSERT_FALSE(connector_->staged_copy_suspended_);
+        auto& scratch = connector_->stagedCopyScratchForDevice(params.device_index);
+        ASSERT_TRUE(execStagedMemoryCopy(params, &scratch));
+    };
+
+    run_staged_copy();
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    auto stats = connector_->pinnedHostMemoryStats();
+    EXPECT_EQ(stats.allocation_count, 1u);
+    EXPECT_GE(stats.bytes, kBytes);
+
+    ASSERT_TRUE(connector_->suspendPinnedHostMemory());
+    stats = connector_->pinnedHostMemoryStats();
+    EXPECT_EQ(stats.allocation_count, 0u);
+    EXPECT_EQ(stats.bytes, 0u);
+    EXPECT_TRUE(connector_->staged_copy_scratch_by_device_.empty());
+    EXPECT_TRUE(connector_->staged_copy_suspended_);
+
+    // Suspend is idempotent and must not recreate a scratch allocation.
+    ASSERT_TRUE(connector_->suspendPinnedHostMemory());
+    EXPECT_TRUE(connector_->staged_copy_scratch_by_device_.empty());
+
+    ASSERT_TRUE(connector_->resumePinnedHostMemory());
+    EXPECT_FALSE(connector_->staged_copy_suspended_);
+    EXPECT_TRUE(connector_->staged_copy_scratch_by_device_.empty());
+
+    // Resume itself is allocation-free; the first copy recreates the scratch.
+    run_staged_copy();
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    stats = connector_->pinnedHostMemoryStats();
+    EXPECT_EQ(stats.allocation_count, 1u);
+    EXPECT_GE(stats.bytes, kBytes);
+
+    ASSERT_TRUE(connector_->suspendPinnedHostMemory());
+    ASSERT_TRUE(connector_->resumePinnedHostMemory());
+    stats = connector_->pinnedHostMemoryStats();
+    EXPECT_EQ(stats.allocation_count, 0u);
+    EXPECT_EQ(stats.bytes, 0u);
+
+    EXPECT_EQ(cudaFree(device), cudaSuccess);
 }
 
 }  // namespace rtp_llm::test

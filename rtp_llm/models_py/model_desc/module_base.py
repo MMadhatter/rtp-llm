@@ -51,6 +51,19 @@ class GptModelBase(nn.Module):
         ## (batch_size -> fmha_params)
         self.params_dict: dict[int, Any] = {}
 
+    def release_runtime_host_caches(self) -> None:
+        """Drop model-owned pinned host caches before a Level-3 checkpoint.
+
+        Attention parameter objects are derived from the next request (or CUDA
+        graph recapture), so they must not keep cudaHostAlloc-backed buffers
+        alive across process checkpoint. Persistent configuration stays in the
+        model and these caches are rebuilt lazily.
+        """
+        self.params_dict.clear()
+
+    def restore_runtime_host_caches(self) -> None:
+        """Level-3 wake hook; model host caches are recreated lazily."""
+
     def initialize(self, init_resource: PyModelInitResources) -> bool:
         self.kv_cache = init_resource.kv_cache
         if self.kv_cache is not None:

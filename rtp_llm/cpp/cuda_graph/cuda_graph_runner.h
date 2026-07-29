@@ -95,6 +95,7 @@ public:
     void           initCapture() override;
     void           invalidateCapturedGraphs() override;
     void           recaptureCapturedGraphs() override;
+    void           suspendPinnedHostMemory() override;
     bool           capturedGraphsReady() const override;
     uint64_t       captureGeneration() const override;
     bool           usesCudaGraphVmmRegion() const {

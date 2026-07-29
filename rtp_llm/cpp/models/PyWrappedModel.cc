@@ -124,6 +124,82 @@ void PyWrappedModel::recaptureCudaGraphs() {
     graph_state_ = CudaGraphState();
 }
 
+absl::Status PyWrappedModel::suspendPinnedHostMemory() {
+    if (pinned_host_memory_suspended_) {
+        return absl::OkStatus();
+    }
+
+    absl::Status status = absl::OkStatus();
+    try {
+        py::gil_scoped_acquire gil;
+        if (py_model_ && py::hasattr(py_model_, "release_runtime_host_caches")) {
+            py_model_.attr("release_runtime_host_caches")();
+        }
+    } catch (const py::error_already_set& e) {
+        status = absl::InternalError(std::string("python pinned-host cache release failed: ") + e.what());
+    } catch (const std::exception& e) {
+        status = absl::InternalError(std::string("python pinned-host cache release failed: ") + e.what());
+    }
+
+    try {
+        py::gil_scoped_acquire gil;
+        attention_inputs_                 = torch_ext::PyAttentionInputs();
+        attention_inputs_.headwise_config = py::object();
+        held_attn_pyobj_                  = py::object();
+    } catch (const std::exception& e) {
+        if (status.ok()) {
+            status = absl::InternalError(std::string("model pinned-host reference release failed: ") + e.what());
+        }
+    }
+
+    try {
+        if (graph_runner_ != nullptr) {
+            graph_runner_->suspendPinnedHostMemory();
+        }
+    } catch (const std::exception& e) {
+        if (status.ok()) {
+            status = absl::InternalError(std::string("CUDA graph pinned-host release failed: ") + e.what());
+        }
+    }
+
+    // The Level-3 caller has already drained work and synchronized CUDA.
+    // Unlike releaseBuffers(), clear() discards the two async-safety rounds.
+    const auto holder_stats = buffer_holder_.clear();
+    RTP_LLM_LOG_INFO(
+        "[PinnedHost][owner] PyWrappedModel released tensors=%zu pinned_tensors=%zu pinned_bytes=%zu",
+        holder_stats.tensor_count,
+        holder_stats.pinned_tensor_count,
+        holder_stats.pinned_bytes);
+    d2d_copies_.clear();
+    prepared_attention_inputs_.store(false, std::memory_order_release);
+    graph_state_ = CudaGraphState();
+
+    if (status.ok()) {
+        pinned_host_memory_suspended_ = true;
+    }
+    return status;
+}
+
+absl::Status PyWrappedModel::resumePinnedHostMemory() {
+    if (!pinned_host_memory_suspended_) {
+        return absl::OkStatus();
+    }
+
+    try {
+        py::gil_scoped_acquire gil;
+        if (py_model_ && py::hasattr(py_model_, "restore_runtime_host_caches")) {
+            py_model_.attr("restore_runtime_host_caches")();
+        }
+    } catch (const py::error_already_set& e) {
+        return absl::InternalError(std::string("python pinned-host cache restore failed: ") + e.what());
+    } catch (const std::exception& e) {
+        return absl::InternalError(std::string("model pinned-host cache restore failed: ") + e.what());
+    }
+
+    pinned_host_memory_suspended_ = false;
+    return absl::OkStatus();
+}
+
 torch::Tensor PyWrappedModel::getMtpTargetHiddenStates(int64_t num_tokens) {
     if (!py_model_) {
         return torch::Tensor();

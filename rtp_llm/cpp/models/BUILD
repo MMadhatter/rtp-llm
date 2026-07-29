@@ -80,6 +80,7 @@ cc_library(
         "//rtp_llm/cpp/pybind:py_utils",
         "//rtp_llm/cpp/utils:error_code",
         "@havenask//aios/autil:json",
+        "@com_google_absl//absl/status",
     ] + select({
         "//:using_cuda": ["//rtp_llm/models_py/bindings/cuda/ops:standalone_ops"],
         "//conditions:default": [],

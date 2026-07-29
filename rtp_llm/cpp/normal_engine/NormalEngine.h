@@ -41,6 +41,8 @@ public:
     absl::Status                      pauseAndWaitQuiesced(int64_t timeout_ms) override;
     void                              invalidateCudaGraphs() override;
     void                              recaptureCudaGraphs() override;
+    absl::Status                      suspendPinnedHostMemory() override;
+    absl::Status                      resumePinnedHostMemory() override;
     // Arm the collective sleep-quiesce consensus during commit, after the
     // all-rank prepare/drain barrier. No-op for single-rank. See definition.
     void armCollectiveSleepQuiesce() override;

@@ -27,6 +27,7 @@
 #endif
 #include "autil/TimeUtility.h"
 #include <limits>
+#include <cstring>
 #include <cstdlib>
 #include <memory>
 #include <thread>
@@ -656,17 +657,16 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
         break;  // NOTE: only support one mtp model now
     }
 
-    target_kv_cache_layer_to_group =
-        torch::empty({(int64_t)target_cache_layer_layout.layers_to_kv_buffer_ptrs.size()}, torch::kInt32).pin_memory();
-    draft_kv_cache_layer_to_group =
-        torch::empty({(int64_t)draft_cache_layer_layout.layers_to_kv_buffer_ptrs.size()}, torch::kInt32).pin_memory();
-
-    memcpy(target_kv_cache_layer_to_group.data_ptr<int>(),
-           target_cache_layer_layout.layer_to_groups.data(),
-           target_cache_layer_layout.layer_to_groups.size() * sizeof(int));
-    memcpy(draft_kv_cache_layer_to_group.data_ptr<int>(),
-           draft_cache_layer_layout.layer_to_groups.data(),
-           draft_cache_layer_layout.layer_to_groups.size() * sizeof(int));
+    // Keep pageable source-of-truth across Level-3 checkpoint. The pinned
+    // tensors are derived metadata and are destroyed before checkpoint.
+    target_kv_cache_layer_to_group_values_.assign(target_cache_layer_layout.layer_to_groups.begin(),
+                                                  target_cache_layer_layout.layer_to_groups.end());
+    draft_kv_cache_layer_to_group_values_.assign(draft_cache_layer_layout.layer_to_groups.begin(),
+                                                 draft_cache_layer_layout.layer_to_groups.end());
+    const auto layer_group_status = rebuildKvCacheLayerToGroupPinnedTensors();
+    RTP_LLM_CHECK_WITH_INFO(layer_group_status.ok(),
+                            "failed to initialize MTP pinned layer-group metadata: %s",
+                            layer_group_status.message().data());
 
     const auto& draft_weights = propose_params->getEngineInitParams().gpt_weights;
     d2t_map_                  = draft_model_ ? draft_model_->weights_.d2t_map : draft_weights.d2t_map;
@@ -1838,6 +1838,138 @@ void MtpExecutor::recaptureCudaGraphs() {
     if (sp_prefill_draft_model_) {
         sp_prefill_draft_model_->recaptureCudaGraphs();
     }
+}
+
+absl::Status MtpExecutor::rebuildKvCacheLayerToGroupPinnedTensors() {
+    try {
+        const auto pinned_i32 =
+            torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true);
+        if (!target_kv_cache_layer_to_group.defined()) {
+            target_kv_cache_layer_to_group =
+                torch::empty({static_cast<int64_t>(target_kv_cache_layer_to_group_values_.size())}, pinned_i32);
+            if (!target_kv_cache_layer_to_group_values_.empty()) {
+                std::memcpy(target_kv_cache_layer_to_group.data_ptr<int32_t>(),
+                            target_kv_cache_layer_to_group_values_.data(),
+                            target_kv_cache_layer_to_group_values_.size() * sizeof(int32_t));
+            }
+        }
+        if (!draft_kv_cache_layer_to_group.defined()) {
+            draft_kv_cache_layer_to_group =
+                torch::empty({static_cast<int64_t>(draft_kv_cache_layer_to_group_values_.size())}, pinned_i32);
+            if (!draft_kv_cache_layer_to_group_values_.empty()) {
+                std::memcpy(draft_kv_cache_layer_to_group.data_ptr<int32_t>(),
+                            draft_kv_cache_layer_to_group_values_.data(),
+                            draft_kv_cache_layer_to_group_values_.size() * sizeof(int32_t));
+            }
+        }
+        return absl::OkStatus();
+    } catch (const std::exception& e) {
+        target_kv_cache_layer_to_group = torch::Tensor();
+        draft_kv_cache_layer_to_group  = torch::Tensor();
+        return absl::InternalError(std::string("failed to rebuild MTP pinned layer-group metadata: ") + e.what());
+    }
+}
+
+absl::Status MtpExecutor::suspendPinnedHostMemory() {
+    if (pinned_host_memory_suspended_) {
+        return absl::OkStatus();
+    }
+
+    absl::Status first_error = absl::OkStatus();
+    auto record = [&first_error](const absl::Status& status) {
+        if (first_error.ok() && !status.ok()) {
+            first_error = status;
+        }
+    };
+
+    const auto holder_stats = buffer_holder_.clear();
+    RTP_LLM_LOG_INFO(
+        "[PinnedHost][owner] MtpExecutor released tensors=%zu pinned_tensors=%zu pinned_bytes=%zu",
+        holder_stats.tensor_count,
+        holder_stats.pinned_tensor_count,
+        holder_stats.pinned_bytes);
+    if (model_) {
+        record(model_->suspendPinnedHostMemory());
+    }
+    if (draft_model_) {
+        record(draft_model_->suspendPinnedHostMemory());
+    }
+    if (sp_prefill_draft_model_) {
+        record(sp_prefill_draft_model_->suspendPinnedHostMemory());
+    }
+    if (sampler_) {
+        record(sampler_->suspendPinnedHostMemory());
+    }
+    if (speculative_sampler_) {
+        record(speculative_sampler_->suspendPinnedHostMemory());
+    }
+    if (spec_logits_verify_runner_) {
+        record(spec_logits_verify_runner_->suspendPinnedHostMemory());
+    }
+    if (expert_balancer_) {
+        record(expert_balancer_->suspendPinnedHostMemory());
+    }
+
+    try {
+        if (metrics_accept_len_ready_event_) {
+            metrics_accept_len_ready_event_->synchronize();
+        }
+    } catch (const std::exception& e) {
+        record(absl::InternalError(std::string("MTP metrics D2H synchronization failed: ") + e.what()));
+    }
+    metrics_accept_len_sum_gpu_ = torch::Tensor();
+    metrics_accept_len_sum_cpu_ = torch::Tensor();
+    metrics_accept_len_ready_event_.reset();
+    metrics_accept_len_stream_num_        = 0;
+    metrics_accept_len_propose_token_num_ = 0;
+
+    target_kv_cache_layer_to_group = torch::Tensor();
+    draft_kv_cache_layer_to_group  = torch::Tensor();
+
+    if (first_error.ok()) {
+        pinned_host_memory_suspended_ = true;
+    }
+    return first_error;
+}
+
+absl::Status MtpExecutor::resumePinnedHostMemory() {
+    if (!pinned_host_memory_suspended_) {
+        return absl::OkStatus();
+    }
+
+    absl::Status first_error = rebuildKvCacheLayerToGroupPinnedTensors();
+    auto record = [&first_error](const absl::Status& status) {
+        if (first_error.ok() && !status.ok()) {
+            first_error = status;
+        }
+    };
+
+    if (model_) {
+        record(model_->resumePinnedHostMemory());
+    }
+    if (draft_model_) {
+        record(draft_model_->resumePinnedHostMemory());
+    }
+    if (sp_prefill_draft_model_) {
+        record(sp_prefill_draft_model_->resumePinnedHostMemory());
+    }
+    if (sampler_) {
+        record(sampler_->resumePinnedHostMemory());
+    }
+    if (speculative_sampler_) {
+        record(speculative_sampler_->resumePinnedHostMemory());
+    }
+    if (spec_logits_verify_runner_) {
+        record(spec_logits_verify_runner_->resumePinnedHostMemory());
+    }
+    if (expert_balancer_) {
+        record(expert_balancer_->resumePinnedHostMemory());
+    }
+
+    if (first_error.ok()) {
+        pinned_host_memory_suspended_ = false;
+    }
+    return first_error;
 }
 
 absl::Status MtpExecutor::drainAsyncRunners() {

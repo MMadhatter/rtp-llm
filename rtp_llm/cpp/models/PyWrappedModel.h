@@ -62,6 +62,8 @@ public:
     void            releaseBuffers() override;
     void            invalidateCudaGraphs() override;
     void            recaptureCudaGraphs() override;
+    absl::Status    suspendPinnedHostMemory() override;
+    absl::Status    resumePinnedHostMemory() override;
     torch::Tensor   getMtpTargetHiddenStates(int64_t num_tokens) override;
     torch::Tensor   getMtpLastHiddenStates(int64_t num_tokens) override;
     void            prepareAttentionInputs(const GptModelInputs& inputs) override;
@@ -138,6 +140,7 @@ private:
     std::atomic<bool>            prepared_attention_inputs_{false};
     torch_ext::PyAttentionInputs attention_inputs_;
     CudaGraphState               graph_state_;
+    bool                         pinned_host_memory_suspended_{false};
 };
 
 // NOTE(wangyin): constructor can not be compiled correctly when placed in cc file.

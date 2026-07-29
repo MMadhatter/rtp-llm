@@ -81,4 +81,28 @@ TEST_F(ModelDataTest, testTensorHolderReleasesOnThirdRound) {
     EXPECT_EQ(holder.clear_tensors.front().front().data_ptr(), t1.data_ptr());
 }
 
+TEST_F(ModelDataTest, testTensorHolderClearDropsCurrentAndReleasedRounds) {
+    TensorHolder holder;
+    auto         pinned_current =
+        torch::empty({8}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true));
+    auto pinned_released =
+        torch::empty({4}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+    auto unpinned_released = torch::empty({2}, torch::kFloat32);
+
+    holder.hold(pinned_released);
+    holder.hold(unpinned_released);
+    holder.release();
+    holder.hold(pinned_current);
+
+    const auto stats = holder.clear();
+
+    EXPECT_EQ(stats.tensor_count, 3);
+    EXPECT_EQ(stats.pinned_tensor_count, 2);
+    EXPECT_EQ(stats.pinned_bytes,
+              pinned_current.numel() * pinned_current.element_size()
+                  + pinned_released.numel() * pinned_released.element_size());
+    EXPECT_TRUE(holder.tensors.empty());
+    EXPECT_TRUE(holder.clear_tensors.empty());
+}
+
 }  // namespace rtp_llm

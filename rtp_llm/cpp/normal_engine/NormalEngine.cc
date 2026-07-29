@@ -568,6 +568,14 @@ void NormalEngine::recaptureCudaGraphs() {
     }
 }
 
+absl::Status NormalEngine::suspendPinnedHostMemory() {
+    return executor_ ? executor_->suspendPinnedHostMemory() : absl::OkStatus();
+}
+
+absl::Status NormalEngine::resumePinnedHostMemory() {
+    return executor_ ? executor_->resumePinnedHostMemory() : absl::OkStatus();
+}
+
 void NormalEngine::recordPauseQuiesceFailure(uint64_t pause_epoch, const absl::Status& status) {
     if (status.ok()) {
         return;

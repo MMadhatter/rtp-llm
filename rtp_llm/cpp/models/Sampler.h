@@ -1,5 +1,6 @@
 #pragma once
 
+#include "absl/status/status.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorStates.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/models_py/bindings/core/TensorHolder.h"
@@ -15,6 +16,8 @@ public:
     ~Sampler() {};
 
     virtual SamplerOutput forward(const SamplerInputs& inputs);
+    virtual absl::Status  suspendPinnedHostMemory();
+    virtual absl::Status  resumePinnedHostMemory();
 
 private:
     void preprocessLogits(const SamplerInputs& inputs);

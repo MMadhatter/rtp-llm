@@ -9,6 +9,7 @@
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
 #include "rtp_llm/models_py/bindings/core/TensorHolder.h"
+#include "absl/status/status.h"
 #include <string>
 #include <utility>
 #include <memory>
@@ -125,6 +126,12 @@ public:
     virtual void            releaseBuffers() {}
     virtual void            invalidateCudaGraphs() {}
     virtual void            recaptureCudaGraphs() {}
+    virtual absl::Status suspendPinnedHostMemory() {
+        return absl::OkStatus();
+    }
+    virtual absl::Status resumePinnedHostMemory() {
+        return absl::OkStatus();
+    }
     virtual void            prepareAttentionInputs(const GptModelInputs& inputs) {}
 
     // Refresh only kv_cache_kernel_block_id-dependent state on a previously-

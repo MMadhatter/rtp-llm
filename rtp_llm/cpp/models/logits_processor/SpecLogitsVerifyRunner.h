@@ -5,6 +5,7 @@
 
 #include <torch/torch.h>
 
+#include "absl/status/status.h"
 #include "rtp_llm/cpp/models/logits_processor/SpecLogitsProcessor.h"
 
 namespace rtp_llm {
@@ -52,6 +53,8 @@ public:
     SpecLogitsVerifyRunner();
 
     LaunchResult buildInline(const LaunchTask& task);
+    absl::Status suspendPinnedHostMemory();
+    absl::Status resumePinnedHostMemory();
 
 private:
     void ensureBuffersFit(size_t total_streams, int propose_step, size_t vocab_size, size_t bitmask_words);

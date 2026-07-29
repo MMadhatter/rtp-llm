@@ -50,6 +50,22 @@ void EplbPlanBuffers::init(size_t    log_exp_num,
     }
 }
 
+void EplbPlanBuffers::suspendPinnedHostMemory() {
+    logic_expert_cnt_host = torch::Tensor();
+    log2phy_host          = torch::Tensor();
+}
+
+void EplbPlanBuffers::resumePinnedHostMemory() {
+    const auto pinned_i32 =
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true);
+    if (!logic_expert_cnt_host.defined()) {
+        logic_expert_cnt_host = torch::zeros(logic_expert_cnt.sizes(), pinned_i32);
+    }
+    if (!log2phy_host.defined()) {
+        log2phy_host = torch::zeros(log2phy.sizes(), pinned_i32);
+    }
+}
+
 void BalanceStatsBuffers::init(int layer_num, int log_exp_num, int ep_size) {
     // host tensors
     log_stats = torch::zeros({layer_num, log_exp_num}, torch::kInt32);
@@ -71,6 +87,17 @@ void LoadFlags::init() {
     flag_gpu  = torch::zeros({1}, torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
     flag_sync = torch::zeros({1}, torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
     flag_host = torch::zeros({1}, torch::kInt32).pin_memory();
+}
+
+void LoadFlags::suspendPinnedHostMemory() {
+    flag_host = torch::Tensor();
+}
+
+void LoadFlags::resumePinnedHostMemory() {
+    if (!flag_host.defined()) {
+        flag_host = torch::zeros(
+            {1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+    }
 }
 
 void LoadFlags::setReady(bool ready) {
@@ -103,6 +130,20 @@ void EplbController::init(const EPLBConfig& eplb_control_data, const EPLBConfig&
     eplb_control_data_buf_host   = torch::zeros({(int64_t)eplb_control_data_list.size()}, torch::kInt32).pin_memory();
     eplb_control_data_buf_device = torch::zeros({(int64_t)eplb_control_data_list.size()},
                                                 torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
+}
+
+void EplbController::suspendPinnedHostMemory() {
+    lock_guard<mutex> lock(eplb_control_mutex);
+    eplb_control_data_buf_host = torch::Tensor();
+}
+
+void EplbController::resumePinnedHostMemory() {
+    lock_guard<mutex> lock(eplb_control_mutex);
+    if (!eplb_control_data_buf_host.defined()) {
+        eplb_control_data_buf_host =
+            torch::zeros(eplb_control_data_buf_device.sizes(),
+                         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+    }
 }
 
 void EplbController::setData(const EPLBConfig& updated_control_data) {
@@ -210,6 +251,37 @@ void ExpertBalancer::stepForward(ModelBase& model, RtpLLMExecutorMetricsCollecto
 bool ExpertBalancer::updateEplbConfig(const EPLBConfig& config) {
     eplb_controller_.setData(config);
     return true;
+}
+
+absl::Status ExpertBalancer::suspendPinnedHostMemory() {
+    if (pinned_host_memory_suspended_) {
+        return absl::OkStatus();
+    }
+    if (getPlanStatus() == EplbPlanStatus::LOADING) {
+        return absl::FailedPreconditionError(
+            "cannot suspend EPLB pinned-host memory while its detached weight loader is active");
+    }
+
+    eplb_plan_buffers_.suspendPinnedHostMemory();
+    load_flags_.suspendPinnedHostMemory();
+    eplb_controller_.suspendPinnedHostMemory();
+    pinned_host_memory_suspended_ = true;
+    return absl::OkStatus();
+}
+
+absl::Status ExpertBalancer::resumePinnedHostMemory() {
+    if (!pinned_host_memory_suspended_) {
+        return absl::OkStatus();
+    }
+    try {
+        eplb_plan_buffers_.resumePinnedHostMemory();
+        load_flags_.resumePinnedHostMemory();
+        eplb_controller_.resumePinnedHostMemory();
+    } catch (const std::exception& e) {
+        return absl::InternalError(std::string("failed to rebuild EPLB pinned-host buffers: ") + e.what());
+    }
+    pinned_host_memory_suspended_ = false;
+    return absl::OkStatus();
 }
 
 void ExpertBalancer::syncController() {

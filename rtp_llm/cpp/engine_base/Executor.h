@@ -27,6 +27,17 @@ public:
     virtual void invalidateCudaGraphs() {}
     virtual void recaptureCudaGraphs() {}
 
+    // Level-3 checkpoint lifecycle. The caller must quiesce all executor work
+    // and synchronize CUDA before suspend. Implementations release every
+    // process-owned pinned-host allocation; resume recreates only persistent
+    // metadata while request-scoped staging stays lazy.
+    virtual absl::Status suspendPinnedHostMemory() {
+        return absl::OkStatus();
+    }
+    virtual absl::Status resumePinnedHostMemory() {
+        return absl::OkStatus();
+    }
+
     // Drain outstanding stream-async worker tasks before a sleep pause is acknowledged.
     // Returning an error keeps the lifecycle from releasing weights/KV after a failed drain.
     virtual absl::Status drainAsyncRunners() {

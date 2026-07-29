@@ -218,6 +218,67 @@ absl::Status NormalExecutor::drainAsyncRunners() {
     }
 }
 
+absl::Status NormalExecutor::suspendPinnedHostMemory() {
+    if (pinned_host_memory_suspended_) {
+        return absl::OkStatus();
+    }
+
+    // The sleep controller has drained the executor and synchronized CUDA.
+    // clear(), unlike the hot-path release(), also drops the two safety rounds.
+    const auto holder_stats = buffer_holder_.clear();
+    RTP_LLM_LOG_INFO(
+        "[PinnedHost][owner] NormalExecutor released tensors=%zu pinned_tensors=%zu pinned_bytes=%zu",
+        holder_stats.tensor_count,
+        holder_stats.pinned_tensor_count,
+        holder_stats.pinned_bytes);
+
+    absl::Status first_error = absl::OkStatus();
+    auto record = [&first_error](const absl::Status& status) {
+        if (first_error.ok() && !status.ok()) {
+            first_error = status;
+        }
+    };
+    if (model_) {
+        record(model_->suspendPinnedHostMemory());
+    }
+    if (sampler_) {
+        record(sampler_->suspendPinnedHostMemory());
+    }
+    if (expert_balancer_) {
+        record(expert_balancer_->suspendPinnedHostMemory());
+    }
+    if (first_error.ok()) {
+        pinned_host_memory_suspended_ = true;
+    }
+    return first_error;
+}
+
+absl::Status NormalExecutor::resumePinnedHostMemory() {
+    if (!pinned_host_memory_suspended_) {
+        return absl::OkStatus();
+    }
+
+    absl::Status first_error = absl::OkStatus();
+    auto record = [&first_error](const absl::Status& status) {
+        if (first_error.ok() && !status.ok()) {
+            first_error = status;
+        }
+    };
+    if (model_) {
+        record(model_->resumePinnedHostMemory());
+    }
+    if (sampler_) {
+        record(sampler_->resumePinnedHostMemory());
+    }
+    if (expert_balancer_) {
+        record(expert_balancer_->resumePinnedHostMemory());
+    }
+    if (first_error.ok()) {
+        pinned_host_memory_suspended_ = false;
+    }
+    return first_error;
+}
+
 absl::Status
 NormalExecutor::processImpl(const std::list<GenerateStreamPtr>& streams, int64_t schedule_time_us, bool pause_signal) {
     const int64_t process_start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();

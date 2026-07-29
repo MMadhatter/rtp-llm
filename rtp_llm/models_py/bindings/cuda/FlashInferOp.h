@@ -47,6 +47,6 @@ protected:
     bool             enable_cuda_graph_;
 };
 
-void registerFlashInferOp(const py::module& m);
+void registerFlashInferOp(py::module& m);
 
 }  // namespace rtp_llm

@@ -215,6 +215,15 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
                           std::move(all_success)});
 }
 
+absl::Status Sampler::suspendPinnedHostMemory() {
+    buffer_holder_.clear();
+    return absl::OkStatus();
+}
+
+absl::Status Sampler::resumePinnedHostMemory() {
+    return absl::OkStatus();
+}
+
 void Sampler::preprocessLogits(const SamplerInputs& inputs) {
     if (inputs.logits_processor_states_ptr != nullptr) {
         inputs.logits_processor_states_ptr->batchProcess(inputs);

@@ -210,6 +210,12 @@ struct SleepHooks {
     std::function<bool(const std::string&, int64_t, bool)> coordinateResourcePhase;
     std::function<bool(const SleepOptions&)>               teardownCollectives;
     std::function<bool()>                                  rebuildCollectives;
+    // Level-3 only: after all CUDA work and collective teardown have completed,
+    // destroy every live CUDA pinned-host allocation before process checkpoint.
+    // After restore, recreate only persistent pinned metadata; transient staging
+    // buffers are allocated lazily by the next request.
+    std::function<bool()> suspendPinnedHostMemory;
+    std::function<bool()> resumePinnedHostMemory;
     // Recreate transport-owned mempools/listeners/QPs after CUDA restore and
     // memory restoration, but before KV MRs are registered and advertised.
     std::function<bool()> rebuildRdmaTransports;

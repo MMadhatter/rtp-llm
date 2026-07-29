@@ -275,6 +275,10 @@ TEST(SleepLifecycleControllerTest, LevelThreeHooksRunInDependencyOrder) {
         calls.push_back("teardown_collectives");
         return true;
     };
+    hooks.suspendPinnedHostMemory = [&calls]() {
+        calls.push_back("suspend_pinned_host");
+        return true;
+    };
     hooks.releaseKvMemoryBacking = [&calls](const SleepOptions&) {
         calls.push_back("release_kv");
         return true;
@@ -293,6 +297,10 @@ TEST(SleepLifecycleControllerTest, LevelThreeHooksRunInDependencyOrder) {
     };
     hooks.rebuildCollectives = [&calls]() {
         calls.push_back("rebuild_collectives");
+        return true;
+    };
+    hooks.resumePinnedHostMemory = [&calls]() {
+        calls.push_back("resume_pinned_host");
         return true;
     };
     hooks.rebuildRdmaTransports = [&calls]() {
@@ -345,12 +353,16 @@ TEST(SleepLifecycleControllerTest, LevelThreeHooksRunInDependencyOrder) {
                                         "teardown_collectives",
                                         "collective_teardown_done",
                                         "release_kv",
+                                        "suspend_pinned_host",
+                                        "pinned_host_suspend_done",
                                         "release_weights",
                                         "restore_weights",
                                         "restore_kv",
                                         "collective_rebuild_ready",
                                         "rebuild_collectives",
                                         "collective_rebuild_done",
+                                        "resume_pinned_host",
+                                        "pinned_host_resume_done",
                                         "rebuild_rdma",
                                         "register_mr",
                                         "graph_recapture_ready",
@@ -416,6 +428,38 @@ TEST(SleepLifecycleControllerTest, LevelThreeTeardownDoneCoordinatesLocalFailure
     EXPECT_EQ(controller.state(), SleepState::ERROR);
 }
 
+TEST(SleepLifecycleControllerTest, LevelThreePinnedHostSuspendFailureStopsBeforeRestorableGpuRelease) {
+    SleepLifecycleController controller(true);
+    controller.setConfiguredLevel(3);
+
+    std::vector<std::tuple<std::string, int64_t, bool>> phases;
+    int                                                 release_gpu_called = 0;
+    SleepHooks                                          hooks;
+    hooks.coordinateResourcePhase = [&phases](const std::string& phase, int64_t epoch, bool local_success) {
+        phases.emplace_back(phase, epoch, local_success);
+        return local_success;
+    };
+    hooks.suspendPinnedHostMemory = []() { return false; };
+    hooks.releaseRestorableGpuMemory = [&release_gpu_called](const SleepOptions&) {
+        ++release_gpu_called;
+        return true;
+    };
+    controller.setHooks(hooks);
+
+    auto opt  = gracefulOptions();
+    opt.level = 3;
+    EXPECT_FALSE(controller.sleep(opt).ok);
+
+    ASSERT_EQ(phases.size(), 3);
+    EXPECT_EQ(std::get<0>(phases[0]), "collective_teardown_ready");
+    EXPECT_EQ(std::get<0>(phases[1]), "collective_teardown_done");
+    EXPECT_EQ(std::get<0>(phases[2]), "pinned_host_suspend_done");
+    EXPECT_FALSE(std::get<2>(phases[2]));
+    EXPECT_EQ(release_gpu_called, 0);
+    EXPECT_EQ(controller.state(), SleepState::ERROR);
+    EXPECT_NE(controller.status().last_error.find("suspendPinnedHostMemory"), std::string::npos);
+}
+
 TEST(SleepLifecycleControllerTest, LevelThreeRebuildReadyCoordinatesLocalFailure) {
     SleepLifecycleController controller(true);
     controller.setConfiguredLevel(3);
@@ -474,6 +518,45 @@ TEST(SleepLifecycleControllerTest, LevelThreeRebuildDoneCoordinatesLocalFailure)
     EXPECT_EQ(std::get<1>(phases[1]), 1);
     EXPECT_FALSE(std::get<2>(phases[1]));
     EXPECT_EQ(controller.state(), SleepState::ERROR);
+}
+
+TEST(SleepLifecycleControllerTest, LevelThreePinnedHostResumeFailureStopsBeforeRdmaRebuild) {
+    SleepLifecycleController controller(true);
+    controller.setConfiguredLevel(3);
+
+    std::vector<std::tuple<std::string, int64_t, bool>> phases;
+    int                                                 rebuild_rdma_called = 0;
+    SleepHooks                                          hooks;
+    hooks.coordinateResourcePhase = [&phases](const std::string& phase, int64_t epoch, bool local_success) {
+        phases.emplace_back(phase, epoch, local_success);
+        return local_success;
+    };
+    hooks.resumePinnedHostMemory = []() { return false; };
+    hooks.rebuildRdmaTransports  = [&rebuild_rdma_called]() {
+        ++rebuild_rdma_called;
+        return true;
+    };
+    controller.setHooks(hooks);
+
+    auto opt  = gracefulOptions();
+    opt.level = 3;
+    ASSERT_TRUE(controller.sleep(opt).ok);
+    phases.clear();
+
+    EXPECT_FALSE(controller.wakeUp().ok);
+    ASSERT_EQ(phases.size(), 4);
+    EXPECT_EQ(std::get<0>(phases[0]), "collective_rebuild_ready");
+    EXPECT_EQ(std::get<0>(phases[1]), "collective_rebuild_done");
+    EXPECT_EQ(std::get<0>(phases[2]), "pinned_host_resume_done");
+    EXPECT_FALSE(std::get<2>(phases[2]));
+    // Even after a local restore failure, Level 3 still enters the next
+    // all-rank ready gate with local_success=false so peers cannot recapture
+    // graphs against a half-restored rank.
+    EXPECT_EQ(std::get<0>(phases[3]), "graph_recapture_ready");
+    EXPECT_FALSE(std::get<2>(phases[3]));
+    EXPECT_EQ(rebuild_rdma_called, 0);
+    EXPECT_EQ(controller.state(), SleepState::ERROR);
+    EXPECT_NE(controller.status().last_error.find("resumePinnedHostMemory"), std::string::npos);
 }
 
 TEST(SleepLifecycleControllerTest, LevelThreeGraphReadyCoordinatesLocalFailure) {
@@ -809,6 +892,14 @@ TEST(SleepLifecycleControllerTest, LevelOneAndTwoGateTransfersWithoutRunningLeve
             return true;
         };
         hooks.rebuildCollectives = [&level_three_calls]() {
+            ++level_three_calls;
+            return true;
+        };
+        hooks.suspendPinnedHostMemory = [&level_three_calls]() {
+            ++level_three_calls;
+            return true;
+        };
+        hooks.resumePinnedHostMemory = [&level_three_calls]() {
             ++level_three_calls;
             return true;
         };

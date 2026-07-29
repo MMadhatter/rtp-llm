@@ -82,6 +82,7 @@ cc_library(
         "//rtp_llm/cpp/engine_base:profiler",
         "//rtp_llm/cpp/engine_base/sleep:admission_gate",
         "//rtp_llm/cpp/engine_base/sleep:drain_manager",
+        "//rtp_llm/cpp/engine_base/sleep:pinned_host_memory_verifier",
         "//rtp_llm/cpp/engine_base/sleep:sleep_memory_policy",
         "//rtp_llm/cpp/cache:kv_cache_physical_memory_controller",
         "//rtp_llm/cpp/cache/connector",

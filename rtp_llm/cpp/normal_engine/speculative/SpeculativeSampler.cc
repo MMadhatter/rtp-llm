@@ -38,6 +38,15 @@ SpeculativeSamplerOutput SpeculativeSampler::forward(const std::list<GenerateStr
     return sample_output;
 }
 
+absl::Status SpeculativeSampler::suspendPinnedHostMemory() {
+    buffer_holder_.clear();
+    return absl::OkStatus();
+}
+
+absl::Status SpeculativeSampler::resumePinnedHostMemory() {
+    return absl::OkStatus();
+}
+
 void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_output,
                                      const std::list<GenerateStreamPtr>& streams,
                                      SamplerOutput&                      draft_sampler_output,

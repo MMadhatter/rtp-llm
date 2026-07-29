@@ -1,8 +1,37 @@
 load("//:def.bzl", "copts")
+load("//bazel:arch_select.bzl", "torch_deps")
 
 cc_library(
     name = "sleep_memory_policy",
     hdrs = ["SleepMemoryPolicy.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "pinned_host_memory_stats",
+    srcs = ["PinnedHostMemoryStats.cc"],
+    hdrs = ["PinnedHostMemoryVerifier.h"],
+    copts = copts(),
+    deps = [
+        "@com_google_absl//absl/status",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "pinned_host_memory_verifier",
+    srcs = ["PinnedHostMemoryVerifier.cc"],
+    copts = copts(),
+    deps = [
+        ":pinned_host_memory_stats",
+        "//rtp_llm/cpp/utils:core_utils",
+        "@com_google_absl//absl/status",
+    ] + torch_deps() + select({
+        "//:using_cuda": [
+            "@local_config_cuda//cuda:cuda_headers",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
 )
 

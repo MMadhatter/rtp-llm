@@ -173,8 +173,20 @@ public:
         ++recapture_count;
     }
 
+    absl::Status suspendPinnedHostMemory() override {
+        ++suspend_pinned_count;
+        return absl::OkStatus();
+    }
+
+    absl::Status resumePinnedHostMemory() override {
+        ++resume_pinned_count;
+        return absl::OkStatus();
+    }
+
     int invalidate_count{0};
     int recapture_count{0};
+    int suspend_pinned_count{0};
+    int resume_pinned_count{0};
 };
 
 class FakeFastTopKSampler: public spec::FastTopKSampler {
@@ -527,6 +539,62 @@ TEST_F(MtpExecutorTest, testCudaGraphLifecycleCoversAllModelsForTwoCycles) {
         EXPECT_EQ(target_view->recapture_count, cycle);
         EXPECT_EQ(draft_view->recapture_count, cycle);
         EXPECT_EQ(sp_view->recapture_count, cycle);
+    }
+}
+
+TEST_F(MtpExecutorTest, testPinnedHostLifecycleRebuildsPersistentMetadataAndIsIdempotent) {
+    MtpExecutorTestConfig test_config;
+    auto                  components = createMtpExecutorComponents(test_config);
+
+    auto  target      = std::make_unique<CudaGraphLifecycleFakeModel>();
+    auto  draft       = std::make_unique<CudaGraphLifecycleFakeModel>();
+    auto  sp_prefill  = std::make_shared<CudaGraphLifecycleFakeModel>();
+    auto* target_view = target.get();
+    auto* draft_view  = draft.get();
+    auto* sp_view     = sp_prefill.get();
+    components.executor->setTargetModel(std::move(target));
+    components.executor->setDraftModel(std::move(draft));
+    components.executor->sp_prefill_draft_model_ = std::move(sp_prefill);
+
+    const auto expected_target = components.executor->target_kv_cache_layer_to_group.clone();
+    const auto expected_draft  = components.executor->draft_kv_cache_layer_to_group.clone();
+
+    auto pinned_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true);
+    components.executor->buffer_holder_.hold(torch::ones({4}, pinned_i32));
+    components.executor->sampler_->buffer_holder_.hold(torch::ones({4}, pinned_i32));
+    components.executor->speculative_sampler_->buffer_holder_.hold(torch::ones({4}, pinned_i32));
+    components.executor->spec_logits_verify_runner_->draft_tokens_cpu_ = torch::ones({4}, pinned_i32);
+    components.executor->spec_logits_verify_runner_->spec_cap_cpu_     = torch::ones({4}, pinned_i32);
+    components.executor->metrics_accept_len_sum_cpu_                   = torch::ones({1}, pinned_i32);
+
+    for (int cycle = 1; cycle <= 2; ++cycle) {
+        ASSERT_TRUE(components.executor->suspendPinnedHostMemory().ok());
+        ASSERT_TRUE(components.executor->suspendPinnedHostMemory().ok());
+
+        EXPECT_FALSE(components.executor->target_kv_cache_layer_to_group.defined());
+        EXPECT_FALSE(components.executor->draft_kv_cache_layer_to_group.defined());
+        EXPECT_FALSE(components.executor->metrics_accept_len_sum_cpu_.defined());
+        EXPECT_TRUE(components.executor->buffer_holder_.tensors.empty());
+        EXPECT_TRUE(components.executor->buffer_holder_.clear_tensors.empty());
+        EXPECT_TRUE(components.executor->sampler_->buffer_holder_.tensors.empty());
+        EXPECT_TRUE(components.executor->sampler_->buffer_holder_.clear_tensors.empty());
+        EXPECT_TRUE(components.executor->speculative_sampler_->buffer_holder_.tensors.empty());
+        EXPECT_TRUE(components.executor->speculative_sampler_->buffer_holder_.clear_tensors.empty());
+        EXPECT_FALSE(components.executor->spec_logits_verify_runner_->draft_tokens_cpu_.defined());
+        EXPECT_FALSE(components.executor->spec_logits_verify_runner_->spec_cap_cpu_.defined());
+        EXPECT_EQ(target_view->suspend_pinned_count, cycle);
+        EXPECT_EQ(draft_view->suspend_pinned_count, cycle);
+        EXPECT_EQ(sp_view->suspend_pinned_count, cycle);
+
+        ASSERT_TRUE(components.executor->resumePinnedHostMemory().ok());
+        ASSERT_TRUE(components.executor->resumePinnedHostMemory().ok());
+        checkTensorEqual(components.executor->target_kv_cache_layer_to_group, expected_target);
+        checkTensorEqual(components.executor->draft_kv_cache_layer_to_group, expected_draft);
+        EXPECT_TRUE(components.executor->target_kv_cache_layer_to_group.is_pinned());
+        EXPECT_TRUE(components.executor->draft_kv_cache_layer_to_group.is_pinned());
+        EXPECT_EQ(target_view->resume_pinned_count, cycle);
+        EXPECT_EQ(draft_view->resume_pinned_count, cycle);
+        EXPECT_EQ(sp_view->resume_pinned_count, cycle);
     }
 }
 

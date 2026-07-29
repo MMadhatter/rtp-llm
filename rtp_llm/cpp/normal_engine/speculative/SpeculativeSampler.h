@@ -1,5 +1,6 @@
 #pragma once
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "c10/core/Event.h"
 #include "rtp_llm/cpp/engine_base/EngineInitParams.h"
@@ -48,6 +49,8 @@ public:
     virtual SpeculativeSamplerOutput forward(const std::list<GenerateStreamPtr>& streams,
                                              SamplerOutput&                      draft_sampler_output,
                                              SamplerOutput&                      target_sampler_output);
+    virtual absl::Status suspendPinnedHostMemory();
+    virtual absl::Status resumePinnedHostMemory();
 
 private:
     void batchSample(SpeculativeSamplerOutput&           sample_output,

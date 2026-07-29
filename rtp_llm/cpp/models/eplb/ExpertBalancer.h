@@ -1,5 +1,6 @@
 #pragma once
 
+#include "absl/status/status.h"
 #include <torch/extension.h>
 #include "rtp_llm/cpp/models/eplb/ExpertBalancerPythonWrapper.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
@@ -39,6 +40,8 @@ struct EplbPlanBuffers {
               size_t    ep_size,
               DataType  dtype,
               QuantAlgo quant_algo);
+    void suspendPinnedHostMemory();
+    void resumePinnedHostMemory();
 };
 
 struct BalanceStatsBuffers {
@@ -57,6 +60,8 @@ struct LoadFlags {
     torch::Tensor flag_host;  // [1], INT32, CPU pinned
 
     void init();
+    void suspendPinnedHostMemory();
+    void resumePinnedHostMemory();
 
     void setReady(bool ready);
     bool isReady(size_t world_size);
@@ -82,6 +87,8 @@ private:
 
 public:
     void       init(const EPLBConfig& eplb_control_data, const EPLBConfig& eplb_config);
+    void       suspendPinnedHostMemory();
+    void       resumePinnedHostMemory();
     void       setData(const EPLBConfig& updated_control_data);
     bool       stepAndCheckSyncStep();
     EPLBConfig getAndSyncData(size_t world_size);
@@ -107,6 +114,8 @@ public:
     void stepForward(ModelBase& model, RtpLLMExecutorMetricsCollector& executor_collector);
 
     bool updateEplbConfig(const EPLBConfig& config);
+    absl::Status suspendPinnedHostMemory();
+    absl::Status resumePinnedHostMemory();
 
 private:
     void syncController();
@@ -160,6 +169,7 @@ private:
     mutable std::mutex eplb_plan_status_mutex_;
 
     bool test_mode_ = false;
+    bool pinned_host_memory_suspended_ = false;
 };
 
 }  // namespace rtp_llm

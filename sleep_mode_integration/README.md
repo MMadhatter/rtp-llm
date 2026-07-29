@@ -215,54 +215,52 @@ verify the deterministic device-memory pattern after restoration. Symbol
 presence or a successful `Restore` without a successful `Unlock` is not treated
 as checkpoint/restore support.
 
-## PyTorch pinned-host cache
+## Level 3 pinned-host lifecycle
 
-A GB300 failure was isolated from NVLS and the multicast keeper to PyTorch's
-pinned-host caching allocator. The observed sequence was:
+On GB300, the Driver API can accept `cuCheckpointProcessCheckpoint` and then
+return CUDA error 801 (`operation not supported`) from restore when a live
+CUDA-pinned host allocation was recorded in the checkpoint. A native probe
+reproduced the failure with a single 4 KiB allocation, so flushing only free
+PyTorch cache blocks is not sufficient: every pinned-host owner must release
+its live allocation before Level 3 enters process checkpoint.
 
-1. Level 3 checkpoint succeeded and released GPU memory.
-2. Wake failed in `cuCheckpointProcessRestore` with CUDA error 801
-   (`operation not supported`).
-3. A minimal PyTorch process reproduced the failure after `Tensor.item()`
-   created a D2H scalar staging allocation and returned the now-unused pinned
-   block to PyTorch's host cache.
-4. Flushing the host cache before checkpoint made the minimal
-   checkpoint/restore sequence pass.
+The Level 3 lifecycle is therefore fail-closed:
 
-RTP-LLM therefore calls
-`at::getHostAllocator(at::kCUDA)->empty_cache()` beside the CUDA device
-allocator flush after requests and transfers have drained. It runs for every
-sleep level. A Level 3 flush failure stops the process checkpoint; Level 1/2
-log the failure and continue because they do not use the process checkpoint
-API.
+1. drain requests, asynchronous executor work, and KV/PD transfers;
+2. tear down collectives and release KV/memory-cache backing;
+3. suspend Engine/Executor/Model/Sampler/EPLB/CUDA-graph pinned owners;
+4. release raw KV staged-copy `cudaHostAlloc` scratch and reject late staged
+   copies while suspended;
+5. clear derived FlashInfer parameter caches;
+6. flush PyTorch's caching host allocator and require its authoritative
+   backing-block counters, `allocations` and `allocated_bytes`, to be zero.
 
-The flush releases only unoccupied cached pinned blocks. It intentionally does
-not release ordinary pageable CPU tensors or pinned tensors that still have
-live owners. Do not require the host allocator's active allocation counters to
-reach zero. NVIDIA documents that host memory allocated by `cudaMallocHost`
-and similar APIs remains valid while CUDA is checkpointed, and PyTorch defines
-its host-cache flush as releasing unoccupied cached memory:
+Some PyTorch versions leave `active_bytes` and `active_requests` stale after a
+no-event free. They may remain non-zero even when `empty_cache()` has released
+every backing block. RTP-LLM retains those fields as telemetry and emits a
+warning for that contradictory state, but does not mistake them for live
+physical allocations. A non-zero backing counter or owner teardown failure
+rejects sleep before the CUDA checkpoint RPC.
 
-- <https://developer.nvidia.com/blog/checkpointing-cuda-applications-with-criu/>
-- <https://docs.pytorch.org/docs/stable/generated/torch.accelerator.memory.empty_host_cache.html>
+Wake recreates only persistent metadata; request-scoped and copy-staging
+buffers are rebuilt lazily. Level 1/2 do not process-checkpoint and retain
+their previous best-effort free-cache flush without the zero-live-allocation
+requirement.
 
-Keep `pinned_reserve_segment_size_mb` at its default value of zero for Level 3
-until that non-reclaimable allocator mode has been validated separately.
-RTP-LLM does not set it. Known subsystem-owned resources still follow their
-normal lifecycle: outstanding asynchronous copies must be drained, registered
-MRs must be deregistered, and disposable KV host backing must be released
-before checkpoint.
+Keep `pinned_reserve_segment_size_mb` at its default value of zero for Level 3.
+RTP-LLM does not set it.
 
-A successful flush produces one line per rank:
+A successful Level 3 transition produces these lines once per rank:
 
 ```text
-sleep level-3 CUDA pinned-host cache flush: active_bytes=...->... allocated_bytes=...->... active_requests=...->... allocations=...->...
+[PinnedHost][owners] level=3 phase=suspend local_rank=... engine=PASS kv_pd_connector=PASS flashinfer_cache=PASS result=PASS
+[PinnedHost][verify] before={...} after={active_bytes=... active_requests=... allocations=0 allocated_bytes=0}
+[PinnedHost][checkpoint-gate] PASS level=3 local_rank=... owners_suspended=1 torch_backing_empty=1 backing_allocations=0 backing_bytes=0 active_requests_telemetry=... active_bytes_telemetry=... active_counters_stale=... action=allow_checkpoint
 ```
 
-Non-zero active counters are expected when the engine intentionally retains
-live pinned tensors. To reproduce the old cached-block path in the manual
-checkpoint integration test, set
-`RTP_LLM_CHECKPOINT_TEST_FLUSH_HOST_CACHE=0`; the default is `1`.
+On failure, retain the `before` and `after` snapshots. The transition is
+deliberately stopped before checkpoint, so the process is not left in the
+partially restored state associated with the old wake-time 801 failure.
 
 ## Level 3 failure diagnostics
 
@@ -293,11 +291,14 @@ Interpret the last completed line as follows:
 - `Multicast keeper health probe failed` includes holder identity, topology,
   PID/socket information, and the holder log tail captured before private state
   cleanup.
-- `CUDA pinned-host cache flush` confirms the PyTorch host-cache cleanup ran.
-  If restore still fails with 801 after this line, do not infer that every live
-  host tensor must be destroyed. First verify the complete native
-  Lock/Checkpoint/Restore/Unlock lifecycle on that exact driver and platform,
-  then inspect the multicast keeper and other CUDA object types.
+- `[PinnedHost][owners] ... result=PASS` confirms the explicit owner cascade
+  ran. `[PinnedHost][checkpoint-gate] FAIL` includes the authoritative backing
+  counters and means checkpoint was refused because a live or cached PyTorch
+  pinned allocation remains.
+- If all ranks log `[PinnedHost][checkpoint-gate] PASS` but restore still
+  fails with 801, inspect raw CUDA allocations, multicast/NVLS object identity,
+  and the complete native Lock/Checkpoint/Restore/Unlock probe on the exact
+  driver and platform.
 
 For a Driver compatibility issue, retain the native probe output together with
 `nvidia-smi -q`, `uname -a`, the wheel filename, and the filtered Level 3 logs.

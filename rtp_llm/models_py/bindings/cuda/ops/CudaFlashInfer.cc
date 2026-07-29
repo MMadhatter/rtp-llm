@@ -46,6 +46,20 @@ bool FlashInferAttnParams::check_recycle() {
     return true;
 }
 
+size_t FlashInferAttnParams::clearCachedParams() {
+    size_t cleared = 0;
+    auto   clear   = [&cleared](std::deque<FlashInferAttnParams*>& cache) {
+        while (!cache.empty()) {
+            delete cache.back();
+            cache.pop_back();
+            ++cleared;
+        }
+    };
+    clear(ParamsCache::DECODE_PARAMS_CACHE);
+    clear(ParamsCache::PREFILL_PARAMS_CACHE);
+    return cleared;
+}
+
 FlashInferAttnParams* FlashInferAttnParams::get(int batch_size, int input_token_num) {
     auto cache = isDecode(input_token_num) ? &ParamsCache::DECODE_PARAMS_CACHE : &ParamsCache::PREFILL_PARAMS_CACHE;
     if (!cache->empty()) {

@@ -67,6 +67,14 @@ public:
 
     virtual void recaptureCudaGraphs() {}
 
+    virtual absl::Status suspendPinnedHostMemory() {
+        return absl::OkStatus();
+    }
+
+    virtual absl::Status resumePinnedHostMemory() {
+        return absl::OkStatus();
+    }
+
     virtual std::shared_ptr<GenerateStream> enqueue(const std::shared_ptr<GenerateInput>& input) = 0;
 
     virtual void enqueue(std::shared_ptr<GenerateStream>& stream) = 0;

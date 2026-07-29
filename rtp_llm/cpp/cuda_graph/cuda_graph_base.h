@@ -67,6 +67,7 @@ public:
     virtual bool           canRun(const PyModelInputs& inputs, CudaGraphState& state)   = 0;
     virtual void           invalidateCapturedGraphs()                                   = 0;
     virtual void           recaptureCapturedGraphs()                                    = 0;
+    virtual void           suspendPinnedHostMemory() {}
     virtual bool           capturedGraphsReady() const                                  = 0;
     virtual uint64_t       captureGeneration() const                                    = 0;
     virtual void           prepareAttentionInputs(const PyModelInputs& inputs,

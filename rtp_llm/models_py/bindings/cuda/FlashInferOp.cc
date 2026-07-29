@@ -175,7 +175,8 @@ torch::Tensor FlashInferDecodeOp::forward(const torch::Tensor&                  
     return output;
 }
 
-void registerFlashInferOp(const py::module& m) {
+void registerFlashInferOp(py::module& m) {
+    m.def("clear_flashinfer_attn_params_cache", []() { return FlashInferAttnParams::clearCachedParams(); });
     pybind11::class_<FlashInferAttnParams, std::shared_ptr<FlashInferAttnParams>, rtp_llm::ParamsBase>(
         m, "FlashInferAttnParams")
         .def(pybind11::init<>());

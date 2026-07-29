@@ -126,15 +126,7 @@ KVCacheMemoryConnector::~KVCacheMemoryConnector() {
     incomplete_pool_.reset();
     compressed_pool_.reset();
     state_swa_pool_.reset();
-    {
-        std::lock_guard<std::mutex> lock(staged_copy_scratch_mutex_);
-        for (auto& [_, scratch] : staged_copy_scratch_by_device_) {
-            if (scratch) {
-                releaseStagedMemoryCopyScratch(*scratch);
-            }
-        }
-        staged_copy_scratch_by_device_.clear();
-    }
+    suspendPinnedHostMemory();
 }
 
 bool KVCacheMemoryConnector::init() {
@@ -686,6 +678,46 @@ bool KVCacheMemoryConnector::restoreMemoryCacheBacking() {
         block_cache_->clear();
     }
     RTP_LLM_LOG_INFO("memory cache backing restored on wake");
+    return true;
+}
+
+KVCacheMemoryConnector::PinnedHostMemoryStats KVCacheMemoryConnector::pinnedHostMemoryStats() const {
+    std::lock_guard<std::mutex> lock(staged_copy_scratch_mutex_);
+    PinnedHostMemoryStats       stats;
+    for (const auto& [_, scratch] : staged_copy_scratch_by_device_) {
+        if (scratch && scratch->host_staging != nullptr) {
+            ++stats.allocation_count;
+            stats.bytes += scratch->host_capacity;
+        }
+    }
+    return stats;
+}
+
+bool KVCacheMemoryConnector::suspendPinnedHostMemory() {
+    std::lock_guard<std::mutex> lock(staged_copy_scratch_mutex_);
+    PinnedHostMemoryStats       released;
+    staged_copy_suspended_ = true;
+    for (auto& [_, scratch] : staged_copy_scratch_by_device_) {
+        if (!scratch) {
+            continue;
+        }
+        if (scratch->host_staging != nullptr) {
+            ++released.allocation_count;
+            released.bytes += scratch->host_capacity;
+        }
+        releaseStagedMemoryCopyScratch(*scratch);
+    }
+    staged_copy_scratch_by_device_.clear();
+    RTP_LLM_LOG_INFO("KV cache staged pinned host memory suspended: allocations=%zu bytes=%zu",
+                     released.allocation_count,
+                     released.bytes);
+    return true;
+}
+
+bool KVCacheMemoryConnector::resumePinnedHostMemory() {
+    std::lock_guard<std::mutex> lock(staged_copy_scratch_mutex_);
+    staged_copy_suspended_ = false;
+    RTP_LLM_LOG_INFO("KV cache staged pinned host memory resumed; scratch will be recreated lazily");
     return true;
 }
 
@@ -2189,6 +2221,10 @@ bool KVCacheMemoryConnector::tryCopyCacheWithStagedMemoryCopy(const MemoryOperat
                       params.device_index);
     RTP_LLM_PROFILE_SCOPE("reuse_cache.memory.copy.exec_staged");
     std::lock_guard<std::mutex> scratch_lock(staged_copy_scratch_mutex_);
+    if (staged_copy_suspended_) {
+        RTP_LLM_LOG_WARNING("cuda staged memory copy rejected while pinned host memory is suspended");
+        return false;
+    }
     if (!execStagedMemoryCopy(params, &stagedCopyScratchForDevice(params.device_index))) {
         return false;
     }

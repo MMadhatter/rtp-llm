@@ -573,4 +573,18 @@ bool KVCacheConnectorCoordinator::restoreMemoryCacheBacking() {
     return memory_connector_->restoreMemoryCacheBacking();
 }
 
+bool KVCacheConnectorCoordinator::suspendPinnedHostMemory() {
+    if (!memory_connector_) {
+        return true;
+    }
+    return memory_connector_->suspendPinnedHostMemory();
+}
+
+bool KVCacheConnectorCoordinator::resumePinnedHostMemory() {
+    if (!memory_connector_) {
+        return true;
+    }
+    return memory_connector_->resumePinnedHostMemory();
+}
+
 }  // namespace rtp_llm

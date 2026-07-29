@@ -130,6 +130,11 @@ public:
                                                 const int            tokens_per_block);
     void                         refreshFlashInferBuf(int batch_size, int token_num);
     static FlashInferAttnParams* get(int batch_size, int input_token_num);
+
+    // Level-3 checkpoint lifecycle. Cached params own both pinned host and
+    // device workspaces but are fully derived from the next request, so the
+    // quiesced sleep path destroys them and lets prepare() rebuild lazily.
+    static size_t clearCachedParams();
 };
 
 using FlashInferAttnParamsPtr = std::shared_ptr<FlashInferAttnParams>;

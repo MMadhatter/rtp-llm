@@ -118,6 +118,11 @@ public:
     bool releaseMemoryCacheBacking();
     bool restoreMemoryCacheBacking();
 
+    // Level-3 checkpoint lifecycle for raw pinned host memory owned by KV
+    // connectors. Transfers must already be frozen and drained before suspend.
+    bool suspendPinnedHostMemory();
+    bool resumePinnedHostMemory();
+
     // Transfer admission is closed/reopened on every level. The teardown/rebuild
     // operations remain Level-3 only. CacheStore is late-bound by RemoteRpcServer,
     // so these methods resolve current owners at call time.
