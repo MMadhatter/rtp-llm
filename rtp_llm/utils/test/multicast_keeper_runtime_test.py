@@ -15,8 +15,11 @@ from rtp_llm.utils.multicast_keeper import (
     BIN_DIR_ENV,
     CREATOR_ENV,
     ENABLE_ENV,
+    FABRIC_TEAM_ENV,
     HOLDER_ENV,
+    LOCAL_GPU_ENV,
     SHIM_ENV,
+    SYMM_MEM_HANDLE_POLICY_ENV,
     KeeperArtifacts,
     MulticastKeeperConfigError,
     MulticastKeeperError,
@@ -336,6 +339,7 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
                 "NCCL_NVLS_ENABLE": "custom",
                 "TORCH_SYMM_MEM_DISABLE_MULTICAST": "custom",
                 "RTP_LLM_MC_REQUEST_TIMEOUT_MS": "77",
+                SYMM_MEM_HANDLE_POLICY_ENV: "stale-parent-policy",
             }
             child = runtime.subprocess_env(base)
             self.assertEqual(f"/opt/tms.so:/opt/a.so:{shim}", child["LD_PRELOAD"])
@@ -345,6 +349,7 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
             self.assertEqual("125000", child["RTP_LLM_MC_CREATE_TIMEOUT_MS"])
             self.assertEqual("0,2", child["RTP_LLM_MC_LOCAL_GPUS"])
             self.assertEqual("8", child["RTP_LLM_MC_FABRIC_TEAM_SIZE"])
+            self.assertNotIn(SYMM_MEM_HANDLE_POLICY_ENV, child)
             self.assertEqual(
                 str(runtime.socket_path), child["RTP_LLM_CUDA_CKPT_MULTICAST_SOCKET"]
             )
@@ -424,12 +429,20 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
             env.get("LD_PRELOAD", ""), shim
         )
         env[ENABLE_ENV] = "1"
+        env[FABRIC_TEAM_ENV] = "2"
+        env[LOCAL_GPU_ENV] = "0,1"
+        env[SYMM_MEM_HANDLE_POLICY_ENV] = "local_posix"
         completed = subprocess.run(
             [
                 sys.executable,
                 "-c",
-                "import ctypes, struct; "
+                "import ctypes, struct, torch; "
                 "assert struct.calcsize('P') == ctypes.sizeof(ctypes.c_void_p); "
+                "fabric_access = getattr("
+                "ctypes.CDLL(None), '_ZN2at4cuda17get_fabric_accessEa'); "
+                "fabric_access.argtypes = [ctypes.c_int8]; "
+                "fabric_access.restype = ctypes.c_bool; "
+                "assert fabric_access(0) is False; "
                 "print('preload-smoke-ok')",
             ],
             env=env,

@@ -46,8 +46,20 @@ typedef struct held_entry {
     unsigned char fabric_handle[RTP_MC_FABRIC_HANDLE_BYTES];
 } held_entry;
 
+typedef struct held_backing {
+    uint64_t                 object_id;
+    rtp_mc_object_properties properties;
+    uint64_t                 served_size;
+    uint64_t                 owner_id;
+    uint64_t                 owner_generation;
+    pid_t                    creator_pid;
+    int                      control_fd;
+} held_backing;
+
 static held_entry            g_entries[RTP_MC_MAX_ENTRIES];
 static size_t                g_entry_count      = 0;
+static held_backing          g_backings[RTP_MC_MAX_ENTRIES];
+static size_t                g_backing_count    = 0;
 static uint64_t              g_instance_hi      = 0;
 static uint64_t              g_instance_lo      = 0;
 static uint64_t              g_next_object_id   = 1;
@@ -127,6 +139,35 @@ static int parse_gpu_count(const char* text, uint32_t* count) {
     return value_count == 0 ? -1 : 0;
 }
 
+static int gpu_ordinal_at(const char* text, uint32_t index, int* ordinal) {
+    if (text == NULL || ordinal == NULL) {
+        return -1;
+    }
+    uint32_t    current = 0;
+    const char* cursor  = text;
+    while (*cursor != '\0') {
+        char* end  = NULL;
+        errno      = 0;
+        long value = strtol(cursor, &end, 10);
+        if (errno != 0 || end == cursor || value < 0 || value > INT_MAX) {
+            return -1;
+        }
+        if (current == index) {
+            *ordinal = (int)value;
+            return 0;
+        }
+        ++current;
+        if (*end == '\0') {
+            break;
+        }
+        if (*end != ',' || end[1] == '\0') {
+            return -1;
+        }
+        cursor = end + 1;
+    }
+    return -1;
+}
+
 static int parse_positive_u32(const char* text, uint32_t* value) {
     char* end            = NULL;
     errno                = 0;
@@ -200,24 +241,33 @@ static int compatible_import_properties(const rtp_mc_object_properties* request,
            && ((request->handle_types ^ held->handle_types) & ~RTP_MC_HANDLE_TYPE_POSIX_FD) == 0;
 }
 
-static int send_response(int socket_fd, const rtp_mc_response* response, int passed_fd) {
+static int send_response_fds(
+    int socket_fd, const rtp_mc_response* response, const int* passed_fds, size_t passed_fd_count) {
+    if (passed_fd_count > 2) {
+        errno = EINVAL;
+        return -1;
+    }
     struct iovec iov = {.iov_base = (void*)response, .iov_len = sizeof(*response)};
-    char         control[CMSG_SPACE(sizeof(int))];
+    char         control[CMSG_SPACE(sizeof(int) * 2)];
     memset(control, 0, sizeof(control));
     struct msghdr header;
     memset(&header, 0, sizeof(header));
     header.msg_iov    = &iov;
     header.msg_iovlen = 1;
-    if (passed_fd >= 0) {
+    if (passed_fd_count != 0) {
         header.msg_control    = control;
-        header.msg_controllen = sizeof(control);
+        header.msg_controllen = CMSG_SPACE(sizeof(int) * passed_fd_count);
         struct cmsghdr* cmsg  = CMSG_FIRSTHDR(&header);
         cmsg->cmsg_level      = SOL_SOCKET;
         cmsg->cmsg_type       = SCM_RIGHTS;
-        cmsg->cmsg_len        = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(cmsg), &passed_fd, sizeof(passed_fd));
+        cmsg->cmsg_len        = CMSG_LEN(sizeof(int) * passed_fd_count);
+        memcpy(CMSG_DATA(cmsg), passed_fds, sizeof(int) * passed_fd_count);
     }
     return sendmsg(socket_fd, &header, MSG_NOSIGNAL) == (ssize_t)sizeof(*response) ? 0 : -1;
+}
+
+static int send_response(int socket_fd, const rtp_mc_response* response, int passed_fd) {
+    return send_response_fds(socket_fd, response, passed_fd < 0 ? NULL : &passed_fd, passed_fd < 0 ? 0 : 1);
 }
 
 static int recv_creator_result(int socket_fd, rtp_mc_creator_result* result, int* received_fd) {
@@ -401,28 +451,42 @@ static size_t reclaim_stale_owner(uint64_t owner_id, uint64_t owner_generation) 
     return reclaimed;
 }
 
-// Create or import a multicast object via a short-lived child.
-//   import_fabric == NULL: CREATE mode — the child calls cuMulticastCreate and
-//     deposits a node-local POSIX fd (plus, for FABRIC teams, the 64-byte fabric
-//     handle inline in the result). properties->num_devices is the whole team.
-//   import_fabric != NULL: IMPORT_ADD mode — the child imports that 64-byte
-//     fabric handle, AddDevice's this node's LOCAL devices, and re-exports a
-//     node-local POSIX fd. The child receives the handle over a pipe.
-// In both cases the resulting node-local POSIX fd is what local ranks import.
-static held_entry* create_entry(const char*                     creator,
-                                const char*                     gpus,
-                                const rtp_mc_object_properties* properties,
-                                uint64_t                        owner_id,
-                                uint64_t                        owner_generation,
-                                int                             timeout_ms,
-                                const unsigned char*            import_fabric) {
-    if (g_entry_count == RTP_MC_MAX_ENTRIES) {
-        errno = ENOSPC;
-        return NULL;
+typedef enum creator_mode {
+    CREATOR_MULTICAST_CREATE,
+    CREATOR_MULTICAST_IMPORT,
+    CREATOR_GENERIC_FABRIC,
+} creator_mode;
+
+static const char* creator_mode_name(creator_mode mode) {
+    switch (mode) {
+        case CREATOR_MULTICAST_CREATE:
+            return "multicast_create";
+        case CREATOR_MULTICAST_IMPORT:
+            return "multicast_import";
+        case CREATOR_GENERIC_FABRIC:
+            return "generic_fabric";
     }
+    return "unknown";
+}
+
+// Run the CUDA-bearing creator in a short-lived child. The holder remains
+// CUDA-free, which is essential because it must survive rank checkpoint/restore.
+// The returned fd is owned by the caller. Generic FABRIC mode also returns the
+// live child and its control socket; release_backing_at() later drops the
+// rendezvous fence and reaps it.
+static int run_creator(const char*                     creator,
+                       const char*                     gpus,
+                       const rtp_mc_object_properties* properties,
+                       int                             timeout_ms,
+                       creator_mode                    mode,
+                       const unsigned char*            import_fabric,
+                       rtp_mc_creator_result*          result,
+                       int*                            allocation_fd,
+                       pid_t*                          live_child,
+                       int*                            live_control_fd) {
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) != 0) {
-        return NULL;
+        return -1;
     }
     int flags = fcntl(pair[1], F_GETFD);
     if (flags < 0 || fcntl(pair[1], F_SETFD, flags & ~FD_CLOEXEC) != 0) {
@@ -430,17 +494,23 @@ static held_entry* create_entry(const char*                     creator,
         close(pair[0]);
         close(pair[1]);
         errno = saved_errno;
-        return NULL;
+        return -1;
     }
     // For IMPORT_ADD, hand the 64-byte fabric handle to the child over a pipe.
     int fabric_pipe[2] = {-1, -1};
-    if (import_fabric != NULL) {
+    if (mode == CREATOR_MULTICAST_IMPORT) {
+        if (import_fabric == NULL) {
+            close(pair[0]);
+            close(pair[1]);
+            errno = EINVAL;
+            return -1;
+        }
         if (pipe2(fabric_pipe, O_CLOEXEC) != 0) {
             int saved_errno = errno;
             close(pair[0]);
             close(pair[1]);
             errno = saved_errno;
-            return NULL;
+            return -1;
         }
         int rflags = fcntl(fabric_pipe[0], F_GETFD);
         if (rflags < 0 || fcntl(fabric_pipe[0], F_SETFD, rflags & ~FD_CLOEXEC) != 0) {
@@ -450,10 +520,11 @@ static held_entry* create_entry(const char*                     creator,
             close(fabric_pipe[0]);
             close(fabric_pipe[1]);
             errno = saved_errno;
-            return NULL;
+            return -1;
         }
     }
-    pid_t child = fork();
+    pid_t holder_pid = getpid();
+    pid_t child      = fork();
     if (child < 0) {
         int saved_errno = errno;
         close(pair[0]);
@@ -463,9 +534,14 @@ static held_entry* create_entry(const char*                     creator,
             close(fabric_pipe[1]);
         }
         errno = saved_errno;
-        return NULL;
+        return -1;
     }
     if (child == 0) {
+        // Generic backing creators may remain alive through a distributed
+        // rendezvous. Never allow one to outlive a crashed holder.
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != holder_pid) {
+            _exit(126);
+        }
         close(pair[0]);
         if (fabric_pipe[1] >= 0) {
             close(fabric_pipe[1]);
@@ -481,7 +557,7 @@ static held_entry* create_entry(const char*                     creator,
         snprintf(num_devices, sizeof(num_devices), "%u", properties->num_devices);
         snprintf(handle_types, sizeof(handle_types), "%u", properties->handle_types);
         snprintf(property_flags, sizeof(property_flags), "%llu", (unsigned long long)properties->flags);
-        if (import_fabric != NULL) {
+        if (mode == CREATOR_MULTICAST_IMPORT) {
             snprintf(import_fd, sizeof(import_fd), "%d", fabric_pipe[0]);
             execl(creator,
                   creator,
@@ -499,6 +575,23 @@ static held_entry* create_entry(const char*                     creator,
                   deposit_fd,
                   "--import-fabric-fd",
                   import_fd,
+                  (char*)NULL);
+        } else if (mode == CREATOR_GENERIC_FABRIC) {
+            execl(creator,
+                  creator,
+                  "--gpus",
+                  gpus,
+                  "--size",
+                  requested,
+                  "--num-devices",
+                  num_devices,
+                  "--handle-types",
+                  handle_types,
+                  "--flags",
+                  property_flags,
+                  "--deposit-fd",
+                  deposit_fd,
+                  "--generic-fabric",
                   (char*)NULL);
         } else {
             execl(creator,
@@ -530,7 +623,7 @@ static held_entry* create_entry(const char*                     creator,
             close(pair[0]);
             (void)terminate_creator(child, NULL);
             errno = EIO;
-            return NULL;
+            return -1;
         }
     }
     g_creator_pid = child;
@@ -539,33 +632,79 @@ static held_entry* create_entry(const char*                     creator,
                 (unsigned long long)properties->size,
                 properties->num_devices,
                 properties->handle_types,
-                import_fabric != NULL ? "import" : "create");
+                creator_mode_name(mode));
 
-    rtp_mc_creator_result result;
-    memset(&result, 0, sizeof(result));
-    int multicast_fd = -1;
-    int receive_ok = wait_for_fd(pair[0], timeout_ms) == 0 && recv_creator_result(pair[0], &result, &multicast_fd) == 0;
+    memset(result, 0, sizeof(*result));
+    *allocation_fd = -1;
+    int receive_ok =
+        wait_for_fd(pair[0], timeout_ms) == 0 && recv_creator_result(pair[0], result, allocation_fd) == 0;
+    int result_ok = receive_ok && result->magic == RTP_MC_CREATOR_MAGIC && result->status == 0
+                    && result->requested_size == properties->size && result->served_size >= properties->size
+                    && *allocation_fd >= 0;
+    if (mode == CREATOR_GENERIC_FABRIC && result_ok && live_child != NULL && live_control_fd != NULL) {
+        int   child_status = 0;
+        pid_t exited       = waitpid(child, &child_status, WNOHANG);
+        if (exited == 0) {
+            g_creator_pid    = -1;
+            *live_child      = child;
+            *live_control_fd = pair[0];
+            log_message("creator_ready pid=%d requested=%llu served=%llu mode=%s",
+                        (int)child,
+                        (unsigned long long)properties->size,
+                        (unsigned long long)result->served_size,
+                        creator_mode_name(mode));
+            return 0;
+        }
+        result_ok = 0;
+    }
     close(pair[0]);
 
     int child_status = 0;
     int child_ok     = 0;
-    if (receive_ok) {
+    if (result_ok) {
         child_ok = wait_for_child(child, timeout_ms, &child_status) == 0;
     }
-    if (!receive_ok || !child_ok) {
+    if (!result_ok || !child_ok) {
         child_ok = terminate_creator(child, &child_status) == 0;
     }
     g_creator_pid = -1;
-    if (!receive_ok || !child_ok || result.magic != RTP_MC_CREATOR_MAGIC || result.status != 0
-        || result.requested_size != properties->size || result.served_size < properties->size || multicast_fd < 0
-        || !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
-        if (multicast_fd >= 0) {
-            close(multicast_fd);
+    if (!result_ok || !child_ok || !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
+        if (*allocation_fd >= 0) {
+            close(*allocation_fd);
+            *allocation_fd = -1;
         }
         errno = EIO;
+        return -1;
+    }
+    log_message("creator_done requested=%llu served=%llu mode=%s",
+                (unsigned long long)properties->size,
+                (unsigned long long)result->served_size,
+                creator_mode_name(mode));
+    return 0;
+}
+
+// Create or import a retained multicast object. The common child runner above
+// is also used by short-lived generic backing requests, but only this path
+// allocates a holder entry and participates in owner/dedup lifecycle.
+static held_entry* create_entry(const char*                     creator,
+                                const char*                     gpus,
+                                const rtp_mc_object_properties* properties,
+                                uint64_t                        owner_id,
+                                uint64_t                        owner_generation,
+                                int                             timeout_ms,
+                                const unsigned char*            import_fabric) {
+    if (g_entry_count == RTP_MC_MAX_ENTRIES) {
+        errno = ENOSPC;
         return NULL;
     }
-
+    rtp_mc_creator_result result;
+    int                   multicast_fd = -1;
+    creator_mode mode = import_fabric == NULL ? CREATOR_MULTICAST_CREATE : CREATOR_MULTICAST_IMPORT;
+    if (run_creator(
+            creator, gpus, properties, timeout_ms, mode, import_fabric, &result, &multicast_fd, NULL, NULL)
+        != 0) {
+        return NULL;
+    }
     held_entry* entry = &g_entries[g_entry_count++];
     memset(entry, 0, sizeof(*entry));
     entry->object_id = g_next_object_id++;
@@ -592,7 +731,7 @@ static held_entry* create_entry(const char*                     creator,
         memcpy(entry->fabric_handle, result.fabric_handle, RTP_MC_FABRIC_HANDLE_BYTES);
     }
     log_message(
-        "creator_done object=%llu requested=%llu served=%llu owner=%llu gen=%llu fabric=%d refs=%zu entries=%zu",
+        "multicast_held object=%llu requested=%llu served=%llu owner=%llu gen=%llu fabric=%d refs=%zu entries=%zu",
         (unsigned long long)entry->object_id,
         (unsigned long long)entry->properties.size,
         (unsigned long long)entry->served_size,
@@ -613,6 +752,65 @@ static held_entry* find_entry_by_fabric(const unsigned char* fabric_handle) {
         }
     }
     return NULL;
+}
+
+static held_backing* find_backing(uint64_t object_id) {
+    for (size_t i = 0; i < g_backing_count; ++i) {
+        if (g_backings[i].object_id == object_id) {
+            return &g_backings[i];
+        }
+    }
+    return NULL;
+}
+
+static int release_backing_at(size_t index, int timeout_ms) {
+    if (index >= g_backing_count) {
+        errno = EINVAL;
+        return -1;
+    }
+    held_backing backing = g_backings[index];
+    char         release = 1;
+    (void)write(backing.control_fd, &release, sizeof(release));
+    close(backing.control_fd);
+    int status = 0;
+    int waited = wait_for_child(backing.creator_pid, timeout_ms, &status);
+    if (waited != 0) {
+        waited = terminate_creator(backing.creator_pid, &status);
+    }
+    if (index != g_backing_count - 1) {
+        g_backings[index] = g_backings[g_backing_count - 1];
+    }
+    memset(&g_backings[g_backing_count - 1], 0, sizeof(g_backings[g_backing_count - 1]));
+    --g_backing_count;
+    int clean = waited == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    log_message("fabric_backing_released object=%llu owner=%llu gen=%llu clean=%d active=%zu",
+                (unsigned long long)backing.object_id,
+                (unsigned long long)backing.owner_id,
+                (unsigned long long)backing.owner_generation,
+                clean,
+                g_backing_count);
+    if (!clean) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static size_t reclaim_stale_backings(uint64_t owner_id, uint64_t owner_generation, int timeout_ms) {
+    size_t reclaimed = 0;
+    if (owner_id == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < g_backing_count;) {
+        held_backing* backing = &g_backings[i];
+        if (backing->owner_id == owner_id && backing->owner_generation != owner_generation) {
+            (void)release_backing_at(i, timeout_ms);
+            ++reclaimed;
+        } else {
+            ++i;
+        }
+    }
+    return reclaimed;
 }
 
 // Wrap a 64-byte fabric handle in a sealed, read-only memfd so FETCH_FABRIC can
@@ -660,6 +858,15 @@ validate_properties(const rtp_mc_object_properties* properties, uint32_t gpu_cou
     }
     if (properties->flags != 0 || (properties->handle_types & ~RTP_MC_SUPPORTED_HANDLE_TYPES) != 0) {
         return RTP_MC_STATUS_UNSUPPORTED_PROPERTIES;
+    }
+    // A backing request represents one ordinary allocation on one local GPU,
+    // not a multicast team. Its device ordinal is carried separately in
+    // request.object_id, so do not apply the global FABRIC team-size contract.
+    if (opcode == RTP_MC_OP_CREATE_FABRIC_BACKING || opcode == RTP_MC_OP_RELEASE_FABRIC_BACKING) {
+        return properties->size != RTP_MC_UNKNOWN_SIZE && properties->num_devices == 1
+                       && properties->handle_types == RTP_MC_HANDLE_TYPE_FABRIC ?
+                   RTP_MC_STATUS_OK :
+                   RTP_MC_STATUS_UNSUPPORTED_PROPERTIES;
     }
     // FABRIC requires an explicit full-team contract at holder startup. This
     // prevents an incomplete node set from reaching CUDA, where bind/map waits
@@ -730,7 +937,9 @@ handle_client(int client_fd, const char* creator, const char* gpus, uint32_t gpu
         (void)send_response(client_fd, &response, -1);
         return;
     }
-    if (request.opcode == RTP_MC_OP_IMPORT_ADD && owner_generation == 0) {
+    if ((request.opcode == RTP_MC_OP_IMPORT_ADD || request.opcode == RTP_MC_OP_CREATE_FABRIC_BACKING
+         || request.opcode == RTP_MC_OP_RELEASE_FABRIC_BACKING)
+        && owner_generation == 0) {
         rtp_mc_response response = base_response(&request, RTP_MC_STATUS_INVALID_REQUEST);
         (void)send_response(client_fd, &response, -1);
         return;
@@ -753,6 +962,11 @@ handle_client(int client_fd, const char* creator, const char* gpus, uint32_t gpu
     held_entry*   entry       = NULL;
     rtp_mc_status status      = RTP_MC_STATUS_OK;
     int           owner_added = 0;
+    int           backing_fd          = -1;
+    int           backing_token_fd    = -1;
+    uint64_t      backing_served_size = 0;
+    uint64_t      backing_object_id   = 0;
+    int           backing_created     = 0;
     if (request.opcode == RTP_MC_OP_CREATE) {
         if (request.holder_instance_hi != 0 || request.holder_instance_lo != 0 || request.object_id != 0) {
             status = RTP_MC_STATUS_INVALID_REQUEST;
@@ -867,6 +1081,95 @@ handle_client(int client_fd, const char* creator, const char* gpus, uint32_t gpu
                         remaining_refs,
                         g_entry_count);
         }
+    } else if (request.opcode == RTP_MC_OP_CREATE_FABRIC_BACKING) {
+        // object_id on input encodes the caller-visible local CUDA ordinal plus
+        // one. The response replaces it with a temporary holder identity that
+        // the caller releases after group rendezvous.
+        if (request.holder_instance_hi != 0 || request.holder_instance_lo != 0 || request.object_id == 0
+            || request.object_id > gpu_count) {
+            status = RTP_MC_STATUS_INVALID_REQUEST;
+        } else if (g_backing_count == RTP_MC_MAX_ENTRIES) {
+            status = RTP_MC_STATUS_CAPACITY_EXCEEDED;
+        } else {
+            size_t reclaimed = reclaim_stale_backings(owner_id, owner_generation, creator_timeout_ms);
+            if (reclaimed > 0) {
+                log_message("fabric_backing_reclaimed owner=%llu count=%zu active=%zu",
+                            (unsigned long long)owner_id,
+                            reclaimed,
+                            g_backing_count);
+            }
+            int holder_ordinal = -1;
+            if (gpu_ordinal_at(gpus, (uint32_t)(request.object_id - 1), &holder_ordinal) != 0) {
+                status = RTP_MC_STATUS_INVALID_REQUEST;
+            } else {
+                char selected_gpu[32];
+                snprintf(selected_gpu, sizeof(selected_gpu), "%d", holder_ordinal);
+                rtp_mc_creator_result result;
+                pid_t                 live_child      = -1;
+                int                   live_control_fd = -1;
+                if (run_creator(creator,
+                                selected_gpu,
+                                &request.properties,
+                                creator_timeout_ms,
+                                CREATOR_GENERIC_FABRIC,
+                                NULL,
+                                &result,
+                                &backing_fd,
+                                &live_child,
+                                &live_control_fd)
+                    != 0) {
+                    status = RTP_MC_STATUS_CREATOR_FAILED;
+                } else if ((result.flags & RTP_MC_CREATOR_FLAG_FABRIC_VALID) == 0
+                           || (backing_token_fd = make_fabric_memfd(result.fabric_handle)) < 0) {
+                    close(backing_fd);
+                    backing_fd = -1;
+                    char release = 1;
+                    (void)write(live_control_fd, &release, sizeof(release));
+                    close(live_control_fd);
+                    (void)terminate_creator(live_child, NULL);
+                    status = RTP_MC_STATUS_INTERNAL_ERROR;
+                } else {
+                    held_backing* backing = &g_backings[g_backing_count++];
+                    memset(backing, 0, sizeof(*backing));
+                    backing->object_id = g_next_object_id++;
+                    if (backing->object_id == 0) {
+                        backing->object_id = g_next_object_id++;
+                    }
+                    backing->properties       = request.properties;
+                    backing->served_size      = result.served_size;
+                    backing->owner_id         = owner_id;
+                    backing->owner_generation = owner_generation;
+                    backing->creator_pid      = live_child;
+                    backing->control_fd       = live_control_fd;
+                    backing_served_size = result.served_size;
+                    backing_object_id   = backing->object_id;
+                    backing_created     = 1;
+                    log_message("fabric_backing_ready object=%llu logical_device=%llu holder_device=%d "
+                                "requested=%llu served=%llu owner=%llu gen=%llu active=%zu",
+                                (unsigned long long)backing_object_id,
+                                (unsigned long long)(request.object_id - 1),
+                                holder_ordinal,
+                                (unsigned long long)request.properties.size,
+                                (unsigned long long)backing_served_size,
+                                (unsigned long long)owner_id,
+                                (unsigned long long)owner_generation,
+                                g_backing_count);
+                }
+            }
+        }
+    } else if (request.opcode == RTP_MC_OP_RELEASE_FABRIC_BACKING) {
+        held_backing* backing = NULL;
+        if (request.holder_instance_hi != g_instance_hi || request.holder_instance_lo != g_instance_lo) {
+            status = RTP_MC_STATUS_STALE_INSTANCE;
+        } else if (request.object_id == 0 || (backing = find_backing(request.object_id)) == NULL) {
+            status = RTP_MC_STATUS_UNKNOWN_OBJECT;
+        } else if (backing->owner_id != owner_id || backing->owner_generation != owner_generation) {
+            status = RTP_MC_STATUS_OWNER_MISMATCH;
+        } else if (!same_properties(&request.properties, &backing->properties)) {
+            status = RTP_MC_STATUS_PROPERTY_MISMATCH;
+        } else if (release_backing_at((size_t)(backing - g_backings), creator_timeout_ms) != 0) {
+            status = RTP_MC_STATUS_INTERNAL_ERROR;
+        }
     } else {
         status = RTP_MC_STATUS_INVALID_REQUEST;
     }
@@ -877,6 +1180,14 @@ handle_client(int client_fd, const char* creator, const char* gpus, uint32_t gpu
     // FETCH_FABRIC (owned here and closed after the reply).
     int reply_fd       = -1;
     int owned_reply_fd = -1;
+    if (backing_fd >= 0 && backing_token_fd >= 0 && status == RTP_MC_STATUS_OK) {
+        response.object_id      = backing_object_id;
+        response.requested_size = request.properties.size;
+        response.served_size    = backing_served_size;
+        response.num_devices    = 1;
+        response.handle_types   = RTP_MC_HANDLE_TYPE_FABRIC;
+        response.flags          = 0;
+    }
     if (entry != NULL && status == RTP_MC_STATUS_OK) {
         fill_entry_response(&response, entry);
         if (request.opcode == RTP_MC_OP_FETCH_FABRIC) {
@@ -890,9 +1201,28 @@ handle_client(int client_fd, const char* creator, const char* gpus, uint32_t gpu
             reply_fd = entry->fd;
         }
     }
-    if (send_response(client_fd, &response, reply_fd) != 0) {
+    int send_result;
+    if (backing_fd >= 0 && backing_token_fd >= 0 && status == RTP_MC_STATUS_OK) {
+        int backing_fds[2] = {backing_fd, backing_token_fd};
+        send_result        = send_response_fds(client_fd, &response, backing_fds, 2);
+    } else {
+        send_result = send_response(client_fd, &response, reply_fd);
+    }
+    if (send_result != 0) {
+        if (backing_fd >= 0) {
+            close(backing_fd);
+        }
+        if (backing_token_fd >= 0) {
+            close(backing_token_fd);
+        }
         if (owned_reply_fd >= 0) {
             close(owned_reply_fd);
+        }
+        if (backing_created) {
+            held_backing* backing = find_backing(backing_object_id);
+            if (backing != NULL) {
+                (void)release_backing_at((size_t)(backing - g_backings), creator_timeout_ms);
+            }
         }
         if (owner_added && response.object_id != 0) {
             held_entry* registered = find_entry(response.object_id);
@@ -902,6 +1232,12 @@ handle_client(int client_fd, const char* creator, const char* gpus, uint32_t gpu
         }
         log_message("reply_failed opcode=%u status=%d error=%s", request.opcode, status, strerror(errno));
         return;
+    }
+    if (backing_fd >= 0) {
+        close(backing_fd);
+    }
+    if (backing_token_fd >= 0) {
+        close(backing_token_fd);
     }
     if (owned_reply_fd >= 0) {
         close(owned_reply_fd);
@@ -1238,6 +1574,10 @@ int main(int argc, char** argv) {
         close(client);
     }
 
+    size_t cleaned_backings = g_backing_count;
+    while (g_backing_count != 0) {
+        (void)release_backing_at(g_backing_count - 1, creator_timeout_ms);
+    }
     for (size_t i = 0; i < g_entry_count; ++i) {
         close(g_entries[i].fd);
         free(g_entries[i].owners);
@@ -1249,6 +1589,6 @@ int main(int argc, char** argv) {
     if (ready_file != NULL) {
         unlink(ready_file);
     }
-    log_message("HOLDER_EXIT cleaned_entries=%zu", g_entry_count);
+    log_message("HOLDER_EXIT cleaned_entries=%zu cleaned_backings=%zu", g_entry_count, cleaned_backings);
     return 0;
 }

@@ -97,6 +97,10 @@ def _get_or_create_mega_fused_buf(
     )
     buf = _MEGA_FUSED_BUF_CACHE.get(key)
     if buf is None:
+        from rtp_llm.models_py.distributed.symm_mem_group_scope import (
+            symm_mem_allocation_scope,
+        )
+
         try:
             group_size = int(group.size())
         except Exception:
@@ -115,16 +119,17 @@ def _get_or_create_mega_fused_buf(
             if group_size > 0
             else None
         )
-        buf = deep_gemm.get_symm_buffer_for_mega_moe_fused(
-            group=group,
-            num_experts=num_experts,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_topk=num_topk,
-            hidden=hidden,
-            intermediate_hidden=intermediate_hidden,
-            use_fp8_dispatch=use_fp8_dispatch,
-            activation=activation,
-        )
+        with symm_mem_allocation_scope(group, owner="dsv4_mega_moe_fused"):
+            buf = deep_gemm.get_symm_buffer_for_mega_moe_fused(
+                group=group,
+                num_experts=num_experts,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+                num_topk=num_topk,
+                hidden=hidden,
+                intermediate_hidden=intermediate_hidden,
+                use_fp8_dispatch=use_fp8_dispatch,
+                activation=activation,
+            )
         actual_bytes = None
         try:
             actual_bytes = int(buf.buffer.numel() * buf.buffer.element_size())

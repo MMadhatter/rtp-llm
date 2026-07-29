@@ -21,14 +21,18 @@ namespace {
 void usage(FILE* stream, const char* program) {
     fprintf(stream,
             "Usage: %s --gpus LIST --size BYTES --num-devices N "
-            "--handle-types MASK --flags 0 --deposit-fd FD [--import-fabric-fd FD] [--dry-run]\n\n"
+            "--handle-types MASK --flags 0 --deposit-fd FD "
+            "[--import-fabric-fd FD | --generic-fabric] [--dry-run]\n\n"
             "LIST is a comma-separated list of CUDA ordinals. BYTES accepts raw bytes\n"
             "or KiB/MiB/GiB suffixes. The holder normally invokes this process.\n\n"
             "Default (create) mode calls cuMulticastCreate for the whole team\n"
             "(--num-devices = configured global team size) and adds only LIST.\n"
             "With --import-fabric-fd, the process instead imports a 64-byte FABRIC\n"
             "handle read from FD, AddDevice's the LIST (local) devices, and re-exports\n"
-            "a node-local POSIX fd — the peer-node path for cross-machine MNNVL teams.\n",
+            "a node-local POSIX fd — the peer-node path for cross-machine MNNVL teams.\n"
+            "With --generic-fabric, LIST and --num-devices must identify one GPU;\n"
+            "the process creates a generic FABRIC|POSIX backing allocation and\n"
+            "returns its POSIX fd without creating a multicast object.\n",
             program);
 }
 
@@ -172,6 +176,7 @@ int main(int argc, char** argv) {
     const char*                flags_text        = nullptr;
     int                        deposit_fd        = -1;
     int                        import_fabric_fd  = -1;
+    bool                       generic_fabric    = false;
     bool                       dry_run           = false;
     static const struct option options[]         = {
         {"gpus", required_argument, nullptr, 'g'},
@@ -181,12 +186,13 @@ int main(int argc, char** argv) {
         {"flags", required_argument, nullptr, 'f'},
         {"deposit-fd", required_argument, nullptr, 'd'},
         {"import-fabric-fd", required_argument, nullptr, 'i'},
+        {"generic-fabric", no_argument, nullptr, 'b'},
         {"dry-run", no_argument, nullptr, 'n'},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
     int option;
-    while ((option = getopt_long(argc, argv, "g:s:N:T:f:d:i:nh", options, nullptr)) != -1) {
+    while ((option = getopt_long(argc, argv, "g:s:N:T:f:d:i:bnh", options, nullptr)) != -1) {
         switch (option) {
             case 'g':
                 gpu_text = optarg;
@@ -223,6 +229,9 @@ int main(int argc, char** argv) {
                 import_fabric_fd = (int)parsed;
                 break;
             }
+            case 'b':
+                generic_fabric = true;
+                break;
             case 'n':
                 dry_run = true;
                 break;
@@ -245,21 +254,29 @@ int main(int argc, char** argv) {
         || requested_num_devices > std::numeric_limits<unsigned int>::max() || requested_handle_types == 0
         || requested_handle_types > std::numeric_limits<uint32_t>::max()
         || (requested_handle_types & ~RTP_MC_SUPPORTED_HANDLE_TYPES) != 0 || requested_flags != 0
-        || (!dry_run && deposit_fd < 0)) {
+        || (!dry_run && deposit_fd < 0) || (generic_fabric && import_fabric_fd >= 0)) {
         usage(stderr, argv[0]);
         return 2;
     }
     // The holder enforces FABRIC numDevices against its explicit global team
     // contract; the creator independently rejects totals smaller than LIST. The
     // single-node POSIX path keeps the strict local == total invariant.
-    const bool want_fabric = (import_fabric_fd >= 0) || (requested_handle_types & RTP_MC_HANDLE_TYPE_FABRIC) != 0;
-    if (want_fabric ? (requested_num_devices < gpu_ordinals.size()) : (requested_num_devices != gpu_ordinals.size())) {
+    const bool want_fabric =
+        generic_fabric || (import_fabric_fd >= 0) || (requested_handle_types & RTP_MC_HANDLE_TYPE_FABRIC) != 0;
+    const bool invalid_device_contract =
+        generic_fabric ?
+            (gpu_ordinals.size() != 1 || requested_num_devices != 1
+             || requested_handle_types != RTP_MC_HANDLE_TYPE_FABRIC) :
+            (want_fabric ? (requested_num_devices < gpu_ordinals.size()) :
+                           (requested_num_devices != gpu_ordinals.size()));
+    if (invalid_device_contract) {
         usage(stderr, argv[0]);
         return 2;
     }
     if (dry_run) {
-        printf("CREATOR_CONFIG gpus=%s num_devices=%zu requested_size=%llu "
+        printf("CREATOR_CONFIG mode=%s gpus=%s num_devices=%zu requested_size=%llu "
                "handle_types=0x%llx flags=%llu deposit_fd=%d no_cuda=1\n",
+               generic_fabric ? "generic_fabric" : (import_fabric_fd >= 0 ? "import" : "multicast"),
                gpu_text,
                gpu_ordinals.size(),
                (unsigned long long)requested_size,
@@ -279,8 +296,8 @@ int main(int argc, char** argv) {
     };
     std::vector<CUdevice>        devices;
     std::vector<CUcontext>       contexts;
-    CUmemGenericAllocationHandle multicast_handle = 0;
-    int                          multicast_fd     = -1;
+    CUmemGenericAllocationHandle allocation_handle = 0;
+    int                          allocation_fd     = -1;
     int                          exit_code        = 1;
     unsigned char                fabric_handle[RTP_MC_FABRIC_HANDLE_BYTES];
     memset(fabric_handle, 0, sizeof(fabric_handle));
@@ -307,6 +324,66 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cuCtxSetCurrent(contexts.front()));
 
+    if (generic_fabric) {
+        CUmemAllocationProp properties;
+        memset(&properties, 0, sizeof(properties));
+        properties.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        properties.requestedHandleTypes = static_cast<CUmemAllocationHandleType>(
+            CU_MEM_HANDLE_TYPE_FABRIC | CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+        properties.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        properties.location.id   = devices.front();
+
+        size_t granularity = 0;
+        CUDA_CHECK(cuMemGetAllocationGranularity(
+            &granularity, &properties, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+        size_t served_size = (size_t)requested_size;
+        if (granularity != 0 && served_size % granularity != 0) {
+            if (served_size > std::numeric_limits<size_t>::max() - granularity) {
+                fprintf(stderr, "keeper creator: rounded generic allocation size overflows size_t\n");
+                goto cleanup;
+            }
+            served_size = ((served_size + granularity - 1) / granularity) * granularity;
+        }
+        CUDA_CHECK(cuMemCreate(&allocation_handle, served_size, &properties, 0));
+        CUDA_CHECK(cuMemExportToShareableHandle(
+            &allocation_fd, allocation_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
+        CUmemFabricHandle exported;
+        memset(&exported, 0, sizeof(exported));
+        CUDA_CHECK(cuMemExportToShareableHandle(&exported, allocation_handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+        memcpy(response.fabric_handle, &exported, sizeof(exported));
+        response.flags |= RTP_MC_CREATOR_FLAG_FABRIC_VALID;
+        response.served_size = served_size;
+        response.status      = 0;
+        if (!sendResult(deposit_fd, response, allocation_fd)) {
+            perror("keeper generic creator sendmsg");
+            response.status = 1;
+            goto cleanup;
+        }
+        printf("BACKING_DEPOSITED pid=%d gpu=%s requested=%llu served=%llu granularity=%zu\n",
+               (int)getpid(),
+               gpu_text,
+               (unsigned long long)requested_size,
+               (unsigned long long)response.served_size,
+               granularity);
+        fflush(stdout);
+        // A raw FABRIC identity remains importable only while its exporting
+        // process owns the allocation. The holder releases this one-byte fence
+        // after every rank has completed SymmMem rendezvous.
+        char release = 0;
+        ssize_t received;
+        do {
+            received = read(deposit_fd, &release, sizeof(release));
+        } while (received < 0 && errno == EINTR);
+        if (received < 0) {
+            perror("keeper generic creator release fence");
+            goto cleanup;
+        }
+        printf("BACKING_RELEASED pid=%d gpu=%s\n", (int)getpid(), gpu_text);
+        fflush(stdout);
+        exit_code = 0;
+        goto cleanup;
+    }
+
     if (import_fabric_fd >= 0) {
         // Peer-node importer: import the fabric team the creator node produced,
         // add this node's LOCAL devices, then re-export a node-local POSIX fd so
@@ -315,15 +392,15 @@ int main(int argc, char** argv) {
         CUmemFabricHandle imported;
         memset(&imported, 0, sizeof(imported));
         memcpy(&imported, fabric_handle, sizeof(imported));
-        CUDA_CHECK(cuMemImportFromShareableHandle(&multicast_handle, &imported, CU_MEM_HANDLE_TYPE_FABRIC));
+        CUDA_CHECK(cuMemImportFromShareableHandle(&allocation_handle, &imported, CU_MEM_HANDLE_TYPE_FABRIC));
         for (CUdevice device : devices) {
-            CUDA_CHECK(cuMulticastAddDevice(multicast_handle, device));
+            CUDA_CHECK(cuMulticastAddDevice(allocation_handle, device));
         }
-        CUDA_CHECK(
-            cuMemExportToShareableHandle(&multicast_fd, multicast_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
+        CUDA_CHECK(cuMemExportToShareableHandle(
+            &allocation_fd, allocation_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
         response.served_size = requested_size;
         response.status      = 0;
-        if (!sendResult(deposit_fd, response, multicast_fd)) {
+        if (!sendResult(deposit_fd, response, allocation_fd)) {
             perror("keeper creator sendmsg");
             response.status = 1;
             goto cleanup;
@@ -355,24 +432,24 @@ int main(int argc, char** argv) {
         }
         properties.size = ((properties.size + granularity - 1) / granularity) * granularity;
     }
-    CUDA_CHECK(cuMulticastCreate(&multicast_handle, &properties));
+    CUDA_CHECK(cuMulticastCreate(&allocation_handle, &properties));
     for (CUdevice device : devices) {
-        CUDA_CHECK(cuMulticastAddDevice(multicast_handle, device));
+        CUDA_CHECK(cuMulticastAddDevice(allocation_handle, device));
     }
-    CUDA_CHECK(
-        cuMemExportToShareableHandle(&multicast_fd, multicast_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
+    CUDA_CHECK(cuMemExportToShareableHandle(
+        &allocation_fd, allocation_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
     if (want_fabric) {
         // Export the 64-byte fabric handle inline for cross-node distribution.
         CUmemFabricHandle exported;
         memset(&exported, 0, sizeof(exported));
-        CUDA_CHECK(cuMemExportToShareableHandle(&exported, multicast_handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+        CUDA_CHECK(cuMemExportToShareableHandle(&exported, allocation_handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
         memcpy(response.fabric_handle, &exported, sizeof(exported));
         response.flags |= RTP_MC_CREATOR_FLAG_FABRIC_VALID;
     }
 
     response.served_size = (uint64_t)properties.size;
     response.status      = 0;
-    if (!sendResult(deposit_fd, response, multicast_fd)) {
+    if (!sendResult(deposit_fd, response, allocation_fd)) {
         perror("keeper creator sendmsg");
         response.status = 1;
         goto cleanup;
@@ -387,8 +464,8 @@ int main(int argc, char** argv) {
     exit_code = 0;
 
 cleanup:
-    if (multicast_fd >= 0) {
-        close(multicast_fd);
+    if (allocation_fd >= 0) {
+        close(allocation_fd);
     }
     // On success, match the validated upstream lite creator: exit directly and
     // let process teardown release CUDA handles and primary contexts together.
@@ -398,8 +475,8 @@ cleanup:
         close(deposit_fd);
         return 0;
     }
-    if (multicast_handle != 0) {
-        (void)cuMemRelease(multicast_handle);
+    if (allocation_handle != 0) {
+        (void)cuMemRelease(allocation_handle);
     }
     (void)cuCtxSetCurrent(nullptr);
     for (size_t i = 0; i < contexts.size(); ++i) {

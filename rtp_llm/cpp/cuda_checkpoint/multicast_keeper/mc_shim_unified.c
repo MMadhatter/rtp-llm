@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,8 +32,30 @@ typedef void*              CUcontext;
 
 #define CUDA_SUCCESS 0
 #define CUDA_ERROR_INVALID_VALUE 1
+#define CU_MEM_ALLOCATION_TYPE_PINNED 1
+#define CU_MEM_LOCATION_TYPE_DEVICE 1
 #define CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR 0x1
 #define CU_MEM_HANDLE_TYPE_FABRIC 0x8
+
+typedef struct CUmemLocation {
+    int type;
+    int id;
+} CUmemLocation;
+
+// CUDA 13 CUmemAllocationProp ABI. Keep the shim independent of CUDA headers
+// and libcuda at link time, like the existing multicast interposition.
+typedef struct CUmemAllocationProp {
+    int           type;
+    int           requestedHandleTypes;
+    CUmemLocation location;
+    void*         win32HandleMetaData;
+    struct {
+        unsigned char  compressionType;
+        unsigned char  gpuDirectRDMACapable;
+        unsigned short usage;
+        unsigned char  reserved[4];
+    } allocFlags;
+} CUmemAllocationProp;
 
 typedef struct CUmulticastObjectProp {
     unsigned int       numDevices;
@@ -44,6 +68,8 @@ typedef int (*getentry_fn)(const char*, void**, unsigned int, unsigned long long
 typedef CUresult (*getproc_v2_fn)(const char*, void**, int, unsigned long long, int*);
 typedef CUresult (*import_fn)(CUmemGenericAllocationHandle*, void*, int);
 typedef CUresult (*export_fn)(void*, CUmemGenericAllocationHandle, int, unsigned long long);
+typedef CUresult (*memcreate_fn)(
+    CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*, unsigned long long);
 typedef CUresult (*mccreate_fn)(CUmemGenericAllocationHandle*, const CUmulticastObjectProp*);
 typedef CUresult (*mcadd_fn)(CUmemGenericAllocationHandle, CUdevice);
 typedef CUresult (*mcbind_fn)(CUmemGenericAllocationHandle,
@@ -61,21 +87,24 @@ typedef CUresult (*device_get_fn)(CUdevice*, int);
 typedef CUresult (*ctx_get_device_fn)(CUdevice*);
 typedef CUresult (*primary_ctx_retain_fn)(CUcontext*, CUdevice);
 typedef void* (*dlsym_fn)(void*, const char*);
+typedef bool (*torch_fabric_access_fn)(signed char);
 
-static dlsym_fn           real_dlsym      = NULL;
-static getentry_fn        real_getentry   = NULL;
-static getproc_v2_fn      real_getproc    = NULL;
-static import_fn          real_import     = NULL;
-static export_fn          real_export     = NULL;
-static mccreate_fn        real_mccreate   = NULL;
-static mcadd_fn           real_mcadd      = NULL;
-static mcbind_fn          real_mcbind     = NULL;
-static mcunbind_fn        real_mcunbind   = NULL;
-static memmap_fn          real_memmap     = NULL;
-static memrelease_fn      real_memrelease = NULL;
-static void*              g_libcuda       = NULL;
-static int                g_cuda_version  = 0;
-static unsigned long long g_cuda_flags    = 0;
+static dlsym_fn               real_dlsym               = NULL;
+static getentry_fn            real_getentry            = NULL;
+static getproc_v2_fn          real_getproc              = NULL;
+static import_fn              real_import               = NULL;
+static export_fn              real_export               = NULL;
+static memcreate_fn           real_memcreate            = NULL;
+static mccreate_fn            real_mccreate             = NULL;
+static mcadd_fn               real_mcadd                = NULL;
+static mcbind_fn              real_mcbind               = NULL;
+static mcunbind_fn            real_mcunbind             = NULL;
+static memmap_fn              real_memmap               = NULL;
+static memrelease_fn          real_memrelease           = NULL;
+static torch_fabric_access_fn real_torch_fabric_access  = NULL;
+static void*                  g_libcuda                 = NULL;
+static int                    g_cuda_version            = 0;
+static unsigned long long     g_cuda_flags              = 0;
 
 typedef struct keeper_handle {
     CUmemGenericAllocationHandle handle;
@@ -101,6 +130,8 @@ static raw_fabric_import* g_raw_fabric_imports = NULL;
 // cuMemRelease/rebuild cycles release it exactly once at process teardown.
 static rtp_mc_token   g_peer_refs[1024];
 static size_t         g_peer_ref_count             = 0;
+static rtp_mc_token   g_pending_backings[1024];
+static size_t         g_pending_backing_count       = 0;
 static size_t         g_handle_count               = 0;
 static size_t         g_raw_fabric_import_count    = 0;
 static size_t         g_raw_fabric_import_capacity = 0;
@@ -117,6 +148,7 @@ static uint64_t       g_owner_id         = 0;
 static uint64_t       g_owner_generation = 0;
 
 static void keeper_send_release(const rtp_mc_token* token);
+static int  keeper_send_backing_release(const rtp_mc_token* token);
 
 static int env_is_one(const char* name) {
     const char* value = getenv(name);
@@ -126,6 +158,12 @@ static int env_is_one(const char* name) {
 static int keeper_enabled(void) {
     return env_is_one("RTP_LLM_CUDA_CKPT_MULTICAST_KEEPER");
 }
+
+_Static_assert(sizeof(CUmemAllocationProp) == 32, "CUmemAllocationProp ABI changed");
+_Static_assert(offsetof(CUmemAllocationProp, location) == 8, "CUmemAllocationProp location offset changed");
+_Static_assert(
+    offsetof(CUmemAllocationProp, win32HandleMetaData) == 16, "CUmemAllocationProp metadata offset changed");
+_Static_assert(offsetof(CUmemAllocationProp, allocFlags) == 24, "CUmemAllocationProp flags offset changed");
 
 static int verbose_logging(void) {
     return env_is_one("RTP_LLM_CUDA_CKPT_MULTICAST_KEEPER_DEBUG");
@@ -318,6 +356,73 @@ static int parse_gpu_list(const char* text, int* values, size_t capacity, size_t
     return parsed_count > 0;
 }
 
+// PyTorch 2.11 chooses FABRIC handles for every CUDASymmetricMemory allocation
+// whenever the GPU advertises fabric access, even when the complete group is on
+// one host. That choice is cached in the allocator for the process lifetime.
+// On the verified GB300 CUDA Driver 580.126.20 path, a cuda-checkpoint-restored
+// rank can no longer create/export a fresh FABRIC allocation
+// (CUDA_ERROR_NOT_PERMITTED), so rebuilding symm_mem fails before the multicast
+// keeper is consulted.
+//
+// A single-node group does not need FABRIC for handle exchange: POSIX FDs carry
+// the same NVLS multicast object between local ranks, which is the path proven
+// by the upstream nekyia keeper. The collective layer publishes the policy from
+// the actual ProcessGroup immediately before the first SymmetricMemory
+// allocation. The keeper shim consumes that decision; it does not infer group
+// topology from world_size/local_world_size.
+static int should_force_torch_local_posix(void) {
+    if (!keeper_enabled()) {
+        return 0;
+    }
+    const char* policy = getenv("RTP_LLM_MC_SYMM_MEM_HANDLE_POLICY");
+    return policy != NULL && strcmp(policy, "local_posix") == 0;
+}
+
+static void resolve_real_torch_fabric_access(void) {
+    dlsym_fn lookup = get_real_dlsym();
+    if (lookup != NULL) {
+        real_torch_fabric_access =
+            (torch_fabric_access_fn)lookup(RTLD_NEXT, "_ZN2at4cuda17get_fabric_accessEa");
+    }
+}
+
+static pthread_once_t g_torch_fabric_access_once = PTHREAD_ONCE_INIT;
+static pthread_once_t g_local_posix_log_once      = PTHREAD_ONCE_INIT;
+static pthread_once_t g_missing_policy_log_once   = PTHREAD_ONCE_INIT;
+
+static void log_local_posix_policy(void) {
+    log_message(1,
+                "actual local SymmMem group: forcing Torch SymmetricMemory "
+                "handle exchange to POSIX; NVLS multicast remains enabled");
+}
+
+static void log_missing_symm_mem_policy(void) {
+    log_message(1,
+                "RTP_LLM_MC_SYMM_MEM_HANDLE_POLICY is unset; preserving Torch "
+                "fabric capability (all RTP-LLM SymmMem allocations must "
+                "configure their actual ProcessGroup before allocation)");
+}
+
+// Interpose at::cuda::get_fabric_access(c10::DeviceIndex). libtorch_cuda calls
+// this symbol through the PLT, so LD_PRELOAD can make the single-node decision
+// before CUDASymmetricMemoryAllocator caches its handle type.
+bool rtp_torch_get_fabric_access(signed char device) __asm__("_ZN2at4cuda17get_fabric_accessEa");
+bool rtp_torch_get_fabric_access(signed char device) {
+    if (should_force_torch_local_posix()) {
+        pthread_once(&g_local_posix_log_once, log_local_posix_policy);
+        return false;
+    }
+    if (keeper_enabled() && getenv("RTP_LLM_MC_SYMM_MEM_HANDLE_POLICY") == NULL) {
+        pthread_once(&g_missing_policy_log_once, log_missing_symm_mem_policy);
+    }
+    pthread_once(&g_torch_fabric_access_once, resolve_real_torch_fabric_access);
+    if (real_torch_fabric_access == NULL) {
+        log_message(1, "real at::cuda::get_fabric_access is unavailable");
+        return false;
+    }
+    return real_torch_fabric_access(device);
+}
+
 // FABRIC is allowed only under the explicit launcher contract. The holder list
 // names physical ordinals; a rank either exposes that exact ordered list through
 // CUDA_VISIBLE_DEVICES or, when unset, sees the same dense ordinal set.
@@ -478,8 +583,10 @@ static int connect_to_keeper(const char* path, int timeout_ms) {
     return -1;
 }
 
-static int
-keeper_request(const rtp_mc_request* request, const unsigned char* trailing_fabric, rtp_mc_response* response) {
+static int keeper_request_with_aux(const rtp_mc_request* request,
+                                   const unsigned char* trailing_fabric,
+                                   rtp_mc_response*     response,
+                                   int*                 auxiliary_fd) {
     char path[sizeof(((struct sockaddr_un*)0)->sun_path)];
     if (keeper_socket_path(path, sizeof(path)) == NULL) {
         log_message(1, "keeper socket path is too long");
@@ -487,7 +594,8 @@ keeper_request(const rtp_mc_request* request, const unsigned char* trailing_fabr
     }
     // CREATE and IMPORT_ADD both fork a short-lived CUDA child in the holder, so
     // they share the long creator deadline; every other opcode is a quick lookup.
-    int forks_child     = request->opcode == RTP_MC_OP_CREATE || request->opcode == RTP_MC_OP_IMPORT_ADD;
+    int forks_child = request->opcode == RTP_MC_OP_CREATE || request->opcode == RTP_MC_OP_IMPORT_ADD
+                      || request->opcode == RTP_MC_OP_CREATE_FABRIC_BACKING;
     int default_timeout = forks_child ? 125000 : 5000;
     int timeout_ms = timeout_from_env(forks_child ? "RTP_LLM_MC_CREATE_TIMEOUT_MS" : "RTP_LLM_MC_REQUEST_TIMEOUT_MS",
                                       default_timeout);
@@ -519,7 +627,7 @@ keeper_request(const rtp_mc_request* request, const unsigned char* trailing_fabr
     }
     memset(response, 0, sizeof(*response));
     struct iovec iov = {.iov_base = response, .iov_len = sizeof(*response)};
-    char         control[CMSG_SPACE(sizeof(int))];
+    char         control[CMSG_SPACE(sizeof(int) * 2)];
     memset(control, 0, sizeof(control));
     struct msghdr header;
     memset(&header, 0, sizeof(header));
@@ -529,12 +637,24 @@ keeper_request(const rtp_mc_request* request, const unsigned char* trailing_fabr
     header.msg_controllen = sizeof(control);
     ssize_t received      = recvmsg(socket_fd, &header, MSG_CMSG_CLOEXEC);
     int     received_fd   = -1;
+    if (auxiliary_fd != NULL) {
+        *auxiliary_fd = -1;
+    }
     if (received == (ssize_t)sizeof(*response) && !(header.msg_flags & MSG_CTRUNC)) {
         for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&header); cmsg != NULL; cmsg = CMSG_NXTHDR(&header, cmsg)) {
             if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS
                 && cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
-                memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
-                break;
+                size_t fd_count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                int*   fds      = (int*)CMSG_DATA(cmsg);
+                for (size_t i = 0; i < fd_count; ++i) {
+                    if (received_fd < 0) {
+                        received_fd = fds[i];
+                    } else if (auxiliary_fd != NULL && *auxiliary_fd < 0) {
+                        *auxiliary_fd = fds[i];
+                    } else {
+                        close(fds[i]);
+                    }
+                }
             }
         }
     }
@@ -545,12 +665,20 @@ keeper_request(const rtp_mc_request* request, const unsigned char* trailing_fabr
         if (received_fd >= 0) {
             close(received_fd);
         }
+        if (auxiliary_fd != NULL && *auxiliary_fd >= 0) {
+            close(*auxiliary_fd);
+            *auxiliary_fd = -1;
+        }
         log_message(1, "keeper returned an invalid protocol response opcode=%u", request->opcode);
         return -1;
     }
     if (response->status != RTP_MC_STATUS_OK || received_fd < 0) {
         if (received_fd >= 0) {
             close(received_fd);
+        }
+        if (auxiliary_fd != NULL && *auxiliary_fd >= 0) {
+            close(*auxiliary_fd);
+            *auxiliary_fd = -1;
         }
         const char* gang_epoch = getenv("RTP_LLM_MC_GANG_EPOCH");
         log_message(1,
@@ -566,6 +694,11 @@ keeper_request(const rtp_mc_request* request, const unsigned char* trailing_fabr
         return -1;
     }
     return received_fd;
+}
+
+static int
+keeper_request(const rtp_mc_request* request, const unsigned char* trailing_fabric, rtp_mc_response* response) {
+    return keeper_request_with_aux(request, trailing_fabric, response, NULL);
 }
 
 static int same_token_properties(const rtp_mc_token* left, const rtp_mc_token* right) {
@@ -597,6 +730,18 @@ static int remember_peer_ref(const rtp_mc_token* token) {
     g_peer_refs[g_peer_ref_count++] = *token;
     pthread_mutex_unlock(&g_lock);
     return 1;
+}
+
+static int remember_pending_backing(const rtp_mc_token* token) {
+    pthread_mutex_lock(&g_lock);
+    if (g_pending_backing_count == sizeof(g_pending_backings) / sizeof(g_pending_backings[0])) {
+        pthread_mutex_unlock(&g_lock);
+        log_message(1, "pending FABRIC backing table is full");
+        return -1;
+    }
+    g_pending_backings[g_pending_backing_count++] = *token;
+    pthread_mutex_unlock(&g_lock);
+    return 0;
 }
 
 static int valid_token(const rtp_mc_token* token) {
@@ -633,7 +778,8 @@ static rtp_mc_request request_from_token(uint16_t opcode, const rtp_mc_token* to
     request.opcode      = opcode;
     request.struct_size = sizeof(request);
     request.properties  = token->properties;
-    if (opcode == RTP_MC_OP_FETCH || opcode == RTP_MC_OP_RELEASE || opcode == RTP_MC_OP_FETCH_FABRIC) {
+    if (opcode == RTP_MC_OP_FETCH || opcode == RTP_MC_OP_RELEASE || opcode == RTP_MC_OP_FETCH_FABRIC
+        || opcode == RTP_MC_OP_RELEASE_FABRIC_BACKING) {
         request.holder_instance_hi = token->holder_instance_hi;
         request.holder_instance_lo = token->holder_instance_lo;
         request.object_id          = token->object_id;
@@ -931,6 +1077,167 @@ static void abort_local_create(int index, int was_create) {
     pthread_mutex_unlock(&g_lock);
 }
 
+static int is_fabric_backing_request(const CUmemAllocationProp* properties, unsigned long long flags) {
+    if (!keeper_enabled() || properties == NULL || flags != 0) {
+        return 0;
+    }
+    const char* policy = getenv("RTP_LLM_MC_SYMM_MEM_HANDLE_POLICY");
+    if (policy == NULL || strcmp(policy, "fabric") != 0) {
+        return 0;
+    }
+    static const unsigned char zero_flags[8] = {0};
+    return properties->type == CU_MEM_ALLOCATION_TYPE_PINNED
+           && properties->requestedHandleTypes == CU_MEM_HANDLE_TYPE_FABRIC
+           && properties->location.type == CU_MEM_LOCATION_TYPE_DEVICE && properties->location.id >= 0
+           && properties->win32HandleMetaData == NULL
+           && memcmp(&properties->allocFlags, zero_flags, sizeof(zero_flags)) == 0;
+}
+
+// A restored GB300 rank can import and use a new FABRIC allocation but the
+// driver may reject creating it in that restored process (CUDA 800). For an
+// explicitly cross-node SymmMem group, delegate only this exact generic backing
+// allocation to the keeper's short-lived CUDA child. The response carries both
+// a POSIX fd and the matching raw FABRIC token. Import the POSIX fd so this rank
+// owns the allocation after the child exits, and remember the FABRIC identity
+// for PyTorch's later handle exchange (CUDA cannot re-export the POSIX-imported
+// handle as FABRIC itself). The holder retains no allocation fd; it tracks only
+// the temporary creator fence until the post-rendezvous release.
+static CUresult hook_memcreate(CUmemGenericAllocationHandle* handle,
+                               size_t                        size,
+                               const CUmemAllocationProp*    properties,
+                               unsigned long long            flags) {
+    if (!is_fabric_backing_request(properties, flags)) {
+        if (real_memcreate == NULL) {
+            real_memcreate = (memcreate_fn)driver_symbol("cuMemCreate");
+        }
+        return real_memcreate == NULL ? CUDA_ERROR_INVALID_VALUE : real_memcreate(handle, size, properties, flags);
+    }
+    if (handle == NULL || size == 0 || properties->location.id == INT_MAX) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    rtp_mc_request request;
+    memset(&request, 0, sizeof(request));
+    request.magic                   = RTP_MC_PROTOCOL_MAGIC;
+    request.version                 = RTP_MC_PROTOCOL_VERSION;
+    request.opcode                  = RTP_MC_OP_CREATE_FABRIC_BACKING;
+    request.struct_size             = sizeof(request);
+    request.object_id               = (uint64_t)properties->location.id + 1;
+    request.properties.size         = size;
+    request.properties.num_devices  = 1;
+    request.properties.handle_types = RTP_MC_HANDLE_TYPE_FABRIC;
+
+    rtp_mc_response response;
+    int             token_fd    = -1;
+    int             lifetime_fd = keeper_request_with_aux(&request, NULL, &response, &token_fd);
+    if (lifetime_fd < 0 || token_fd < 0) {
+        if (lifetime_fd >= 0) {
+            close(lifetime_fd);
+        }
+        if (token_fd >= 0) {
+            close(token_fd);
+        }
+        log_message(1,
+                    "FABRIC backing broker failed size=%zu logical_device=%d; "
+                    "refusing in-process cuMemCreate fallback",
+                    size,
+                    properties->location.id);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (response.object_id == 0 || (response.holder_instance_hi == 0 && response.holder_instance_lo == 0)
+        || response.requested_size != size || response.served_size < size
+        || response.num_devices != 1 || response.handle_types != RTP_MC_HANDLE_TYPE_FABRIC || response.flags != 0
+        || response.local_device_count < request.object_id) {
+        close(lifetime_fd);
+        close(token_fd);
+        log_message(1,
+                    "FABRIC backing broker returned inconsistent metadata size=%zu "
+                    "logical_device=%d served=%llu local_devices=%u",
+                    size,
+                    properties->location.id,
+                    (unsigned long long)response.served_size,
+                    response.local_device_count);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    rtp_mc_token backing_token;
+    memset(&backing_token, 0, sizeof(backing_token));
+    memcpy(backing_token.magic, RTP_MC_TOKEN_MAGIC, sizeof(backing_token.magic));
+    backing_token.version                 = RTP_MC_PROTOCOL_VERSION;
+    backing_token.token_size              = sizeof(backing_token);
+    backing_token.holder_instance_hi      = response.holder_instance_hi;
+    backing_token.holder_instance_lo      = response.holder_instance_lo;
+    backing_token.object_id               = response.object_id;
+    backing_token.properties.size         = response.requested_size;
+    backing_token.properties.num_devices  = response.num_devices;
+    backing_token.properties.handle_types = response.handle_types;
+    backing_token.properties.flags        = response.flags;
+
+    unsigned char raw_fabric[RTP_MC_FABRIC_HANDLE_BYTES];
+    struct stat   token_info;
+    int           seals          = fcntl(token_fd, F_GET_SEALS);
+    int           required_seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    if (fstat(token_fd, &token_info) != 0 || token_info.st_size != RTP_MC_FABRIC_HANDLE_BYTES || seals < 0
+        || (seals & required_seals) != required_seals
+        || pread(token_fd, raw_fabric, sizeof(raw_fabric), 0) != (ssize_t)sizeof(raw_fabric)) {
+        close(lifetime_fd);
+        close(token_fd);
+        log_message(1, "FABRIC backing broker returned a malformed token fd");
+        (void)keeper_send_backing_release(&backing_token);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (real_import == NULL) {
+        real_import = (import_fn)driver_symbol("cuMemImportFromShareableHandle");
+    }
+    CUresult result =
+        real_import == NULL ?
+            CUDA_ERROR_INVALID_VALUE :
+            real_import(handle, (void*)(intptr_t)lifetime_fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+    close(token_fd);
+    close(lifetime_fd);
+    if (result != CUDA_SUCCESS) {
+        log_message(1,
+                    "FABRIC backing POSIX import failed size=%zu logical_device=%d result=%d",
+                    size,
+                    properties->location.id,
+                    result);
+        (void)keeper_send_backing_release(&backing_token);
+        return result;
+    }
+    if (remember_raw_fabric_import(*handle, raw_fabric) != 0) {
+        int saved_errno = errno;
+        if (real_memrelease == NULL) {
+            real_memrelease = (memrelease_fn)driver_symbol("cuMemRelease");
+        }
+        if (real_memrelease != NULL) {
+            (void)real_memrelease(*handle);
+        }
+        log_message(1, "cannot track brokered FABRIC backing: %s", strerror(saved_errno));
+        (void)keeper_send_backing_release(&backing_token);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (remember_pending_backing(&backing_token) != 0) {
+        if (real_memrelease == NULL) {
+            real_memrelease = (memrelease_fn)driver_symbol("cuMemRelease");
+        }
+        if (real_memrelease != NULL) {
+            (void)real_memrelease(*handle);
+        }
+        pthread_mutex_lock(&g_lock);
+        discard_raw_fabric_import_locked(*handle);
+        pthread_mutex_unlock(&g_lock);
+        (void)keeper_send_backing_release(&backing_token);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    log_message(1,
+                "FABRIC backing brokered object=%llu size=%zu served=%llu logical_device=%d handle=0x%llx",
+                (unsigned long long)backing_token.object_id,
+                size,
+                (unsigned long long)response.served_size,
+                properties->location.id,
+                (unsigned long long)*handle);
+    return CUDA_SUCCESS;
+}
+
 static CUresult hook_mccreate(CUmemGenericAllocationHandle* handle, const CUmulticastObjectProp* properties) {
     if (!keeper_enabled()) {
         if (real_mccreate == NULL) {
@@ -1180,6 +1487,23 @@ hook_export(void* shareable_handle, CUmemGenericAllocationHandle handle, int typ
         // the c10d store to peer nodes for cross-machine (MNNVL) import.
         return keeper_export_fabric(&token, shareable_handle);
     }
+    if (keeper_enabled() && type == CU_MEM_HANDLE_TYPE_FABRIC && flags == 0 && shareable_handle != NULL) {
+        unsigned char                raw_fabric[RTP_MC_FABRIC_HANDLE_BYTES];
+        int                          keeper_registered = 0;
+        CUmemGenericAllocationHandle keeper_handle     = 0;
+        if (get_raw_fabric_import(handle, raw_fabric, &keeper_registered, &keeper_handle) == 0) {
+            // CUDA does not allow re-exporting an imported generic allocation
+            // to a different handle representation. Return the exact FABRIC
+            // identity it was imported from; this is what PyTorch needs to
+            // publish through its store.
+            memcpy(shareable_handle, raw_fabric, sizeof(raw_fabric));
+            log_message(0,
+                        "re-exported tracked FABRIC identity handle=0x%llx multicast=%d",
+                        (unsigned long long)handle,
+                        keeper_registered);
+            return CUDA_SUCCESS;
+        }
+    }
     if (real_export == NULL) {
         real_export = (export_fn)driver_symbol("cuMemExportToShareableHandle");
     }
@@ -1349,10 +1673,96 @@ static void keeper_send_release(const rtp_mc_token* token) {
     close(socket_fd);
 }
 
+static int keeper_send_backing_release(const rtp_mc_token* token) {
+    if (!valid_token(token)) {
+        return -1;
+    }
+    char path[sizeof(((struct sockaddr_un*)0)->sun_path)];
+    if (keeper_socket_path(path, sizeof(path)) == NULL) {
+        return -1;
+    }
+    int timeout_ms = timeout_from_env("RTP_LLM_MC_CREATE_TIMEOUT_MS", 125000);
+    int socket_fd  = connect_to_keeper(path, timeout_ms);
+    if (socket_fd < 0) {
+        return -1;
+    }
+    ensure_owner_identity();
+    rtp_mc_request_ext message;
+    memset(&message, 0, sizeof(message));
+    message.base             = request_from_token(RTP_MC_OP_RELEASE_FABRIC_BACKING, token);
+    message.base.struct_size = sizeof(message);
+    message.owner_id         = g_owner_id;
+    message.owner_generation = g_owner_generation;
+    rtp_mc_response response;
+    ssize_t sent = send(socket_fd, &message, sizeof(message), MSG_NOSIGNAL);
+    ssize_t received = sent == (ssize_t)sizeof(message) ? recv(socket_fd, &response, sizeof(response), 0) : -1;
+    close(socket_fd);
+    int valid = received == (ssize_t)sizeof(response) && response.magic == RTP_MC_PROTOCOL_MAGIC
+                && response.version == RTP_MC_PROTOCOL_VERSION
+                && response.opcode == RTP_MC_OP_RELEASE_FABRIC_BACKING
+                && response.struct_size == sizeof(response) && response.status == RTP_MC_STATUS_OK
+                && response.holder_instance_hi == token->holder_instance_hi
+                && response.holder_instance_lo == token->holder_instance_lo;
+    if (!valid) {
+        log_message(1,
+                    "FABRIC backing release failed object=%llu owner=%llu generation=%llu status=%d",
+                    (unsigned long long)token->object_id,
+                    (unsigned long long)g_owner_id,
+                    (unsigned long long)g_owner_generation,
+                    received == (ssize_t)sizeof(response) ? response.status : -1);
+        return -1;
+    }
+    log_message(0, "FABRIC backing release completed object=%llu", (unsigned long long)token->object_id);
+    return 0;
+}
+
+// Called by the SymmMem allocation scope after every rank has completed
+// rendezvous. It releases only the creator-process fences; the rank's mappings
+// continue to own the backing allocations during service.
+int rtp_llm_mc_release_fabric_backings(void) {
+    if (!keeper_enabled()) {
+        return 0;
+    }
+    rtp_mc_token pending[sizeof(g_pending_backings) / sizeof(g_pending_backings[0])];
+    size_t       pending_count = 0;
+    pthread_mutex_lock(&g_lock);
+    pending_count = g_pending_backing_count;
+    memcpy(pending, g_pending_backings, pending_count * sizeof(*pending));
+    g_pending_backing_count = 0;
+    pthread_mutex_unlock(&g_lock);
+
+    rtp_mc_token failed[sizeof(g_pending_backings) / sizeof(g_pending_backings[0])];
+    size_t       failed_count = 0;
+    int          released     = 0;
+    for (size_t i = 0; i < pending_count; ++i) {
+        if (keeper_send_backing_release(&pending[i]) == 0) {
+            ++released;
+        } else {
+            failed[failed_count++] = pending[i];
+        }
+    }
+    if (failed_count != 0) {
+        pthread_mutex_lock(&g_lock);
+        size_t available =
+            sizeof(g_pending_backings) / sizeof(g_pending_backings[0]) - g_pending_backing_count;
+        size_t retained = failed_count < available ? failed_count : available;
+        memcpy(
+            &g_pending_backings[g_pending_backing_count], failed, retained * sizeof(*g_pending_backings));
+        g_pending_backing_count += retained;
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    if (released != 0) {
+        log_message(1, "released %d FABRIC backing creator fence(s) after SymmMem rendezvous", released);
+    }
+    return released;
+}
+
 __attribute__((destructor)) static void shim_release_owned_objects(void) {
     if (!keeper_enabled()) {
         return;
     }
+    (void)rtp_llm_mc_release_fabric_backings();
     // Snapshot and deduplicate locally-created and raw-FABRIC peer references
     // under the lock, then release outside it so socket I/O never holds g_lock.
     rtp_mc_token owned[sizeof(g_handles) / sizeof(g_handles[0]) + sizeof(g_peer_refs) / sizeof(g_peer_refs[0])];
@@ -1384,6 +1794,13 @@ __attribute__((destructor)) static void shim_release_owned_objects(void) {
 }
 
 static void* swap_symbol(const char* symbol, void* resolved) {
+    if (strcmp(symbol, "cuMemCreate") == 0) {
+        if (resolved != (void*)hook_memcreate) {
+            real_memcreate = (memcreate_fn)resolved;
+        }
+        log_message(0, "hooked %s resolved=%p", symbol, resolved);
+        return (void*)hook_memcreate;
+    }
     if (strcmp(symbol, "cuMemImportFromShareableHandle") == 0) {
         if (resolved != (void*)hook_import) {
             real_import = (import_fn)resolved;
@@ -1444,6 +1861,13 @@ static void* swap_symbol(const char* symbol, void* resolved) {
 
 // Export direct symbols as well as replacing CUDA entry-point queries. Some
 // NCCL/PyTorch versions link these APIs directly or dlsym them from libcuda.
+CUresult cuMemCreate(CUmemGenericAllocationHandle* handle,
+                     size_t                        size,
+                     const CUmemAllocationProp*    properties,
+                     unsigned long long            flags) {
+    return hook_memcreate(handle, size, properties, flags);
+}
+
 CUresult cuMulticastCreate(CUmemGenericAllocationHandle* handle, const CUmulticastObjectProp* properties) {
     return hook_mccreate(handle, properties);
 }

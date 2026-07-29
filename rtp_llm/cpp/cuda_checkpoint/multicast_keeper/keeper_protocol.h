@@ -45,6 +45,18 @@ typedef enum rtp_mc_opcode {
     //                  unchanged), mirroring how identity tokens are transported.
     RTP_MC_OP_IMPORT_ADD   = 5,
     RTP_MC_OP_FETCH_FABRIC = 6,
+    // Short-lived FABRIC backing allocation broker. A checkpoint-restored rank
+    // can be forbidden from calling cuMemCreate(FABRIC) even though importing
+    // and using a newly-created allocation is supported. The CUDA-free holder
+    // asks its short-lived creator child to create one generic allocation and
+    // returns its POSIX fd plus FABRIC identity to the caller. The creator stays
+    // alive only until every SymmMem participant finishes rendezvous, then the
+    // caller sends RELEASE_FABRIC_BACKING. This prevents the exported FABRIC
+    // identity from expiring mid-rendezvous without retaining any backing
+    // allocation across Level3 sleep. For CREATE, request.object_id is the
+    // caller-visible CUDA device ordinal plus one (zero remains invalid).
+    RTP_MC_OP_CREATE_FABRIC_BACKING = 7,
+    RTP_MC_OP_RELEASE_FABRIC_BACKING = 8,
 } rtp_mc_opcode;
 
 typedef enum rtp_mc_status {
@@ -145,7 +157,9 @@ typedef struct rtp_mc_token {
 // travels inline in fabric_handle, flagged by RTP_MC_CREATOR_FLAG_FABRIC_VALID.
 // A peer-node importer child reuses this same result to return its re-exported
 // POSIX fd, leaving fabric_handle unset (single-node POSIX path leaves it unset
-// too, so flags == 0 and the extra bytes are ignored).
+// too, so flags == 0 and the extra bytes are ignored). Generic FABRIC backing
+// creation returns both a POSIX allocation fd and fabric_handle, then waits on
+// the private socket until the holder releases its rendezvous fence.
 #define RTP_MC_CREATOR_FLAG_FABRIC_VALID 0x1u
 
 typedef struct rtp_mc_creator_result {

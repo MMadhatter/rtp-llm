@@ -41,13 +41,52 @@ creators need an explicit communicator identity API before enabling this shim.
 
 Single-node POSIX multicast requires `numDevices` to equal the holder's complete
 local GPU list. FABRIC multicast requires `--fabric-team-size N`; every request
-must use exactly that global `numDevices`. FABRIC is not limited to cross-node
-jobs: GB200/GB300 may select it for a complete single-node team as well. The
-runtime therefore always supplies the global `world_size` as the FABRIC team
-contract while the actual request `handleTypes` selects POSIX or FABRIC. The
-generated backend environment exports the same local list and global size, and
-the shim rejects a rank unless its visible GPU list exactly matches the holder
-list.
+must use exactly that global `numDevices`. The runtime always supplies the
+global `world_size` as the FABRIC team contract because the same artifacts also
+serve cross-node MNNVL groups.
+
+PyTorch 2.11 otherwise selects FABRIC handles for every symmetric-memory
+allocation when GB300 advertises fabric access, including a complete
+single-node team. CUDA Driver 580.126.20 was verified to reject a new generic
+FABRIC allocation with `CUDA_ERROR_NOT_PERMITTED` after restoring the same
+process, while POSIX create/export/import continues to work.
+
+RTP-LLM therefore resolves the actual `torch.distributed.ProcessGroup` ranks
+immediately before each SymmetricMemory allocation. A group containing only
+this node's complete rank/GPU set selects POSIX; a group containing remote
+ranks selects FABRIC. The result is published to the shim through the internal
+`RTP_LLM_MC_SYMM_MEM_HANDLE_POLICY` contract. The keeper and shim never infer
+this decision from `world_size == local_world_size`. This does not disable the
+multicast object or NVLS kernels; it only changes how ranks exchange backing
+and multicast handles.
+
+For a cross-node group, selecting FABRIC is necessary but a restored GB300 rank
+may still be forbidden from calling the generic `cuMemCreate(FABRIC)` used for
+each SymmMem backing allocation. The shim delegates only that exact allocation
+shape to a short-lived creator child. It imports the returned POSIX FD into the
+rank and records the matching raw FABRIC identity for PyTorch's store exchange.
+The creator remains alive while peers import that identity. After rendezvous,
+RTP-LLM performs one group barrier and releases the creator fence; the rank
+mappings then own the allocation normally. No generic backing allocation or
+creator process survives into Level3 sleep.
+
+This broker is separate from multicast-object retention: multicast FDs remain
+in the holder across checkpoint, while generic backing creators exist only for
+one cold-start/wake rendezvous. It is inactive for local POSIX groups, when the
+keeper is disabled, and for every `cuMemCreate` property shape other than
+pinned device memory requesting exactly FABRIC with zero flags.
+
+PyTorch's CUDA SymmetricMemory allocator caches one handle type for the process
+lifetime. A process that would mix a local POSIX SymmMem group with a
+cross-node FABRIC group is rejected before allocation with the owner and group
+ranks in the error. The current holder also requires a local group to cover the
+complete holder GPU list and a FABRIC group to match the explicit FABRIC team
+size; unsupported subgroup layouts fail fast instead of entering CUDA with a
+wrong `numDevices` contract.
+
+The generated backend environment exports the same local list and global size,
+and the shim rejects a rank unless its visible GPU list exactly matches the
+holder list.
 These checks keep incomplete or mixed NVLink partitions from reaching a CUDA
 bind/map that waits for missing team members. `flags` must be zero and
 `handleTypes` may only contain POSIX FD and FABRIC.
@@ -147,12 +186,13 @@ The independent Python entry point is
 `rtp_llm.utils.multicast_keeper.MulticastKeeperRuntime`. It selects
 `single_node` when `world_size == local_world_size`, otherwise
 `cross_node_fabric`. The mode describes process placement, not the only allowed
-CUDA handle type: both modes inject the global FABRIC team size, allowing
-single-node GB200/GB300 jobs to use FABRIC while preserving POSIX operation on
-other systems. Cross-node mode starts one holder on each node while retaining
-only that node's physical GPU list. Cross-node handle publication and barriers
-use the existing RTP-LLM lifecycle TCPStore; holders remain node-local and
-never form a second control plane.
+CUDA handle type: both modes inject the global FABRIC team size, while the
+collective layer selects POSIX exchange for an actual complete node-local
+PyTorch symmetric-memory group and preserves FABRIC for an actual cross-node
+MNNVL group. Cross-node mode starts one holder on
+each node while retaining only that node's physical GPU list. Cross-node handle
+publication and barriers use the existing RTP-LLM lifecycle TCPStore; holders
+remain node-local and never form a second control plane.
 
 The holder is intentionally started empty before NCCL and SymmetricMemory
 initialization. The shim captures multicast objects as CUDA creates/imports
@@ -178,8 +218,9 @@ bootstrap. Sleep disabled, Level 1, and Level 2 follow the original distributed
 startup and failure behavior and do not write generation keys.
 
 The architecture-neutral runtime test starts the native holder in both modes,
-checks its protocol identity, verifies every ELF matches the current host, and
-preloads the real shim into Python. Run it under both native build configs:
+checks its protocol identity, verifies every ELF matches the current host,
+preloads the real shim into Python, and verifies the single-node PyTorch FABRIC
+capability interposition. Run it under both native build configs:
 
 ```bash
 bazelisk test //rtp_llm/utils/test:multicast_keeper_runtime_test \
@@ -187,6 +228,16 @@ bazelisk test //rtp_llm/utils/test:multicast_keeper_runtime_test \
 
 bazelisk test //rtp_llm/utils/test:multicast_keeper_runtime_test \
   --config=cuda13 --test_output=errors
+```
+
+The manual GPU test validates the cross-node backing primitive without
+requiring two nodes: creator allocation, POSIX import, FABRIC re-export/import,
+rendezvous-fence release, and clean creator exit.
+
+```bash
+bazelisk test \
+  //rtp_llm/utils/test:multicast_keeper_fabric_backing_gpu_test \
+  --config=cuda13_arm --test_output=streamed
 ```
 
 ## Checkpoint lifecycle
@@ -199,7 +250,9 @@ bazelisk test //rtp_llm/utils/test:multicast_keeper_runtime_test \
 4. Checkpoint only rank PIDs. Never pass the holder PID to `cuda-checkpoint`.
 5. Restore and unlock every rank.
 6. Rebuild NCCL and symmetric-memory resources. The shim reimports the cached
-   multicast object from the surviving holder.
+   multicast object from the surviving holder. Cross-node SymmMem backing
+   allocations are created by temporary creator children and their fences are
+   released after the post-rendezvous group barrier.
 
 Each backend rank pins its device with `torch.cuda.set_device(local_rank)`, so
 the device rank `r` binds NVLS memory on is `cuDeviceGet(r)` under the rank's

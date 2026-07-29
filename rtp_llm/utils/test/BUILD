@@ -44,6 +44,21 @@ py_test(
 )
 
 py_test(
+    name = "multicast_keeper_fabric_backing_gpu_test",
+    srcs = ["multicast_keeper_fabric_backing_gpu_test.py"],
+    data = select({
+        "@//:using_cuda": [
+            "//rtp_llm/cpp/cuda_checkpoint/multicast_keeper:runtime_files",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = ["//rtp_llm:utils"],
+    size = "large",
+    tags = ["manual", "local", "no-remote"],
+    timeout = "long",
+)
+
+py_test(
     name = "multicast_keeper_generation_test",
     srcs = ["multicast_keeper_generation_test.py"],
     deps = ["//rtp_llm:utils"],

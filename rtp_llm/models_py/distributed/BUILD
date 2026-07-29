@@ -8,6 +8,7 @@ py_library(
         "collective_torch.py",
         "rocm_rccl.py",
         "symm_mem.py",
+        "symm_mem_group_scope.py",
     ],
     deps = [
         "//rtp_llm:ops",

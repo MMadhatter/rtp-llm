@@ -669,6 +669,35 @@ class Level3PhaseCoordinationTest(unittest.TestCase):
             ct._initialized = old_initialized
             ct._process_group_generation = old_generation
 
+    def test_only_tp_group_members_initialize_symmetric_memory(self):
+        old_group_map = ct._group_map
+        ct._group_map = {}
+        parallelism_config = SimpleNamespace(
+            world_rank=0,
+            world_size=4,
+            tp_size=2,
+            dp_size=2,
+        )
+        symm_mem = Mock()
+        try:
+            with patch.object(
+                ct.torch.distributed,
+                "new_group",
+                side_effect=lambda ranks, **_kwargs: tuple(ranks),
+            ), patch.object(ct.torch.distributed, "barrier"), patch.object(
+                ct, "_get_symm_mem", return_value=symm_mem
+            ), patch.object(ct, "_maybe_create_sleep_quiesce_group"):
+                ct._create_process_groups(
+                    parallelism_config,
+                    backend="nccl",
+                    timeout=ct.timedelta(days=1),
+                )
+
+            symm_mem.init_symm_mem_communicator.assert_called_once_with((0, 1))
+            self.assertEqual(ct._group_map["TP0"], (0, 1))
+        finally:
+            ct._group_map = old_group_map
+
     def test_process_group_teardown_ignores_post_destroy_cleanup_failures(self):
         old_group_map = ct._group_map
         old_parallelism_config = ct._parallelism_config

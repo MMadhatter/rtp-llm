@@ -33,6 +33,7 @@ SHIM_ENV = "RTP_LLM_MC_SHIM"
 BIN_DIR_ENV = "RTP_LLM_MC_KEEPER_BIN_DIR"
 LOCAL_GPU_ENV = "RTP_LLM_MC_LOCAL_GPUS"
 FABRIC_TEAM_ENV = "RTP_LLM_MC_FABRIC_TEAM_SIZE"
+SYMM_MEM_HANDLE_POLICY_ENV = "RTP_LLM_MC_SYMM_MEM_HANDLE_POLICY"
 SOCKET_ENV = "RTP_LLM_CUDA_CKPT_MULTICAST_SOCKET"
 KEEPER_DIR_ENV = "NEKYIA_KEEPER_DIR"
 
@@ -662,6 +663,10 @@ class MulticastKeeperRuntime:
         child_env[SOCKET_ENV] = str(self.socket_path)
         child_env[LOCAL_GPU_ENV] = ",".join(str(gpu) for gpu in self.gpus)
         child_env[FABRIC_TEAM_ENV] = str(self.fabric_team_size)
+        # This is selected inside each backend rank from the actual
+        # torch.distributed ProcessGroup immediately before its first SymmMem
+        # allocation. Never inherit a stale parent-process decision.
+        child_env.pop(SYMM_MEM_HANDLE_POLICY_ENV, None)
         child_env.setdefault("TORCH_SYMM_MEM_DISABLE_MULTICAST", "0")
         child_env.setdefault(
             "RTP_LLM_MC_REQUEST_TIMEOUT_MS", str(self.request_timeout_ms)
@@ -779,6 +784,7 @@ __all__ = [
     "MulticastKeeperHealthError",
     "MulticastKeeperMode",
     "MulticastKeeperRuntime",
+    "SYMM_MEM_HANDLE_POLICY_ENV",
     "discover_artifacts",
     "is_enabled",
 ]

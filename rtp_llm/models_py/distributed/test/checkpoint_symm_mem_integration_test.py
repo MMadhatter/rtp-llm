@@ -40,6 +40,9 @@ _FLUSH_HOST_CACHE = (
 _USE_MULTICAST_KEEPER = (
     os.environ.get("RTP_LLM_CHECKPOINT_TEST_MULTICAST_KEEPER", "0") == "1"
 )
+_USE_MEGA_MOE_BUFFER = (
+    os.environ.get("RTP_LLM_CHECKPOINT_TEST_MEGA_MOE_BUFFER", "0") == "1"
+)
 
 
 def _symmetric_memory_enabled(generation):
@@ -66,6 +69,7 @@ class _WorkerSkip(RuntimeError):
 def _run_collective_generation(torch, dist, symm_mem, rank, init_path, generation):
     """Build communicators, run both real collectives, then fully tear down."""
     communicator = None
+    mega_buffer = None
     symm_buffer = None
     symm_handle = None
     expected = float(
@@ -121,6 +125,13 @@ def _run_collective_generation(torch, dist, symm_mem, rank, init_path, generatio
             communicator = symm_mem.init_symm_mem_communicator(dist.group.WORLD)
             if communicator is None or communicator.disabled:
                 raise RuntimeError("Torch symmetric-memory communicator is disabled")
+            print(
+                "CHECKPOINT_SYMM_MEM "
+                f"rank={rank} generation={generation} "
+                f"multicast_ptr={int(communicator.handle.multicast_ptr)} "
+                f"transport={communicator.transport}",
+                flush=True,
+            )
 
             symm_value = torch.full(
                 (4,), local_value, dtype=torch.bfloat16, device="cuda"
@@ -151,6 +162,60 @@ def _run_collective_generation(torch, dist, symm_mem, rank, init_path, generatio
                 )
             symm_handle.barrier()
 
+        mega_result = None
+        if _USE_MEGA_MOE_BUFFER:
+            import deep_gemm
+
+            # Exercise the exact DeepGEMM allocation path used by DSV4 Mega MoE,
+            # while keeping the isolated integration test small. DeepGEMM aligns
+            # the token capacity to its production kernel requirement.
+            mega_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+                group=dist.group.WORLD,
+                num_experts=16,
+                num_max_tokens_per_rank=16,
+                num_topk=2,
+                hidden=1024,
+                intermediate_hidden=512,
+                use_fp8_dispatch=True,
+                activation="swiglu",
+            )
+            mega_bytes = int(
+                mega_buffer.buffer.numel() * mega_buffer.buffer.element_size()
+            )
+            mega_buffer.buffer[0] = rank + generation * _WORLD_SIZE + 1
+            mega_buffer.handle.barrier()
+            peer_values = [
+                int(
+                    mega_buffer.handle.get_buffer(
+                        peer_rank,
+                        mega_buffer.buffer.shape,
+                        mega_buffer.buffer.dtype,
+                    )[0].item()
+                )
+                for peer_rank in range(_WORLD_SIZE)
+            ]
+            expected_peer_values = [
+                peer_rank + generation * _WORLD_SIZE + 1
+                for peer_rank in range(_WORLD_SIZE)
+            ]
+            if peer_values != expected_peer_values:
+                raise AssertionError(
+                    f"Mega MoE peer values {peer_values}, "
+                    f"expected {expected_peer_values}"
+                )
+            mega_result = {
+                "bytes": mega_bytes,
+                "multicast": bool(mega_buffer.handle.multicast_ptr),
+                "peer_values": peer_values,
+            }
+            print(
+                "CHECKPOINT_MEGA_MOE_SYMM_MEM "
+                f"rank={rank} generation={generation} bytes={mega_bytes} "
+                f"multicast_ptr={int(mega_buffer.handle.multicast_ptr)} "
+                f"peer_values={peer_values}",
+                flush=True,
+            )
+
         torch.cuda.synchronize(rank)
         nccl_result = float(nccl_value.item())
         symm_result_value = (
@@ -173,11 +238,18 @@ def _run_collective_generation(torch, dist, symm_mem, rank, init_path, generatio
         symm_buffer = None
         dist.barrier()
         torch.cuda.synchronize(rank)
-        return {"nccl": nccl_result, "symm": symm_result_value}
+        return {
+            "nccl": nccl_result,
+            "symm": symm_result_value,
+            "mega": mega_result,
+        }
     finally:
         if dist.is_initialized():
             # Symmetric-memory mappings retain the process group. They must be
             # released before ProcessGroupNCCL is destroyed.
+            if mega_buffer is not None:
+                mega_buffer.destroy()
+                mega_buffer = None
             symm_mem.destroy_symm_mem_communicator()
             dist.destroy_process_group()
             if dist.is_initialized():
@@ -483,36 +555,42 @@ class CheckpointSymmetricMemoryIntegrationTest(unittest.TestCase):
 
                 for connection in connections.values():
                     connection.send("run-initial")
-                quiesced = _receive_all(
-                    connections, processes, "quiesced", _PHASE_TIMEOUT_SECONDS
+                initial_kind = "complete" if _CHECKPOINT_CYCLES == 0 else "quiesced"
+                initial = _receive_all(
+                    connections, processes, initial_kind, _PHASE_TIMEOUT_SECONDS
                 )
                 self._assert_generation_results(
-                    quiesced, generation=0, processes=processes
+                    initial, generation=0, processes=processes
                 )
 
-                try:
-                    # This initializes only the parent-side driver control API;
-                    # the parent never imports torch or creates a CUDA context.
-                    driver = LibCudaCheckpointDriver()
-                except CheckpointError as error:
-                    if _checkpoint_api_unavailable(error):
-                        self.skipTest(str(error))
-                    raise
+                targets = []
+                if _CHECKPOINT_CYCLES > 0:
+                    try:
+                        # This initializes only the parent-side driver control
+                        # API; the parent never imports torch or creates a CUDA
+                        # context.
+                        driver = LibCudaCheckpointDriver()
+                    except CheckpointError as error:
+                        if _checkpoint_api_unavailable(error):
+                            self.skipTest(str(error))
+                        raise
 
-                controller = CheckpointController(
-                    manifest_path,
-                    driver=driver,
-                    lock_timeout_ms=_LOCK_TIMEOUT_MS,
-                )
-                targets = [
-                    CheckpointTarget(
-                        pid=processes[rank].pid,
-                        rank=rank,
-                        address=f"local-rank://{rank}",
-                        expected_starttime=read_process_starttime(processes[rank].pid),
+                    controller = CheckpointController(
+                        manifest_path,
+                        driver=driver,
+                        lock_timeout_ms=_LOCK_TIMEOUT_MS,
                     )
-                    for rank in range(_WORLD_SIZE)
-                ]
+                    targets = [
+                        CheckpointTarget(
+                            pid=processes[rank].pid,
+                            rank=rank,
+                            address=f"local-rank://{rank}",
+                            expected_starttime=read_process_starttime(
+                                processes[rank].pid
+                            ),
+                        )
+                        for rank in range(_WORLD_SIZE)
+                    ]
                 for cycle in range(_CHECKPOINT_CYCLES):
                     try:
                         checkpoint_status = controller.checkpoint_all(
@@ -576,6 +654,20 @@ class CheckpointSymmetricMemoryIntegrationTest(unittest.TestCase):
                 self.assertEqual(message["results"]["symm"], expected)
             else:
                 self.assertIsNone(message["results"]["symm"])
+            if _USE_MEGA_MOE_BUFFER:
+                mega_result = message["results"]["mega"]
+                self.assertIsNotNone(mega_result)
+                self.assertGreater(mega_result["bytes"], 0)
+                self.assertTrue(mega_result["multicast"])
+                self.assertEqual(
+                    mega_result["peer_values"],
+                    [
+                        peer_rank + generation * _WORLD_SIZE + 1
+                        for peer_rank in range(_WORLD_SIZE)
+                    ],
+                )
+            else:
+                self.assertIsNone(message["results"]["mega"])
 
 
 if __name__ == "__main__":

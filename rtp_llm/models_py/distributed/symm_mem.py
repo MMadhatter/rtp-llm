@@ -8,6 +8,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from rtp_llm.models_py.distributed.symm_mem_group_scope import (
+    symm_mem_allocation_scope,
+)
+
 MiB = 1024 * 1024
 
 TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES = {
@@ -127,15 +131,16 @@ class TorchSymmMemCommunicator:
         self.max_size = TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability][
             self.world_size
         ]
-        self.buffer = torch_symm_mem.empty(
-            self.max_size // self.dtype.itemsize,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        # Try ProcessGroup object first, fallback to group_name if needed
-        self.handle = torch_symm_mem.rendezvous(
-            self.buffer, group=self.group.group_name
-        )
+        with symm_mem_allocation_scope(group, owner="torch_symm_mem"):
+            self.buffer = torch_symm_mem.empty(
+                self.max_size // self.dtype.itemsize,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            # Try ProcessGroup object first, fallback to group_name if needed
+            self.handle = torch_symm_mem.rendezvous(
+                self.buffer, group=self.group.group_name
+            )
         self.has_multicast_support = self.handle.multicast_ptr != 0
         # Level3 transport split: multicast objects are preserved by the external
         # keeper; RDMA-backed symm_mem is rebuilt on wake. See

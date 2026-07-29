@@ -749,6 +749,11 @@ def _rebuild_torch_process_groups() -> None:
     parallelism_config = snapshot.parallelism_config
     nccl_comm_config = snapshot.nccl_comm_config
     _normalize_parallelism_ranks(parallelism_config)
+    from rtp_llm.models_py.distributed.symm_mem_group_scope import (
+        configure_rank_topology,
+    )
+
+    configure_rank_topology(parallelism_config)
     _cpu_tp_broadcaster_base_path = _make_cpu_tp_broadcaster_base_path(
         parallelism_config, snapshot.nccl_init_port
     )
@@ -888,8 +893,11 @@ def _create_process_groups(
                     logging.info(
                         f"[rank: {world_rank}] Stored TP group with key: {group_key} {tp_group} with ranks: {tp_ranks}"
                     )
-
-                _get_symm_mem().init_symm_mem_communicator(tp_group)
+                    # Only members may allocate/rendezvous symmetric memory for
+                    # this group. Calling this for GroupMember.NON_GROUP_MEMBER
+                    # also makes actual-scope validation see another node's TP
+                    # group and can select the wrong process-wide handle type.
+                    _get_symm_mem().init_symm_mem_communicator(tp_group)
 
                 # All ranks must wait for group creation to complete
                 torch.distributed.barrier()

@@ -67,6 +67,15 @@ py_test(
 )
 
 py_test(
+    name = "symm_mem_group_scope_test",
+    srcs = ["symm_mem_group_scope_test.py"],
+    deps = [
+        "//rtp_llm/models_py/distributed:collective_torch",
+    ],
+    timeout = "short",
+)
+
+py_test(
     name = "mega_symm_lifecycle_test",
     srcs = ["mega_symm_lifecycle_test.py"],
     deps = [
@@ -80,6 +89,7 @@ py_test(
     name = "checkpoint_symm_mem_integration_test",
     srcs = ["checkpoint_symm_mem_integration_test.py"],
     deps = [
+        "//rtp_llm:deep_gemm",
         "//rtp_llm:torch",
         "//rtp_llm:utils",
         "//rtp_llm/models_py/distributed:collective_torch",
