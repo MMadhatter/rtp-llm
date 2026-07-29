@@ -56,7 +56,9 @@ configuration. The matching decode role is TP1/DP2/EP2 and uses
 
 Run the read-only preflight first. It validates the model, topology text,
 ports, GPU availability, RDMA, memlock escalation, CUDA13 Python dependencies,
-and the NVLS/multicast keeper without starting or stopping a service:
+and the multicast-keeper wiring without starting or stopping a service. The
+keeper does not configure `NCCL_NVLS_ENABLE`; NCCL's default or an explicitly
+provided value is preserved:
 
 ```bash
 MODEL_DIR=/mnt/nas1/hf/DeepSeek-V4-Flash \
@@ -232,8 +234,10 @@ The Level 3 lifecycle is therefore fail-closed:
 4. release raw KV staged-copy `cudaHostAlloc` scratch and reject late staged
    copies while suspended;
 5. clear derived FlashInfer parameter caches;
-6. flush PyTorch's caching host allocator and require its authoritative
-   backing-block counters, `allocations` and `allocated_bytes`, to be zero.
+6. flush PyTorch's caching host allocator; if blocks are waiting on events
+   recorded during owner teardown, synchronize once and flush again;
+7. require the final authoritative backing-block counters, `allocations` and
+   `allocated_bytes`, to be zero.
 
 Some PyTorch versions leave `active_bytes` and `active_requests` stale after a
 no-event free. They may remain non-zero even when `empty_cache()` has released
@@ -254,7 +258,7 @@ A successful Level 3 transition produces these lines once per rank:
 
 ```text
 [PinnedHost][owners] level=3 phase=suspend local_rank=... engine=PASS kv_pd_connector=PASS flashinfer_cache=PASS result=PASS
-[PinnedHost][verify] before={...} after={active_bytes=... active_requests=... allocations=0 allocated_bytes=0}
+[PinnedHost][verify] before={...} initial_flush={...} event_drain_retry=... after={active_bytes=... active_requests=... allocations=0 allocated_bytes=0}
 [PinnedHost][checkpoint-gate] PASS level=3 local_rank=... owners_suspended=1 torch_backing_empty=1 backing_allocations=0 backing_bytes=0 active_requests_telemetry=... active_bytes_telemetry=... active_counters_stale=... action=allow_checkpoint
 ```
 
@@ -295,6 +299,13 @@ Interpret the last completed line as follows:
   ran. `[PinnedHost][checkpoint-gate] FAIL` includes the authoritative backing
   counters and means checkpoint was refused because a live or cached PyTorch
   pinned allocation remains.
+- `action=synchronize_and_retry` means the initial allocator flush found
+  blocks waiting on CUDA events recorded while pinned owners were destroyed.
+  The verifier performs one terminal device synchronization and a second
+  flush. This is expected for small per-request metadata blocks. If the final
+  `after={...}` still has non-zero `allocations`/`allocated_bytes`, the
+  remaining allocation is genuinely live (or belongs to a non-freeable
+  private pool) and checkpoint remains blocked.
 - If all ranks log `[PinnedHost][checkpoint-gate] PASS` but restore still
   fails with 801, inspect raw CUDA allocations, multicast/NVLS object identity,
   and the complete native Lock/Checkpoint/Restore/Unlock probe on the exact

@@ -241,9 +241,16 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
         self.assertEqual(MulticastKeeperMode.CROSS_NODE_FABRIC, uneven.mode)
         self.assertEqual(3, uneven.fabric_team_size)
 
-    def test_config_always_uses_dense_container_local_gpu_ordinals(self):
-        for visible_value in (None, "", "7,9,11,13"):
-            with self.subTest(visible_value=visible_value):
+    def test_config_resolves_holder_gpu_ordinals_from_visibility(self):
+        cases = (
+            (None, (0, 1, 2, 3)),
+            ("", (0, 1, 2, 3)),
+            ("7,9,11,13", (7, 9, 11, 13)),
+            ("GPU-invalid", (0, 1, 2, 3)),
+            ("0,1", (0, 1, 2, 3)),
+        )
+        for visible_value, expected in cases:
+            with self.subTest(visible_value=visible_value, expected=expected):
                 env = self._env()
                 if visible_value is None:
                     env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -259,7 +266,7 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
                     state_root=self.root,
                 )
 
-                self.assertEqual((0, 1, 2, 3), runtime.gpus)
+                self.assertEqual(expected, runtime.gpus)
                 self.assertEqual(
                     MulticastKeeperMode.SINGLE_NODE, runtime.mode
                 )
@@ -336,12 +343,21 @@ class MulticastKeeperRuntimeTest(unittest.TestCase):
             self.assertEqual("custom", child["TORCH_SYMM_MEM_DISABLE_MULTICAST"])
             self.assertEqual("77", child["RTP_LLM_MC_REQUEST_TIMEOUT_MS"])
             self.assertEqual("125000", child["RTP_LLM_MC_CREATE_TIMEOUT_MS"])
-            self.assertEqual("0,1", child["RTP_LLM_MC_LOCAL_GPUS"])
+            self.assertEqual("0,2", child["RTP_LLM_MC_LOCAL_GPUS"])
             self.assertEqual("8", child["RTP_LLM_MC_FABRIC_TEAM_SIZE"])
             self.assertEqual(
                 str(runtime.socket_path), child["RTP_LLM_CUDA_CKPT_MULTICAST_SOCKET"]
             )
             self.assertEqual(str(runtime.state_dir), child["NEKYIA_KEEPER_DIR"])
+        finally:
+            runtime.stop()
+
+    def test_subprocess_env_does_not_configure_nccl_nvls(self):
+        runtime = self._runtime(world_size=8)
+        try:
+            runtime.start()
+            child = runtime.subprocess_env({})
+            self.assertNotIn("NCCL_NVLS_ENABLE", child)
         finally:
             runtime.stop()
 

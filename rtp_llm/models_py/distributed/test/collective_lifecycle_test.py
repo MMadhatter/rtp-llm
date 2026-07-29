@@ -964,10 +964,7 @@ class Level3PhaseCoordinationTest(unittest.TestCase):
                         SimpleNamespace(), SimpleNamespace(), 12345
                     )
 
-                self.assertEqual(observed, [("0", "1")])
-                self.assertTrue(
-                    any("overrides NCCL_NVLS_ENABLE=1" in line for line in logs.output)
-                )
+                self.assertEqual(observed, [("1", "1")])
                 self.assertTrue(
                     any(
                         "overrides TORCH_SYMM_MEM_DISABLE_MULTICAST=0" in line
@@ -1007,10 +1004,10 @@ class Level3PhaseCoordinationTest(unittest.TestCase):
             ct.os.environ.pop("NCCL_NVLS_ENABLE", None)
             ct.os.environ.pop("TORCH_SYMM_MEM_DISABLE_MULTICAST", None)
             ct._enforce_level3_multicast_disabled()
-            self.assertEqual(ct.os.environ["NCCL_NVLS_ENABLE"], "0")
+            self.assertNotIn("NCCL_NVLS_ENABLE", ct.os.environ)
             self.assertEqual(ct.os.environ["TORCH_SYMM_MEM_DISABLE_MULTICAST"], "1")
 
-    def test_level_three_keeper_enables_nvls_and_symmetric_multicast(self):
+    def test_level_three_keeper_preserves_nvls_and_enables_symmetric_multicast(self):
         with patch.dict(
             ct.os.environ,
             {
@@ -1023,7 +1020,7 @@ class Level3PhaseCoordinationTest(unittest.TestCase):
             clear=False,
         ), patch.object(ct, "_multicast_keeper_ready", return_value=(True, "", (1, 2))):
             ct._configure_level3_multicast()
-            self.assertEqual(ct.os.environ["NCCL_NVLS_ENABLE"], "1")
+            self.assertEqual(ct.os.environ["NCCL_NVLS_ENABLE"], "0")
             self.assertEqual(ct.os.environ["TORCH_SYMM_MEM_DISABLE_MULTICAST"], "0")
 
     def test_keeper_ready_prefers_exact_socket_environment(self):
@@ -1120,8 +1117,8 @@ class Level3PhaseCoordinationTest(unittest.TestCase):
                 ),
             ):
                 ct.rebuild_distributed_environment()
-                self.assertEqual(observed, [("0", "1")])
-                self.assertEqual(ct.os.environ["NCCL_NVLS_ENABLE"], "0")
+                self.assertEqual(observed, [("1", "1")])
+                self.assertEqual(ct.os.environ["NCCL_NVLS_ENABLE"], "1")
                 self.assertEqual(ct.os.environ["TORCH_SYMM_MEM_DISABLE_MULTICAST"], "1")
         finally:
             ct._distributed_init_snapshot = old_snapshot

@@ -1,9 +1,9 @@
 # CUDA checkpoint multicast keeper
 
-This component keeps NCCL NVLS and PyTorch symmetric-memory multicast enabled
-across rank-local CUDA checkpoint/restore. A multicast object's ready fabric
-state is held by a separate process while checkpointed ranks destroy and later
-rebuild their NCCL and symmetric-memory resources.
+This component keeps multicast objects used by NCCL NVLS and PyTorch
+symmetric-memory alive across rank-local CUDA checkpoint/restore. A multicast
+object's ready fabric state is held by a separate process while checkpointed
+ranks destroy and later rebuild their NCCL and symmetric-memory resources.
 
 The holder is deliberately CUDA-free. Protocol V3 uses explicit `CREATE` and
 `FETCH` operations. Every create gets a unique object ID under a random holder
@@ -51,6 +51,11 @@ list.
 These checks keep incomplete or mixed NVLink partitions from reaching a CUDA
 bind/map that waits for missing team members. `flags` must be zero and
 `handleTypes` may only contain POSIX FD and FABRIC.
+
+The keeper does not set or rewrite `NCCL_NVLS_ENABLE`. NCCL retains its normal
+default capability selection, and an explicit operator-provided value is
+preserved. The Level 3 integration controls only PyTorch symmetric-memory
+multicast through `TORCH_SYMM_MEM_DISABLE_MULTICAST`.
 
 ## Object lifecycle and ownership
 
@@ -200,7 +205,7 @@ Each backend rank pins its device with `torch.cuda.set_device(local_rank)`, so
 the device rank `r` binds NVLS memory on is `cuDeviceGet(r)` under the rank's
 `CUDA_VISIBLE_DEVICES` — i.e. the CUDA default ordinal `CVD[r]` (or `r` when CVD
 is unset). The supervisor therefore derives the creator/holder GPU list from
-`CUDA_VISIBLE_DEVICES` (`MulticastKeeperRuntime._resolve_physical_gpus`): a
+`CUDA_VISIBLE_DEVICES` (`MulticastKeeperRuntime._resolve_gpu_ordinals`): a
 production container that exposes its GPUs densely from 0 yields
 `0..local_world_size-1`, while a role pinned to a non-dense subset (e.g. decode
 `4,5` and prefill `6,7` sharing one box) yields that subset. This keeps the

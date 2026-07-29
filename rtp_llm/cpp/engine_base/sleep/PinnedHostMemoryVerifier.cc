@@ -5,6 +5,7 @@
 
 #if USING_CUDA
 #include <ATen/cuda/CachingHostAllocator.h>
+#include <cuda_runtime_api.h>
 #endif
 
 #include "rtp_llm/cpp/utils/Logger.h"
@@ -37,6 +38,31 @@ absl::Status flushAndVerifyCudaPinnedHostMemory(PinnedHostAllocatorSnapshot* bef
 
         const auto before_snapshot = snapshotAllocator(allocator->get_stats());
         allocator->empty_cache();
+        const auto initial_flush_snapshot = snapshotAllocator(allocator->get_stats());
+        const bool event_drain_retry      = !initial_flush_snapshot.empty();
+        if (event_drain_retry) {
+            // Pinned tensor destruction records allocator events after the
+            // earlier sleep-path synchronization. Drain those events before
+            // asking the allocator to release their backing blocks.
+            RTP_LLM_LOG_WARNING(
+                "[PinnedHost][verify] backing remains after initial flush; "
+                "action=synchronize_and_retry initial={%s}",
+                initial_flush_snapshot.debugString().c_str());
+            const cudaError_t sync_error = cudaDeviceSynchronize();
+            if (sync_error != cudaSuccess) {
+                const std::string message = cudaGetErrorString(sync_error);
+                (void)cudaGetLastError();
+                if (before != nullptr) {
+                    *before = before_snapshot;
+                }
+                if (after != nullptr) {
+                    *after = initial_flush_snapshot;
+                }
+                return absl::InternalError(
+                    "CUDA pinned-host event drain synchronize failed: " + message);
+            }
+            allocator->empty_cache();
+        }
         const auto after_snapshot = snapshotAllocator(allocator->get_stats());
         if (before != nullptr) {
             *before = before_snapshot;
@@ -45,8 +71,11 @@ absl::Status flushAndVerifyCudaPinnedHostMemory(PinnedHostAllocatorSnapshot* bef
             *after = after_snapshot;
         }
 
-        RTP_LLM_LOG_INFO("[PinnedHost][verify] before={%s} after={%s}",
+        RTP_LLM_LOG_INFO("[PinnedHost][verify] before={%s} initial_flush={%s} "
+                         "event_drain_retry=%d after={%s}",
                          before_snapshot.debugString().c_str(),
+                         initial_flush_snapshot.debugString().c_str(),
+                         static_cast<int>(event_drain_retry),
                          after_snapshot.debugString().c_str());
         if (after_snapshot.hasStaleActiveCounters()) {
             RTP_LLM_LOG_WARNING(

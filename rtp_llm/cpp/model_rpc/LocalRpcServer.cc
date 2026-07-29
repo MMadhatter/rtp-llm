@@ -633,9 +633,11 @@ void LocalRpcServer::installSleepHooks() {
         // cudaHostAlloc/cudaHostRegister-backed allocation remains live across
         // checkpoint. Level 3 therefore has a fail-closed contract: all owners
         // were explicitly suspended above, then the caching host allocator must
-        // reach an exact zero after its free cache is flushed. This terminal
-        // gate runs after all other sleep-side Python/C++ cleanup so no later
-        // hook can recreate pinned memory before checkpoint.
+        // reach an exact zero after its free cache is flushed. The verifier
+        // also drains events recorded while those owners were being destroyed
+        // and retries the flush once. This terminal gate runs after all other
+        // sleep-side Python/C++ cleanup so no later hook can recreate pinned
+        // memory before checkpoint.
         //
         // Level 1/2 do not checkpoint the process. Preserve their best-effort
         // free-cache flush without requiring persistent input/control tensors

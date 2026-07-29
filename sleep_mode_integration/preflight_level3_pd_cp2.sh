@@ -136,7 +136,6 @@ fi
 keeper_runtime="${REPO_ROOT}/rtp_llm/utils/multicast_keeper.py"
 require_file "${keeper_runtime}"
 require_text "${LAUNCHER}" 'RTP_LLM_CUDA_CKPT_MULTICAST_KEEPER=1'
-require_text "${keeper_runtime}" 'child_env.setdefault("NCCL_NVLS_ENABLE", "1")'
 require_text "${keeper_runtime}" 'child_env.setdefault("TORCH_SYMM_MEM_DISABLE_MULTICAST", "0")'
 
 if command -v ibv_devices >/dev/null && [[ $(ibv_devices 2>/dev/null | awk 'NR > 2 {count++} END {print count+0}') -gt 0 ]]; then

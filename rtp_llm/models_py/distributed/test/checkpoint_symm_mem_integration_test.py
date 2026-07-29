@@ -5,6 +5,7 @@ Only spawned workers own CUDA state; the parent drives the external CUDA
 process-checkpoint API after both workers have torn down their communicators.
 """
 
+import contextlib
 import datetime
 import multiprocessing
 import os
@@ -26,14 +27,18 @@ from rtp_llm.utils.checkpoint_controller import (
     read_process_starttime,
 )
 
-_WORLD_SIZE = 2
-_CHECKPOINT_CYCLES = 3
+_WORLD_SIZE = int(os.environ.get("RTP_LLM_CHECKPOINT_TEST_WORLD_SIZE", "2"))
+_CHECKPOINT_CYCLES = int(os.environ.get("RTP_LLM_CHECKPOINT_TEST_CYCLES", "3"))
 _PHASE_TIMEOUT_SECONDS = 180
 _EXIT_TIMEOUT_SECONDS = 30
 _LOCK_TIMEOUT_MS = 60_000
 _SYMM_MEM_MODE = os.environ.get("RTP_LLM_CHECKPOINT_TEST_SYMM_MEM", "all")
+_STACK_MODE = os.environ.get("RTP_LLM_CHECKPOINT_TEST_STACK", "collective")
 _FLUSH_HOST_CACHE = (
     os.environ.get("RTP_LLM_CHECKPOINT_TEST_FLUSH_HOST_CACHE", "1") == "1"
+)
+_USE_MULTICAST_KEEPER = (
+    os.environ.get("RTP_LLM_CHECKPOINT_TEST_MULTICAST_KEEPER", "0") == "1"
 )
 
 
@@ -73,6 +78,31 @@ def _run_collective_generation(torch, dist, symm_mem, rank, init_path, generatio
         # selection. Production rebuild does this in collective_torch before
         # constructing ProcessGroupNCCL, so mirror that contract here.
         torch.cuda.set_device(rank)
+        if _STACK_MODE in ("cuda-init", "cuda-alloc", "cuda-kernel", "cuda"):
+            cuda_value = None
+            if _STACK_MODE in ("cuda-alloc", "cuda-kernel", "cuda"):
+                cuda_value = torch.empty(
+                    1,
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+            if _STACK_MODE in ("cuda-kernel", "cuda"):
+                cuda_value.fill_(float(generation + rank + 1))
+            torch.cuda.synchronize(rank)
+            if _STACK_MODE == "cuda" and float(cuda_value.item()) != float(
+                generation + rank + 1
+            ):
+                raise AssertionError("plain CUDA tensor verification failed")
+            del cuda_value
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(rank)
+            return {"nccl": expected, "symm": None}
+        if _STACK_MODE != "collective":
+            raise ValueError(
+                "RTP_LLM_CHECKPOINT_TEST_STACK must be "
+                "collective, cuda-init, cuda-alloc, cuda-kernel, or cuda"
+            )
+
         dist.init_process_group(
             backend="nccl",
             init_method=f"file://{os.path.abspath(init_path)}",
@@ -160,11 +190,14 @@ def _run_collective_generation(torch, dist, symm_mem, rank, init_path, generatio
 def _checkpoint_worker(rank, init_paths, connection):
     """Own all CUDA work and wait on a CPU pipe while checkpointed."""
     try:
-        # CUDA process checkpoint cannot restore multicast state on the tested
-        # CUDA 13 driver. Level 3 applies both settings before its first
-        # production process-group or symmetric-memory initialization.
-        os.environ["NCCL_NVLS_ENABLE"] = "0"
-        os.environ["TORCH_SYMM_MEM_DISABLE_MULTICAST"] = "1"
+        if not _USE_MULTICAST_KEEPER:
+            # Baseline path without the external multicast keeper.
+            os.environ["NCCL_NVLS_ENABLE"] = "0"
+            os.environ["TORCH_SYMM_MEM_DISABLE_MULTICAST"] = "1"
+        else:
+            # MulticastKeeperRuntime injects the production shim and endpoint.
+            os.environ["NCCL_NVLS_ENABLE"] = "1"
+            os.environ["TORCH_SYMM_MEM_DISABLE_MULTICAST"] = "0"
         import torch
         import torch.distributed as dist
 
@@ -404,6 +437,7 @@ class CheckpointSymmetricMemoryIntegrationTest(unittest.TestCase):
         processes = {}
         controller = None
         driver = None
+        keeper = None
 
         with tempfile.TemporaryDirectory() as tempdir:
             init_paths = tuple(
@@ -412,19 +446,34 @@ class CheckpointSymmetricMemoryIntegrationTest(unittest.TestCase):
             )
             manifest_path = os.path.join(tempdir, "checkpoint.json")
             try:
-                for rank in range(_WORLD_SIZE):
-                    parent_connection, child_connection = context.Pipe(duplex=True)
-                    process = context.Process(
-                        target=_checkpoint_worker,
-                        args=(rank, init_paths, child_connection),
-                        name=f"checkpoint-symm-mem-rank-{rank}",
+                if _USE_MULTICAST_KEEPER:
+                    from rtp_llm.utils.multicast_keeper import (
+                        MulticastKeeperRuntime,
                     )
-                    connections[rank] = parent_connection
-                    processes[rank] = process
-                    try:
-                        process.start()
-                    finally:
-                        child_connection.close()
+
+                    keeper = MulticastKeeperRuntime(
+                        _WORLD_SIZE,
+                        _WORLD_SIZE,
+                        role="checkpoint-test",
+                    ).start()
+                    launch_environment = keeper.configure_subprocess()
+                else:
+                    launch_environment = contextlib.nullcontext()
+
+                with launch_environment:
+                    for rank in range(_WORLD_SIZE):
+                        parent_connection, child_connection = context.Pipe(duplex=True)
+                        process = context.Process(
+                            target=_checkpoint_worker,
+                            args=(rank, init_paths, child_connection),
+                            name=f"checkpoint-symm-mem-rank-{rank}",
+                        )
+                        connections[rank] = parent_connection
+                        processes[rank] = process
+                        try:
+                            process.start()
+                        finally:
+                            child_connection.close()
 
                 ready = _receive_all(
                     connections, processes, "ready", _PHASE_TIMEOUT_SECONDS
@@ -500,9 +549,13 @@ class CheckpointSymmetricMemoryIntegrationTest(unittest.TestCase):
                     self.assertFalse(process.is_alive())
                     self.assertEqual(process.exitcode, 0)
             finally:
-                _cleanup_workers(
-                    connections, processes, controller=controller, driver=driver
-                )
+                try:
+                    _cleanup_workers(
+                        connections, processes, controller=controller, driver=driver
+                    )
+                finally:
+                    if keeper is not None:
+                        keeper.stop()
 
     def _assert_generation_results(self, messages, generation, processes):
         expected = float(

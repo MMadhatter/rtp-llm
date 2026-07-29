@@ -430,16 +430,10 @@ def _configure_level3_multicast() -> None:
                 "Sleep mode Level3 multicast keeper was requested but is not ready: "
                 + reason
             )
-        required = {
-            "NCCL_NVLS_ENABLE": "1",
-            "TORCH_SYMM_MEM_DISABLE_MULTICAST": "0",
-        }
+        required = {"TORCH_SYMM_MEM_DISABLE_MULTICAST": "0"}
         policy = "enabled through the external CUDA-checkpoint multicast keeper"
     else:
-        required = {
-            "NCCL_NVLS_ENABLE": "0",
-            "TORCH_SYMM_MEM_DISABLE_MULTICAST": "1",
-        }
+        required = {"TORCH_SYMM_MEM_DISABLE_MULTICAST": "1"}
         policy = "disabled because no CUDA-checkpoint multicast keeper was requested"
 
     for name, value in required.items():

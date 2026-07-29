@@ -662,7 +662,6 @@ class MulticastKeeperRuntime:
         child_env[SOCKET_ENV] = str(self.socket_path)
         child_env[LOCAL_GPU_ENV] = ",".join(str(gpu) for gpu in self.gpus)
         child_env[FABRIC_TEAM_ENV] = str(self.fabric_team_size)
-        child_env.setdefault("NCCL_NVLS_ENABLE", "1")
         child_env.setdefault("TORCH_SYMM_MEM_DISABLE_MULTICAST", "0")
         child_env.setdefault(
             "RTP_LLM_MC_REQUEST_TIMEOUT_MS", str(self.request_timeout_ms)
