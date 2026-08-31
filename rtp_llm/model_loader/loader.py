@@ -359,6 +359,33 @@ class ModelLoader:
                     stacked_key_config[stacked_key] = template
         return stacked_key_config
 
+    @staticmethod
+    def _build_fastsafetensors_local_copyout_keys(
+        tensor_to_weight_map: Mapping[str, "ModelLoader.WeightInfo"],
+        stacked_key_config: Mapping[str, str],
+    ) -> frozenset[str]:
+        """Return checkpoint keys that the current RTP rank can consume.
+
+        Stacked MoE entries stay under their raw checkpoint key until the
+        database adapter expands them to per-expert collector keys.
+        """
+
+        return frozenset((*tensor_to_weight_map.keys(), *stacked_key_config.keys()))
+
+    @staticmethod
+    def _fastsafetensors_stacked_moe_mode() -> str:
+        """Select bounded per-expert delivery or full-stacked comparison mode."""
+
+        mode = os.environ.get(
+            "RTP_FASTSAFETENSORS_STACKED_MOE_MODE", "per-expert"
+        ).strip()
+        if mode not in {"per-expert", "full-stacked"}:
+            raise ValueError(
+                "RTP_FASTSAFETENSORS_STACKED_MOE_MODE must be "
+                f"'per-expert' or 'full-stacked', got {mode!r}"
+            )
+        return mode
+
     def _load_from_fastsafetensor(self, device: str):
         model_weights = self._create_model_weights(device)
         # Sleep-mode residual fix: keep the raw fastsafetensors shard reads OUT
@@ -422,18 +449,29 @@ class ModelLoader:
           torch_memory_saver — see ``mempool-destroy-crashes-under-tms``.
 
         Loader backend and scheduling policy are selected by
-        ``FASTSAFETENSORS_CONFIG_JSON``. ``force_nogds`` is retained in this
-        method signature only to produce an explicit migration error in the
-        database adapter instead of silently changing the configured backend.
+        ``FASTSAFETENSORS_CONFIG_JSON``. ``force_nogds`` remains a compatibility
+        switch for sleep reload and maps to the equivalent base/nogds config.
         """
         logging.info(f"load weight by device: {device}")
         tensor_to_weight_map, weight_info_list = self._generate_weight_info()
 
         stacked_key_config = self._build_stacked_key_config(weight_info_list)
+        stacked_moe_mode = self._fastsafetensors_stacked_moe_mode()
         if stacked_key_config:
             logging.info(
-                f"fastsafetensors per-expert split enabled for {len(stacked_key_config)} stacked keys"
+                "fastsafetensors stacked MoE mode=%s keys=%d",
+                stacked_moe_mode,
+                len(stacked_key_config),
             )
+
+        required_checkpoint_keys = self._build_fastsafetensors_local_copyout_keys(
+            tensor_to_weight_map, stacked_key_config
+        )
+        logging.info(
+            "fastsafetensors rank-local copyout filter: keys=%d stacked_keys=%d",
+            len(required_checkpoint_keys),
+            len(stacked_key_config),
+        )
 
         all_tensors = self._load_config.database.fastsafetensors_weights_iterator(
             device,
@@ -441,6 +479,8 @@ class ModelLoader:
             stacked_key_config=stacked_key_config,
             allocation_context=weights_region if in_weights_region else None,
             force_nogds=force_nogds,
+            local_copyout_filter=required_checkpoint_keys.__contains__,
+            stacked_moe_mode=stacked_moe_mode,
         )
 
         for key, loaded_tensor in all_tensors:

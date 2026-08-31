@@ -268,8 +268,16 @@ class CkptDatabase(BaseDatabase):
         stacked_key_config: Optional[Dict[str, str]] = None,
         allocation_context: Optional[Callable[[], ContextManager[Any]]] = None,
         force_nogds: bool = False,
+        local_copyout_filter: Optional[Callable[[str], bool]] = None,
+        stacked_moe_mode: str = "per-expert",
     ):
         from fastsafetensors import AutoLoader, SingleGroup
+
+        if stacked_moe_mode not in {"per-expert", "full-stacked"}:
+            raise ValueError(
+                "stacked_moe_mode must be 'per-expert' or 'full-stacked', "
+                f"got {stacked_moe_mode!r}"
+            )
 
         def iterator(device: str, use_tqdm_on_load: bool):
             if torch.distributed.is_initialized():
@@ -285,16 +293,40 @@ class CkptDatabase(BaseDatabase):
                 logging.debug(f"origin device is cuda, set to {device}")
 
             if force_nogds or os.environ.get("FASTSAFETENSORS_NOGDS", "0") == "1":
-                raise ValueError(
-                    "FASTSAFETENSORS_NOGDS/force_nogds is not supported by the "
-                    "config-driven loader; select the backend explicitly with "
-                    "FASTSAFETENSORS_CONFIG_JSON"
+                os.environ["FASTSAFETENSORS_CONFIG_JSON"] = (
+                    '{"loader":"base","base":{"copier_type":"nogds"}}'
+                )
+                logging.warning(
+                    "force_nogds/FASTSAFETENSORS_NOGDS overrides "
+                    "FASTSAFETENSORS_CONFIG_JSON with the base/nogds config"
                 )
 
             # Backend selection, batching, queue depth, producer count, physical
             # read size and tensor ordering all belong to fastsafetensors. RTP
             # only supplies the process group, files and target device.
-            loader = AutoLoader(pg, hf_weights_files, device=device)
+            loader_kwargs: Dict[str, Any] = {
+                "local_copyout_filter": local_copyout_filter,
+            }
+            if stacked_key_config and stacked_moe_mode == "per-expert":
+                loader_kwargs["dim0_split_templates"] = stacked_key_config
+            try:
+                loader = AutoLoader(
+                    pg,
+                    hf_weights_files,
+                    device=device,
+                    **loader_kwargs,
+                )
+            except TypeError as error:
+                if "dim0_split_templates" in loader_kwargs and (
+                    "dim0_split_templates" in str(error)
+                ):
+                    raise RuntimeError(
+                        "installed fastsafetensors does not support bounded-memory "
+                        "stacked MoE delivery; install the matching wrapper wheel or "
+                        "set RTP_FASTSAFETENSORS_STACKED_MOE_MODE=full-stacked for "
+                        "the higher-memory comparison path"
+                    ) from error
+                raise
             try:
                 context = (
                     allocation_context
@@ -308,7 +340,7 @@ class CkptDatabase(BaseDatabase):
                             yield key, tensor
                             continue
 
-                        # DSV4 checkpoints may store all experts in one tensor
+                        # MoE/Next checkpoints may store all experts in one tensor
                         # [num_experts, ...], while the RTP collectors expect one
                         # key per expert. Clone each slice because the loader can
                         # release the current batch buffer after iteration moves
