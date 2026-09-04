@@ -308,7 +308,7 @@ class CkptDatabase(BaseDatabase):
                 "local_copyout_filter": local_copyout_filter,
             }
             if stacked_key_config and stacked_moe_mode == "per-expert":
-                loader_kwargs["dim0_split_templates"] = stacked_key_config
+                loader_kwargs["stacked_moe_tensors"] = stacked_key_config
             try:
                 loader = AutoLoader(
                     pg,
@@ -317,8 +317,8 @@ class CkptDatabase(BaseDatabase):
                     **loader_kwargs,
                 )
             except TypeError as error:
-                if "dim0_split_templates" in loader_kwargs and (
-                    "dim0_split_templates" in str(error)
+                if "stacked_moe_tensors" in loader_kwargs and (
+                    "stacked_moe_tensors" in str(error)
                 ):
                     raise RuntimeError(
                         "installed fastsafetensors does not support bounded-memory "

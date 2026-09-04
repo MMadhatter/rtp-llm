@@ -103,9 +103,9 @@ class FastsafetensorsRegionTest(unittest.TestCase):
                 files,
                 device,
                 local_copyout_filter=None,
-                dim0_split_templates=None,
+                stacked_moe_tensors=None,
             ) -> None:
-                observed_split_templates.append(dim0_split_templates)
+                observed_split_templates.append(stacked_moe_tensors)
 
             def iterate_weights(self):
                 for expert_id in range(3):
@@ -180,9 +180,9 @@ class FastsafetensorsRegionTest(unittest.TestCase):
                 files,
                 device,
                 local_copyout_filter=None,
-                dim0_split_templates=None,
+                stacked_moe_tensors=None,
             ) -> None:
-                observed_split_templates.append(dim0_split_templates)
+                observed_split_templates.append(stacked_moe_tensors)
 
             def iterate_weights(self):
                 yield "stacked", FakeStackedTensor()
@@ -228,7 +228,7 @@ class FastsafetensorsRegionTest(unittest.TestCase):
                 files,
                 device,
                 local_copyout_filter=None,
-                dim0_split_templates=None,
+                stacked_moe_tensors=None,
             ) -> None:
                 observed_filters.append(local_copyout_filter)
 
