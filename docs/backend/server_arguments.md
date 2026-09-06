@@ -189,3 +189,30 @@ This page lists server arguments used to configure the behavior and performance 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--load_method` | Specify the weight loading method.<br>Options: auto, fastsafetensors, scratch | auto |
+
+### FastSafeTensors loader configuration
+
+When `LOAD_METHOD=fastsafetensors`, RTP-LLM uses the config-driven `AutoLoader`.
+Pass the standard fastsafetensors configuration as either an inline JSON string
+or a JSON file path. Inline JSON has higher priority when both are set:
+
+```bash
+export FASTSAFETENSORS_CONFIG_JSON='{"loader":"base","base":{"copier_type":"nogds"}}'
+export FASTSAFETENSORS_CONFIG=/path/to/fastsafetensors.json
+```
+
+For compatibility with existing deployments, `FASTSAFETENSORS_NOGDS=1` and
+the sleep reload path's `force_nogds` switch directly override
+`FASTSAFETENSORS_CONFIG_JSON` with the equivalent base/nogds configuration.
+
+Stacked MoE checkpoints use bounded-memory per-expert delivery by default: the
+source rank slices the stacked tensor first, then every rank broadcasts one
+expert at a time. The higher-memory full-stacked path is retained only for
+controlled performance comparisons:
+
+```bash
+export RTP_FASTSAFETENSORS_STACKED_MOE_MODE=full-stacked
+```
+
+The accepted values are `per-expert` (default) and `full-stacked`. Ordinary
+tensors continue to use the FastSafeTensors bucket and rank-local-copy settings.
