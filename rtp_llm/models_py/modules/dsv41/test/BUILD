@@ -134,6 +134,33 @@ py_test(
     legacy_create_init = 0,
 )
 
+# This test loads the lightweight helper by file path and injects every model
+# factory. It must run without torch, CUDA, native libraries or the RTP engine.
+py_test(
+    name = "test_engram_model_attach",
+    size = "small",
+    srcs = ["test_engram_model_attach.py"],
+    main = "test_engram_model_attach.py",
+    deps = ["//rtp_llm/models_py:engram_model_attach_cpu"],
+    legacy_create_init = 0,
+)
+
+# The test imports test_engram_manifest.py as its standard document fixture;
+# declaring it explicitly is required for sandboxed runfiles. Real CPU hash
+# constants come from the narrow engram_model_cpu closure, never :modules.
+py_test(
+    name = "test_engram_bootstrap",
+    size = "small",
+    srcs = ["test_engram_bootstrap.py", "test_engram_manifest.py"],
+    main = "test_engram_bootstrap.py",
+    deps = ["//rtp_llm/models_py:engram_bootstrap_cpu"],
+    legacy_create_init = 0,
+    target_compatible_with = select({
+        "@//:using_cuda13_arm": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
 # CPU execution with the validated CUDA13 ARM dependency versions. These
 # tests need modern FP8/E8M0 torch/safetensors, but no GPU allocation or runtime.
 [
