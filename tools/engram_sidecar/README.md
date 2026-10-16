@@ -2,8 +2,9 @@
 
 Based on public RTP-LLM `main` at
 `492ecf45b3ef55b22fd4882622abfdb2e2f664f2`.
-This is an experimental external-storage backend and component test harness.
-It is not yet wired through a complete RTP model server.
+This is an experimental external-storage backend, file bootstrap and opt-in
+model loading hook. Cross-host bootstrap/hash/lookup has passed; actual model-hook
+GPU forward and complete RTP serving remain pending.
 
 An owner allocates immutable Engram weights/scales in Grace host NUMA memory.
 Independent consumers import the same CUDA Fabric allocations and expose
@@ -37,6 +38,7 @@ fabric domain. GPU visibility alone does not establish EGM or IMEX usability.
 | Native bridge | [native](native/README.md) | CUDA VMM/Fabric allocation/import and external ATen view ownership |
 | Component integration | [integration](integration/README.md) | Deterministic checkpoint, real RTP lookup/hash and Graph tests |
 | Layout experiments | [latency](latency/README.md) | Canonical preprocessing, gather/scale packing and paired benchmarks |
+| Framework bootstrap | `engram_bootstrap.py`, `engram_model_attach.py` and [framework tests](FRAMEWORK_VALIDATION.md) | Trusted private-file attach, transactional model loading and eager-only guards |
 | Platform probes | [probe](probe/README.md) | Small EGM, container device and Python/CUDA checks |
 
 The default model checkpoint path remains unchanged. Consumer external-checkpoint
@@ -44,6 +46,9 @@ construction reads local WKV/q/k weights and validates external Engram layout;
 it must not create a second full embedding table.
 
 ## Lifecycle contract
+
+The guarded-Graph steps below belong to the isolated storage component API.
+The new model loading hook supports eager execution only.
 
 1. Receive an authenticated complete manifest and private opaque capabilities.
 2. `FabricEngramStorage.attach(...)` establishes MAPPED state, not READY.
@@ -63,13 +68,23 @@ file transfer, not production service discovery.
 
 ## Status and next milestone
 
-See [checkpoint validation](CHECKPOINT_VALIDATION.md) for completed component
-checks, the distinction between historical GPU results and publication checks,
-and unpassed performance/full-model gates.
+See the [component checkpoint](CHECKPOINT_VALIDATION.md) and
+[framework validation](FRAMEWORK_VALIDATION.md). The latter records real
+cross-host tokenizer/hash/lookup and incorrect-sample rejection, plus the
+remaining actual model-hook/native-forward acceptance gate. Neither is a
+full-model HTTP or latency result.
 
-Next work is framework integration: attach before model construction, thread the
-storage through all required layers/ranks, manage engine-owned CUDA Graphs,
-and prove two independent cross-host RTP instances can serve requests from one
-backing. Production companion containers, Owner service deployment and HA are
-outside this checkpoint. Native builds happen explicitly before tests; no JIT
-build or control-plane work belongs in the model forward path.
+The experimental `RTP_ENGRAM_EXTERNAL_BUNDLE` switch enables trusted private-file
+bootstrap; absence preserves legacy behavior. The launcher pins dataset/model
+revision through the bundle and keeps the Owner alive. Local model configuration
+does not yet independently pin those identities. This path is eager only, retains
+mappings for process lifetime and rejects unsupported engine Graph capture.
+There is no live detach, reload, service discovery or silent table fallback.
+
+The native 1 GiB/allocation limit, 64 MiB loading chunks and bootstrap 8 GiB total
+limit are development bounds. Next gates are genuine model-hook GPU projection,
+complete engine/rank integration and two independent serving instances. The
+additional 100-microsecond target remains unpassed. Production companion
+containers, Owner service deployment and HA are outside this checkpoint.
+Native builds happen explicitly before startup; no JIT build or control-plane
+work belongs in the model forward path.
