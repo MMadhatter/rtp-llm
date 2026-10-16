@@ -102,6 +102,7 @@ py_test(
 py_test(
     name = "test_engram_model_attach",
     size = "small",
+    env = {"GPU_COUNT": "0"},
     srcs = ["test_engram_model_attach.py"],
     main = "test_engram_model_attach.py",
     deps = ["//rtp_llm/models_py:engram_model_attach_cpu"],
@@ -114,6 +115,7 @@ py_test(
 py_test(
     name = "test_engram_bootstrap",
     size = "small",
+    env = {"GPU_COUNT": "0"},
     srcs = ["test_engram_bootstrap.py", "test_engram_manifest.py"],
     main = "test_engram_bootstrap.py",
     deps = ["//rtp_llm/models_py:engram_bootstrap_cpu"],

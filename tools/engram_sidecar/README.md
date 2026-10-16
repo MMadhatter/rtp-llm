@@ -3,8 +3,9 @@
 Based on public RTP-LLM `main` at
 `492ecf45b3ef55b22fd4882622abfdb2e2f664f2`.
 This is an experimental external-storage backend, file bootstrap and opt-in
-model loading hook. Cross-host bootstrap/hash/lookup has passed; actual model-hook
-GPU forward and complete RTP serving remain pending.
+model loading hook. The small-fixture Engram loading/hash/lookup/native
+quantization/DeepGEMM/layer-forward path has passed locally and across
+hosts/containers. Complete RTP serving remains untested.
 
 An owner allocates immutable Engram weights/scales in Grace host NUMA memory.
 Independent consumers import the same CUDA Fabric allocations and expose
@@ -70,9 +71,9 @@ file transfer, not production service discovery.
 
 See the [component checkpoint](CHECKPOINT_VALIDATION.md) and
 [framework validation](FRAMEWORK_VALIDATION.md). The latter records real
-cross-host tokenizer/hash/lookup and incorrect-sample rejection, plus the
-remaining actual model-hook/native-forward acceptance gate. Neither is a
-full-model HTTP or latency result.
+cross-host tokenizer/hash/lookup, incorrect-sample rejection, and genuine native
+model-hook/layer-forward checks with a v2 fixture. It also records Owner cleanup
+and actual Bazel CPU tests. These are not full-model HTTP or latency results.
 
 The experimental `RTP_ENGRAM_EXTERNAL_BUNDLE` switch enables trusted private-file
 bootstrap; absence preserves legacy behavior. The launcher pins dataset/model
@@ -82,9 +83,11 @@ mappings for process lifetime and rejects unsupported engine Graph capture.
 There is no live detach, reload, service discovery or silent table fallback.
 
 The native 1 GiB/allocation limit, 64 MiB loading chunks and bootstrap 8 GiB total
-limit are development bounds. Next gates are genuine model-hook GPU projection,
+limit are development bounds. Next gates are the supported-shape fused gate,
 complete engine/rank integration and two independent serving instances. The
 additional 100-microsecond target remains unpassed. Production companion
 containers, Owner service deployment and HA are outside this checkpoint.
-Native builds happen explicitly before startup; no JIT build or control-plane
-work belongs in the model forward path.
+The VMM/native bridge is prebuilt before startup and is not compiled by
+bootstrap during forward. Triton/DeepGEMM kernels may JIT on first use; warmup
+and steady-state latency still need validation. Online lookup does not use
+Owner RPC.

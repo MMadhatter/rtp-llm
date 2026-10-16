@@ -131,15 +131,40 @@ def check_consumer_fixture(root):
 
 def require_real_native():
     """Bounded preflight avoids RTP's recursive missing-library fallback search."""
-    for directory in (REPO / "rtp_llm" / "libs", REPO / "bazel-bin"):
-        if directory.is_dir() and str(directory) not in sys.path:
-            sys.path.insert(0, str(directory))
+    config_name = "libth_transformer_config.so"
+    config_path = REPO / "rtp_llm" / "libs" / config_name
+    if not config_path.is_file():
+        # Match the bounded locations checked by rtp_llm.ops before its
+        # recursive fallback. PYTHONPATH alone does not satisfy that check.
+        config_path = None
+        level = [REPO / "bazel-bin"]
+        for depth in range(3):
+            for directory in level:
+                candidate = directory / config_name
+                if candidate.is_file():
+                    config_path = candidate
+                    break
+            if config_path is not None:
+                break
+            if depth < 2:
+                level = [child for directory in level if directory.is_dir()
+                         for child in sorted(directory.iterdir()) if child.is_dir()]
+    if config_path is None:
+        raise RuntimeError(
+            "REAL_RTP_NATIVE_REQUIRED: bounded config library missing; place "
+            "libth_transformer_config.so in rtp_llm/libs or bazel-bin (at most two directory levels)"
+        )
+    directory = str(config_path.parent)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
     evidence = {}
     for name in ("libth_transformer_config", "librtp_compute_ops"):
         spec = importlib.util.find_spec(name)
         if (spec is None or not spec.origin
                 or not isinstance(spec.loader, importlib.machinery.ExtensionFileLoader)):
             raise RuntimeError(f"REAL_RTP_NATIVE_REQUIRED: {name}; build main native targets before this harness")
+        if name == "libth_transformer_config" and Path(spec.origin).resolve() != config_path.resolve():
+            raise RuntimeError("REAL_RTP_NATIVE_REQUIRED: imported config does not match the bounded repo library")
         module = importlib.import_module(name)
         origin = Path(module.__file__).resolve()
         evidence[name] = dict(path=str(origin), size_bytes=origin.stat().st_size)
@@ -178,6 +203,11 @@ def run(fixture_root, bundle, device_ordinal=0):
         raise ValueError("device must be a nonnegative local CUDA ordinal")
     import torch
     # Native RTP extensions depend on libtorch symbols loaded by this import.
+    # Bind the authorized device before dependency imports can initialize CUDA.
+    if not torch.cuda.is_available() or device_ordinal >= torch.cuda.device_count():
+        raise RuntimeError("AUTHORIZED_CUDA_DEVICE_REQUIRED")
+    torch.cuda.set_device(device_ordinal)
+    device = torch.device("cuda", device_ordinal)
     native_evidence = require_real_native()
     from safetensors.torch import load_file
     from rtp_llm import ops
@@ -188,10 +218,6 @@ def run(fixture_root, bundle, device_ordinal=0):
     from rtp_llm.models_py.modules.dsv41.utils import V41MXFP8Linear
     from checkpoint_fixture import HC, HIDDEN_DIM, LAYERS, WKV_N, make_inputs
 
-    if not torch.cuda.is_available() or device_ordinal >= torch.cuda.device_count():
-        raise RuntimeError("AUTHORIZED_CUDA_DEVICE_REQUIRED")
-    torch.cuda.set_device(device_ordinal)
-    device = torch.device("cuda", device_ordinal)
     os.environ["RTP_ENGRAM_EXTERNAL_BUNDLE"] = str(bundle)
     shell = SimpleNamespace(
         _v4_args=SimpleNamespace(v41_config=config),
