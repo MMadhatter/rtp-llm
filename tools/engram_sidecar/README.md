@@ -6,8 +6,9 @@ This is an experimental external-storage backend, file bootstrap and opt-in
 model loading hook. The small-fixture Engram loading/hash/lookup/native
 quantization/DeepGEMM/layer-forward path has passed locally and across
 hosts/containers. The complete 188.83 GiB real Engram generation has also passed
-cross-host lookup. Complete RTP HTTP serving is in progress and has not passed
-acceptance at this checkpoint.
+cross-host lookup. One complete 40-layer RTP instance with TP4/EP4/DP1 has now
+passed an eager OpenAI chat smoke over the shared tables. This is correctness
+and request-plumbing evidence, not latency or production-service acceptance.
 
 An owner allocates immutable Engram weights/scales in Grace host NUMA memory.
 Independent consumers import the same CUDA Fabric allocations and expose
@@ -92,9 +93,20 @@ remain. The rebuilt native bridge and a real cross-host 4.125 GiB
 [188.83 GiB cross-host lookup](framework/REAL_CHECKPOINT_LOOKUP.md) now also passed:
 12 cases were exact in BF16, the consumer checkpoint contained no full tables,
 PyTorch attach allocation was zero, and the consumer closed with all eight
-native counters zero. The Owner remains alive for the
-[full-model HTTP experiment](framework/FULL_MODEL_HTTP.md), which is in progress
-and has not passed acceptance in this record.
+native counters zero. Four concurrent lookup consumers then passed
+[48 exact cases](framework/MULTICONSUMER_LOOKUP_RESULTS.json) while simultaneously
+holding the same two allocations on four GPUs; unique Owner backing stayed
+188.83 GiB. These are lookup processes, not four full serving instances.
+A subsequent [full-model HTTP smoke](framework/FULL_MODEL_HTTP.md) passed with
+one complete four-worker RTP instance: health 200, 26 readable completion
+tokens, and normal stop. See the [HTTP result](framework/FULL_MODEL_HTTP_RESULTS.json).
+After verified consumer exit, explicit Owner STOP produced CLOSED with all eight
+native counters zero. Five task-owned leftover Python processes required targeted
+cleanup; automatic complete service teardown is not established. Its expanded
+[service-entry import preflight](framework/FULL_MODEL_RUNTIME_RESULTS.json) and
+16 CPU helper tests passed, including the attention lazy-import dependency,
+preserving all existing package versions and native libraries; that does not
+establish model or HTTP readiness.
 All 48 original checkpoint shards passed official SHA256 verification; the
 [staged consumer](framework/CHECKPOINT_STAGING_RESULTS.json) retains the full
 model while omitting complete Engram tables. Earlier second-layer allocation
@@ -103,8 +115,8 @@ On the measured driver/kernel, the two EGM mappings had 188.83 GiB resident RSS
 while the verified Owner container cgroup reported about 10.23 GiB current
 memory. Container quotas alone therefore do not guarantee EGM admission or
 capacity enforcement for this path; keep explicit budgets and NUMA checks.
-Next gates are the supported-shape fused gate,
-complete engine/rank integration and two independent serving instances. The
+Remaining gates include local-table numerical comparison at full model
+geometry, two independent serving instances and steady-state performance. The
 additional 100-microsecond target remains unpassed. Production companion
 containers, Owner service deployment and HA are outside this checkpoint.
 The VMM/native bridge is prebuilt before startup and is not compiled by

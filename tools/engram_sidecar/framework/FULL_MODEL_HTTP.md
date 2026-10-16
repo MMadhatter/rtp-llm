@@ -6,6 +6,91 @@ Engram component path only; they do not prove an LLM, model quality, or HTTP.
 These scripts do not implement service discovery, production service lifecycle,
 automatic failover, performance acceptance, or CUDA Graph support.
 
+## Verified full-model HTTP smoke
+
+The complete **40-layer** real checkpoint passed one eager OpenAI chat request
+through a **single RTP instance with four model workers**, TP4/EP4/DP1 and
+PDFUSION. The Owner was in a different host/container and held the same two
+188.83 GiB EGM allocations; the consumer checkpoint contained no complete
+Engram embedding tables. This was not a truncated fixture or four independent
+serving instances. See the [sanitized HTTP result](FULL_MODEL_HTTP_RESULTS.json).
+
+`/health` returned HTTP 200 with `"ok"`. For “你好，请用一句话介绍自己。”, the
+service returned:
+
+> 你好！我是DeepSeek，由深度求索公司创造的AI助手，随时准备为你提供帮助和解答问题！
+
+The response reported 12 prompt tokens, 26 completion tokens, and
+`finish_reason="stop"`. Its actual response metadata had `model=""` and
+`id="chat-"`; the result record preserves that behavior. The request selected
+`deepseek_v41`, but we do not replace the returned metadata with it.
+`pd_sep=false` and prefill CUDA Graph status `not_requested` match the eager
+PDFUSION configuration.
+
+This initial smoke proves complete request plumbing and readable output over
+external Engram. It does not establish local-table numerical equivalence,
+steady-state throughput, multi-instance serving or the additional 100 µs
+latency target. The first request's service timings are not an Engram overhead
+measurement. The successful health result was observed while serving; the
+endpoint was deliberately shut down after the smoke.
+
+Teardown was verified in order: all consumer task processes exited, the four
+consumer GPUs showed 0 MiB used, and only then was Owner STOP issued. The Owner
+exited with `CLOSED` and all eight native counters zero. It had retained its
+backing while waiting for explicit STOP. Consumer shutdown was **not fully
+automatic**: five leftover Python processes needed individually targeted TERM
+after their task identities were verified. No per-worker native zero-counter
+reports are claimed for this process-lifetime integration. The post-shutdown
+health probe correctly returned connection refused.
+
+### Observed nonblocking limitations
+
+The successful run was not warning-free. The JIT snapshot/cache manager emitted
+`JIT_CACHE_FAIL_OPEN` because `watchdog` was missing, then continued with a cold
+start. PyTorch also reported that its elementwise kernel disk-cache directory
+could not be created. MLOPart localization was unavailable and disabled.
+These did not prevent this chat smoke, but cache configuration and optional
+optimization availability need explicit follow-up before performance
+measurement. The PyTorch warning does not describe all Triton/DeepGEMM caches.
+No snapshot policy was changed to obtain the result.
+
+## Current preflight result
+
+The expanded runtime probe passed with real native loading and imports of
+`DashScApp`, `FrontendApp`, `BackendManager`, and the backend entry module.
+It also directly imports the three FlashMLA APIs used by V4.1 attention and
+checks the compiled `sparse_prefill_fwd` / `sparse_decode_fwd` bindings are
+callable. A child process hides GPUs with `CUDA_VISIBLE_DEVICES=''` and verifies
+that CUDA is not initialized. This catches service and lazy attention
+dependencies that importing only `start_server` and the model class did not
+exercise; it does not execute the attention kernels.
+
+The service-import closure added five previously missing distributions from
+the exact main lock: `jsonschema==4.26.0`, `tiktoken==0.7.0`,
+`jsonschema-specifications==2025.9.1`, `referencing==0.37.0`, and
+`rpds-py==0.30.0`. A subsequent attention-import closure added only
+`flash-mla==1.0.0+2e5429f`. Each wheel's SHA256 was verified before offline
+installation with hashes enforced and dependency resolution disabled.
+The environment grew from 131 to 136 to 137 distributions; every pre-existing
+version and all four main native libraries stayed unchanged in both rounds.
+The final helper's 16 CPU tests passed locally and in the consumer environment
+with zero skips. These orchestration tests mock subprocess execution; the
+separate runtime probe performs actual imports and compiled-binding checks.
+
+See [sanitized runtime results](FULL_MODEL_RUNTIME_RESULTS.json) for cumulative
+package, native-library and final source hashes, with the earlier 15-test round
+retained as history. The optional `FusedRopeKVCacheDecodeOp` warning under hidden
+GPUs remains visible. These probes do not construct a model, load full weights,
+establish worker readiness, or validate an HTTP response.
+
+A real TP4/EP4 attempt completed full weight loading. All four rank logs
+confirmed Engram layers `[1, 14]` initialized with `external=True`, and Engram JIT
+warmup completed through 118 tokens. Subsequent attention warmup failed because
+the lazy import of `flash_mla` was missing. The exact locked package and the
+expanded preflight above address that missing dependency. The subsequent
+full-model retry passed health and chat as recorded above. These import-probe
+results retain their own limited scope; they do not by themselves prove HTTP.
+
 ## Supported source and real launch path
 
 Baseline is public main `492ecf45b3ef55b22fd4882622abfdb2e2f664f2` plus this branch.
@@ -94,8 +179,13 @@ No script creates the other host's environment or transfers private handles.
    when the request does not ask for a grammar. An older image's engine `.so`
    is not a valid substitute. The runtime command checks package discovery,
    ELF dependency resolution, prints SHA256 and optionally performs real native
-   and server imports in a child with GPUs hidden. Import success still does
-   not prove every later JIT/model path is usable.
+   and server imports in a child with GPUs hidden. With `--load-native`, this
+   includes the real DashSc/frontend/backend entry classes and backend module,
+   the three FlashMLA Python APIs, and both required compiled sparse-attention
+   bindings. A missing package or child import is fatal before model launch.
+   It also checks that CUDA
+   remains uninitialized. Import success still does not prove every later
+   JIT/model path is usable.
 
 2. Start the real Owner only after platform memory/NUMA/IMEX checks succeed:
 

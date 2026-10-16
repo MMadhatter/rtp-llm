@@ -6,7 +6,8 @@ that an Owner's NUMA node, container, driver or fabric can support that size.
 The rebuilt bridge passed nine native GPU tests on each of two hosts, followed
 by a real cross-host 4.125 GiB Triton lookup probe. The complete 188.83 GiB real
 Engram generation subsequently passed [cross-host lookup](framework/REAL_CHECKPOINT_LOOKUP.md).
-Full-model HTTP serving remains a separate, unfinished acceptance gate.
+A subsequent [complete-model eager HTTP smoke](framework/FULL_MODEL_HTTP.md) passed;
+performance and production-service acceptance remain separate gates.
 
 | Layer | Default | Maximum accepted by this development implementation |
 | --- | ---: | ---: |

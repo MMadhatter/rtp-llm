@@ -27,10 +27,35 @@ read only selected rows, matched the published samples and did not initialize
 CUDA. Attach verification also checked the first/middle/last published rows.
 The PyTorch counters do not account for all driver resource overhead.
 
-The Owner remains READY with both allocations held for the next experiment;
-consumer cleanup does not imply Owner cleanup. Complete full-model HTTP is in
-progress and has **not** passed acceptance in this record. This probe did not
-run WKV, attention, MoE, the scheduler or HTTP, and measured no latency SLO.
+At the end of this lookup probe, the Owner remained READY with both allocations
+held for the next experiment; consumer cleanup did not imply Owner cleanup.
+The subsequent [full-model HTTP smoke](FULL_MODEL_HTTP.md) passed separately.
+This lookup probe itself did not run WKV, attention, MoE, the scheduler or HTTP,
+and measured no latency SLO.
+
+## Four concurrent GPU consumers
+
+A subsequent test held four independent consumer processes on four different
+GPUs in one consumer host/container, with the Owner on a separate host. At a
+common attach barrier, each had imported and mapped both real Owner
+allocations and completed bootstrap sample verification. The coordinator checked
+that all four process identities were still alive and referenced the same
+dataset/generation before releasing them into the existing lookup harness.
+
+All four consumers passed the same 12 cases: **48 / 48 exact BF16 results**.
+Each confirmed no complete Engram tables in its consumer checkpoint, zero
+PyTorch allocated-byte increase during attach, and a peak test increase of
+1,234,432 bytes. All four exited successfully with all eight native counters
+zero. A post-exit check found no compute processes and 0 MiB used on each of
+the four consumer GPUs. The Owner stayed alive and READY.
+
+There was still only **one 202,758,946,816-byte physical generation**. Four
+processes reporting the same mapped capacity do not imply four physical copies.
+See the [sanitized concurrent result](MULTICONSUMER_LOOKUP_RESULTS.json).
+The recorded 9.45 seconds includes process startup and checks; it is not an
+online-request latency measurement. These are lookup consumers, not four
+complete RTP serving instances; projection/gate/full-model HTTP remain separate
+gates.
 
 ## Verified checkpoint preparation
 
@@ -76,8 +101,8 @@ At that second call, node 0 reported 107,031,744 KiB free, yet the approximately
 native resource counters returned to zero. Free-byte totals alone therefore
 remain insufficient admission evidence. These are historical attempts: the
 later run on a suitable Owner host loaded both layers and passed the complete
-cross-host lookup described above. Full-model HTTP is a separate, unfinished
-gate.
+cross-host lookup described above. The later full-model HTTP smoke is recorded
+separately and does not establish why the earlier allocation failed.
 
 A later read-only snapshot found 253.81 GiB of free buddy memory on that node,
 but only 134.75 GiB in blocks of at least 2 MiB. On this 64 KiB-page kernel,
