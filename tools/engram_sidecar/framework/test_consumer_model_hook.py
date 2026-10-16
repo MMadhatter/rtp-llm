@@ -103,19 +103,46 @@ class FixtureBoundaryTest(unittest.TestCase):
             h.check_consumer_fixture(self.root)
 
     def test_missing_native_fails_before_importing_rtp(self):
-        with mock.patch.object(h.importlib.util, "find_spec", return_value=None), \
+        native_dir = self.root / "rtp_llm" / "libs"
+        native_dir.mkdir(parents=True)
+        (native_dir / "libth_transformer_config.so").touch()
+        with mock.patch.object(h, "REPO", self.root), \
+             mock.patch.object(h.sys, "path", list(sys.path)), \
+             mock.patch.object(h.importlib.util, "find_spec", return_value=None), \
              mock.patch.object(h.importlib, "import_module") as imported:
             with self.assertRaisesRegex(RuntimeError, "REAL_RTP_NATIVE_REQUIRED"):
                 h.require_real_native()
         imported.assert_not_called()
 
     def test_python_fake_native_is_rejected(self):
+        native_dir = self.root / "rtp_llm" / "libs"
+        native_dir.mkdir(parents=True)
+        (native_dir / "libth_transformer_config.so").touch()
         fake = SimpleNamespace(origin="/tmp/libth_transformer_config.py",
                                loader=importlib.machinery.SourceFileLoader("fake", "/tmp/fake.py"))
-        with mock.patch.object(h.importlib.util, "find_spec", return_value=fake), \
+        with mock.patch.object(h, "REPO", self.root), \
+             mock.patch.object(h.sys, "path", list(sys.path)), \
+             mock.patch.object(h.importlib.util, "find_spec", return_value=fake), \
              mock.patch.object(h.importlib, "import_module") as imported:
             with self.assertRaisesRegex(RuntimeError, "REAL_RTP_NATIVE_REQUIRED"):
                 h.require_real_native()
+        imported.assert_not_called()
+
+    def test_external_native_spec_cannot_bypass_missing_bounded_repo_library(self):
+        external = self.root / "external" / "libth_transformer_config.so"
+        external.parent.mkdir()
+        external.touch()
+        fake = SimpleNamespace(
+            origin=str(external),
+            loader=importlib.machinery.ExtensionFileLoader("libth_transformer_config", str(external)),
+        )
+        with mock.patch.object(h, "REPO", self.root), \
+             mock.patch.object(h.sys, "path", [str(external.parent), *sys.path]), \
+             mock.patch.object(h.importlib.util, "find_spec", return_value=fake) as found, \
+             mock.patch.object(h.importlib, "import_module") as imported:
+            with self.assertRaisesRegex(RuntimeError, "bounded config library missing"):
+                h.require_real_native()
+        found.assert_not_called()
         imported.assert_not_called()
 
 

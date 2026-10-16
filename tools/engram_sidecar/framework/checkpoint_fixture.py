@@ -30,8 +30,10 @@ MAX_NGRAM = 4
 HEADS = 2
 WKV_K = (MAX_NGRAM - 1) * HEADS * HEAD_DIM
 WKV_N = (HC + 1) * HIDDEN_DIM
-MODEL_REVISION = "engram-framework-fixture-main-492ecf45-v1"
+MODEL_REVISION = "engram-framework-fixture-main-492ecf45-v2"
 IMAGE_TOKEN_ID = 4
+_ROW_ID_BITS = (max(rows for _, rows in LAYERS) - 1).bit_length()
+_ROW_TAG_BITS = _ROW_ID_BITS + (len(LAYERS) - 1).bit_length()
 
 
 def _json(path, document):
@@ -64,13 +66,26 @@ def _tokenizer():
 
 
 def table_rows(layer_id, row_ids):
-    """Produce selected actual FP8/E8M0 rows without constructing a whole table."""
+    """Produce selected FP8/E8M0 rows with a unique layer/row sign signature."""
     import torch
 
+    layer_slots = {layer: slot for slot, (layer, _) in enumerate(LAYERS)}
+    if layer_id not in layer_slots:
+        raise ValueError("unknown fixture layer")
     row_ids = torch.as_tensor(row_ids, dtype=torch.int64, device="cpu")
+    if bool(((row_ids < 0) | (row_ids >= dict(LAYERS)[layer_id])).any()):
+        raise ValueError("fixture row index is outside its layer")
+    if _ROW_TAG_BITS > HEAD_DIM:
+        raise ValueError("fixture row signature does not fit the embedding width")
     columns = torch.arange(HEAD_DIM, dtype=torch.int64)
     groups = torch.arange(HEAD_DIM // 32, dtype=torch.int64)
     values = ((row_ids[..., None] * 7 + columns * 3 + layer_id * 11) % 17 - 8).float() / 4
+    # Positive E8M0 scales preserve these signs after dequantization. Thus all
+    # actual rows, including rows from different layers, remain distinguishable
+    # without increasing the numeric range or losing exact FP8 representation.
+    row_tag = row_ids | (layer_slots[layer_id] << _ROW_ID_BITS)
+    bits = (row_tag[..., None] >> torch.arange(_ROW_TAG_BITS, dtype=torch.int64)) & 1
+    values[..., :_ROW_TAG_BITS] = bits.float() * 2 - 1
     weights = values.to(torch.float8_e4m3fn).contiguous()
     scale_bytes = ((row_ids[..., None] * 2 + groups + layer_id) % 4 + 125).to(torch.uint8)
     scales = scale_bytes.contiguous().view(torch.float8_e8m0fnu)
@@ -108,8 +123,12 @@ def make_inputs(batch_size, step=0):
         raise ValueError("batch_size and step must be nonnegative integers")
     rows = torch.arange(batch_size, dtype=torch.int64)
     history = torch.arange(MAX_NGRAM, dtype=torch.int64)
-    windows = (5 + (rows[:, None] * 3 + step * 5 - history[None, :]) % 27).to(torch.int32)
-    if batch_size:
+    positions = rows[:, None] * 3 + step - history[None, :]
+    windows = torch.where(positions >= 0, 5 + positions * 5 % 27, -1).to(torch.int32)
+    # A singleton is one real rolling decode sequence: at steps 0/1/7 it has
+    # 0/1/3 history tokens. Multi-row cases additionally inject independent
+    # sequence boundaries, current image tokens and fully masked rows.
+    if batch_size > 1:
         windows[rows % 3 == 0, 1:] = -1
         windows[rows % 5 == 4, 0] = IMAGE_TOKEN_ID
         windows[rows % 7 == 6, :] = -1

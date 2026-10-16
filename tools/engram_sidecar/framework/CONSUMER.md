@@ -1,8 +1,9 @@
 # Real model-hook consumer
 
-GPU acceptance for this script is pending in this checkpoint. The completed
-bootstrap/hash/lookup test is documented separately in
-[framework validation](../FRAMEWORK_VALIDATION.md).
+The v2 small-fixture run passed 12 layer/case checks on the Owner host and 12
+on a different host/container, using the same shared dataset/generation. Full
+model serving remains untested; see [framework validation](../FRAMEWORK_VALIDATION.md)
+and [compact results](VALIDATION_RESULTS.json).
 
 `consumer_model_hook.py` calls the real `DeepSeekV41Model._load_extra_weights()`
 and `_prepare_engram()` on a small shell containing only their required fields.
@@ -35,9 +36,14 @@ python tools/engram_sidecar/framework/consumer_model_hook.py \
   --device 0
 ```
 
-The genuine `libth_transformer_config` and `librtp_compute_ops` extensions must
-be importable from the checkout `rtp_llm/libs`, top-level `bazel-bin`, or an
-explicit `PYTHONPATH`. The prebuilt Engram native extension must also be available
+Place genuine `libth_transformer_config.so` and `librtp_compute_ops.so` in the
+checkout's `rtp_llm/libs`. A build under `bazel-bin` is also accepted when the
+config library is at its root or at most two directory levels below it. The
+harness checks these bounded locations before importing any RTP code, and the
+imported config extension must resolve to that checked library. An external
+`PYTHONPATH` alone is insufficient: `rtp_llm.ops` would otherwise enter its
+recursive missing-library search even if Python could already import the file.
+The prebuilt Engram native extension must also be available
 as required by `engram_bootstrap`. Runtime dynamic dependencies must be resolved
 by the existing development environment. Import failures are not skipped.
 
@@ -53,6 +59,12 @@ it is set before measurements, not tuned to observed errors. Zero uses only the
 absolute floor. Nonfinite values always fail. Every case reports maximum absolute
 error and maximum error/bound ratio. This tolerance is a small-fixture criterion,
 not an accuracy promise for the full model.
+
+The fixture uses HC=2 and hidden dimension 128. Its gated residual dispatches to
+the generic/reference computation in `gated_engram_residual`; it does not exercise
+the fused Triton gate selected for supported HC=4, hidden-dimension-5120 inputs.
+The completed fixture runs validate this smaller branch only. Fused-gate
+correctness and latency require a separate supported-shape test.
 
 A successful run emits `consumer_complete` with `layer_cases=12`, the bound
 dataset/generation, and explicit scope limitations. It makes no latency claim.
