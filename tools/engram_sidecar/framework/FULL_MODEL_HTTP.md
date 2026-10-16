@@ -60,7 +60,9 @@ are around 190 GiB in total; use the inspected checkpoint's exact numbers.
 The new hard development ceilings are 128 GiB/allocation and 256 GiB/dataset,
 not a statement that the selected host or container has that memory available.
 Budget excludes file cache, loader RSS, driver metadata and all consumer model
-weights. A former 64 GiB development container cannot hold these tables.
+weights. Neither a former 64 GiB container quota nor raising that quota proves
+that the selected NUMA node can supply these tables. In the tested driver,
+observed EGM RSS and container memory accounting differ; measure both.
 
 For the consumer, four SM100 GPUs are the source-backed test configuration,
 not a proved minimum. Check per-GPU HBM for TP/EP-sharded real weights, replicated
@@ -76,7 +78,9 @@ Use trusted, immutable checkpoint directories. The commands below are examples;
 the operator provides the private publication directory and checkpoint identity.
 No script creates the other host's environment or transfers private handles.
 
-1. **Before loading EGM**, verify the complete runtime on the consumer:
+1. **Before the full HTTP experiment**, verify the complete runtime on the consumer.
+   The separate [real-table lookup experiment](REAL_CHECKPOINT_LOOKUP.md) can run
+   while the complete engine is being built:
 
    ```bash
    python tools/engram_sidecar/framework/full_model_http.py runtime --load-native
@@ -111,6 +115,10 @@ No script creates the other host's environment or transfers private handles.
    private capabilities have been published. The manifest binds tensor bytes.
    Fixture mode remains `--fixture-root PATH`, with original defaults of 1 GiB
    per allocation and 64 MiB Owner budget; never call it a full checkpoint.
+   For an operator-owned private checkpoint copy, the optional
+   `--discard-private-checkpoint-cache` reduces retained source file cache while
+   streaming. It is a kernel advice, not a capacity guarantee; keep monitoring
+   NUMA and container memory, and leave it off for shared checkpoint files.
 
 3. Transfer `bundle.json`, `manifest.json`, `capabilities.json` over the existing
    authenticated channel into the consumer's private directory. Keep files

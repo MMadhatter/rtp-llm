@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import sys
 import threading
@@ -48,6 +49,21 @@ def private_write(path, payload):
 
 def digest(payload):
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def failure_fields(error):
+    """Expose bounded native CUDA diagnostics without arbitrary exception text.
+
+    Paths, payloads and capabilities must not reach publication logs through an
+    exception's message. The native bridge's fixed stage/name/numeric code are
+    enough to distinguish allocation pressure from import/access failures.
+    """
+    fields = dict(error_type=type(error).__name__, code=getattr(error, "code", None))
+    if isinstance(error, RuntimeError):
+        match = re.match(r"\A([a-z_]{1,64}): (CUDA_[A-Z_]{1,80}) \(code=([0-9]{1,6})\):", str(error))
+        if match:
+            fields.update(cuda_stage=match[1], cuda_error=match[2], cuda_code=int(match[3]))
+    return fields
 
 
 @dataclass(frozen=True)
@@ -109,6 +125,8 @@ def parser_for_owner():
     parser.add_argument("--numa", type=int, default=0)
     parser.add_argument("--max-allocation-bytes", type=int, default=1 << 30)
     parser.add_argument("--budget-bytes", type=int, default=64 << 20)
+    parser.add_argument("--discard-private-checkpoint-cache", action="store_true",
+                        help="Advise release of source file cache during loading; only for an operator-owned private immutable checkpoint copy")
     parser.add_argument("--report-timeout", type=float, default=1800)
     return parser
 
@@ -196,7 +214,8 @@ def main(argv=None):
              config_sha256=source.config_sha256, index_sha256=source.index_sha256,
              component_fixture=source.component_fixture, physical_bytes=plan.physical_bytes,
              budget_bytes=args.budget_bytes, max_allocation_bytes=args.max_allocation_bytes)
-        generation = load_checkpoint(plan, native=native, device=args.device, numa=args.numa)
+        generation = load_checkpoint(plan, native=native, device=args.device, numa=args.numa,
+                                     discard_file_cache=args.discard_private_checkpoint_cache)
         manifest = generation.manifest
         bundle = dict(schema_version=1, manifest="manifest.json", capabilities="capabilities.json",
                       manifest_sha256=digest(generation.manifest_bytes),
@@ -217,7 +236,7 @@ def main(argv=None):
         hold_until_stop()
     except BaseException as error:
         failed = True
-        emit("FAILED", error_type=type(error).__name__, code=getattr(error, "code", None))
+        emit("FAILED", **failure_fields(error))
         if published:
             hold_until_stop()
     finally:

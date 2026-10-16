@@ -5,13 +5,17 @@ Imports do not initialize CUDA. The caller supplies a native backend and trusted
 ExpectedLayout. Checkpoint inputs must remain read-only throughout inspection
 and loading; stat tokens detect ordinary replacement/truncation, not adversarial
 in-place modification. The budget covers padded native backing, NOT total RSS:
-safetensors mmap/page-cache residency and Python/header overhead are separate.
+file page-cache residency and Python/header overhead are separate. Optional
+cache advice is exclusively for operator-confirmed private immutable copies;
+it never establishes that the OS actually reclaimed memory.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from uuid import uuid4
@@ -26,6 +30,7 @@ from .engram_capacity import (CapacityError, DEFAULT_MAX_ALLOCATION_BYTES,
 MAX_ALLOCATION_BYTES = HARD_MAX_ALLOCATION_BYTES
 MAX_LOAD_CHUNK_BYTES = 64 << 20
 _MAX_JSON_BYTES = 32 << 20
+_DISCARD_INTERVAL_BYTES = 64 << 20
 
 
 class CheckpointError(ValueError):
@@ -129,9 +134,12 @@ def _path(root, relative, *, tensor_file=True):
     return path
 
 
-def _stat(path):
-    s = path.stat()
+def _stat_token(s):
     return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+
+
+def _stat(path):
+    return _stat_token(path.stat())
 
 
 def _same_snapshot(root, snapshot, *, index=False):
@@ -154,6 +162,69 @@ def _header(path, relative):
     if len(raw) != length or _stat(path) != before:
         raise CheckpointError("CHECKPOINT_CHANGED")
     return _json(raw), 8 + length, FileSnapshot(relative, before, hashlib.sha256(raw).hexdigest())
+
+
+def _read_exact(source, size):
+    """Read a bounded byte span, handling short reads without accepting EOF."""
+    pieces, remaining = [], size
+    while remaining:
+        piece = source.read(remaining)
+        if not piece:
+            raise CheckpointError("SHORT_READ")
+        pieces.append(piece)
+        remaining -= len(piece)
+    return b"".join(pieces)
+
+
+@contextmanager
+def _open_tensor_source(root, snapshot):
+    """Bind the checked header and streamed bytes to the same file descriptor."""
+    path = _same_snapshot(root, snapshot)
+    with path.open("rb", buffering=0) as source:
+        if _stat_token(os.fstat(source.fileno())) != snapshot.stat_token:
+            raise CheckpointError("CHECKPOINT_CHANGED")
+        length = int.from_bytes(_read_exact(source, 8), "little")
+        if not 0 < length <= _MAX_JSON_BYTES or length > snapshot.stat_token[2] - 8:
+            raise CheckpointError("CHECKPOINT_CHANGED")
+        header = _read_exact(source, length)
+        if hashlib.sha256(header).hexdigest() != snapshot.header_sha256:
+            raise CheckpointError("CHECKPOINT_CHANGED")
+        del header
+        _same_snapshot(root, snapshot)
+        yield source, 8 + length
+        if _stat_token(os.fstat(source.fileno())) != snapshot.stat_token:
+            raise CheckpointError("CHECKPOINT_CHANGED")
+    _same_snapshot(root, snapshot)
+
+
+def _cache_page_size(enabled):
+    if type(enabled) is not bool:
+        raise CheckpointError("INVALID_ARGUMENT")
+    if not enabled:
+        return None
+    if (not callable(getattr(os, "posix_fadvise", None))
+            or not hasattr(os, "POSIX_FADV_DONTNEED")):
+        raise CheckpointError("CACHE_ADVICE_UNSUPPORTED")
+    try:
+        page_size = os.sysconf("SC_PAGESIZE")
+    except (AttributeError, OSError, ValueError) as error:
+        raise CheckpointError("CACHE_ADVICE_UNSUPPORTED") from error
+    if type(page_size) is not int or page_size <= 0:
+        raise CheckpointError("CACHE_ADVICE_UNSUPPORTED")
+    return page_size
+
+
+def _discard_consumed_pages(source, start, end, page_size):
+    """Advise only complete pages inside [start, end); return the cursor."""
+    first = ((start + page_size - 1) // page_size) * page_size
+    last = end // page_size * page_size
+    if last > first:
+        try:
+            os.posix_fadvise(source.fileno(), first, last - first, os.POSIX_FADV_DONTNEED)
+        except OSError as error:
+            raise CheckpointError("CACHE_ADVICE_FAILED") from error
+        return last
+    return start
 
 
 def _document(layout, generation):
@@ -330,18 +401,24 @@ class LoadedGeneration:
         self._state = "CLOSED"
 
 
-def load_checkpoint(plan: CheckpointPlan, *, native, device, numa, chunk_bytes=8 << 20):
-    """Load bounded row chunks, hash full tensors, then export the whole generation.
+def load_checkpoint(plan: CheckpointPlan, *, native, device, numa, chunk_bytes=8 << 20,
+                    discard_file_cache=False):
+    """Stream exact tensor bytes, hash them, then export the whole generation.
 
-    Only the copied byte chunk is bounded by chunk_bytes. Underlying file mmap
-    residency/page cache is not bounded by this option. No Owner exists until
-    current metadata, native granularity, padded budget and chunk limits pass.
+    Raw reads avoid full-file tensor mappings; chunk_bytes still does not bound
+    OS page cache. discard_file_cache is an explicit operator assertion that
+    plan.files belong to private immutable checkpoint copies. It advises those
+    files before allocation and consumed complete pages during loading. It does
+    not touch the index, unrelated paths or global caches; callers must not
+    enable it for shared source files. Advice failure aborts loading;
+    success is only a hint, not a guarantee of eviction or sufficient memory.
+    No Owner exists until metadata, native granularity, budgets and limits pass.
     """
     import torch
-    from safetensors import safe_open
 
     if not isinstance(plan, CheckpointPlan) or type(device) is not int or device < 0 or type(numa) is not int or numa < 0:
         raise CheckpointError("INVALID_ARGUMENT")
+    page_size = _cache_page_size(discard_file_cache)
     _positive(chunk_bytes, min(MAX_LOAD_CHUNK_BYTES, native.max_load_chunk_bytes))
     if any(t.shape[1] > chunk_bytes for layer in plan.layers for t in layer.tensors):
         raise CheckpointError("CHUNK_SMALLER_THAN_ROW")
@@ -357,9 +434,13 @@ def load_checkpoint(plan: CheckpointPlan, *, native, device, numa, chunk_bytes=8
               "F8_E8M0": getattr(torch, "float8_e8m0fnu", None)}
     if any(dtypes[t.source_dtype] is None for layer in plan.layers for t in layer.tensors):
         raise CheckpointError("UNSUPPORTED_TORCH_DTYPE")
+    root = Path(plan.root)
+    if page_size is not None:
+        for snapshot in plan.files:
+            with _open_tensor_source(root, snapshot) as (source, _):
+                _discard_consumed_pages(source, 0, snapshot.stat_token[2], page_size)
     result = LoadedGeneration()
     result.physical_bytes = plan.physical_bytes
-    root = Path(plan.root)
     snapshots = {snapshot.relative_path: snapshot for snapshot in plan.files}
     generation, incarnation = str(uuid4()), str(uuid4())
     document = _document(plan.expected_layout, generation)
@@ -374,25 +455,28 @@ def load_checkpoint(plan: CheckpointPlan, *, native, device, numa, chunk_bytes=8
             allocation_id = str(uuid4())
             allocation_owners.append((allocation_id, owner))
             for tensor in layer.tensors:
-                path = _same_snapshot(root, snapshots[tensor.relative_path])
                 digest = hashlib.sha256()
                 rows, columns = tensor.shape
                 rows_per_chunk = chunk_bytes // columns
-                expected_dtype = dtypes[tensor.source_dtype]
-                with safe_open(path, framework="pt", device="cpu") as reader:
-                    view = reader.get_slice(tensor.name)
+                snapshot = snapshots[tensor.relative_path]
+                with _open_tensor_source(root, snapshot) as (source, data_start):
+                    start = data_start + tensor.data_range[0]
+                    end = data_start + tensor.data_range[1]
+                    source.seek(start)
+                    consumed, discarded = start, start
                     for begin in range(0, rows, rows_per_chunk):
-                        chunk = view[begin:min(begin + rows_per_chunk, rows)]
-                        if chunk.device.type != "cpu" or chunk.dtype != expected_dtype or chunk.element_size() != 1:
-                            raise CheckpointError("TENSOR_DTYPE_MISMATCH")
-                        payload = chunk.contiguous().view(torch.uint8).numpy().tobytes()
-                        if len(payload) > chunk_bytes or len(payload) != chunk.numel():
-                            raise CheckpointError("INVALID_CHUNK")
+                        length = min(rows_per_chunk, rows - begin) * columns
+                        payload = _read_exact(source, length)
                         digest.update(payload)
                         owner.load(payload, offset=tensor.target_offset + begin * columns)
-                        del payload, chunk
-                    del view
-                _same_snapshot(root, snapshots[tensor.relative_path])
+                        del payload
+                        consumed += length
+                        if page_size is not None and consumed - discarded >= _DISCARD_INTERVAL_BYTES:
+                            discarded = _discard_consumed_pages(source, discarded, consumed, page_size)
+                    if consumed != end:
+                        raise CheckpointError("INVALID_TENSOR_RANGE")
+                    if page_size is not None:
+                        _discard_consumed_pages(source, discarded, consumed, page_size)
                 document["tensors"].append(_tensor_metadata(
                     tensor, layer, allocation_id, incarnation, granularity, "sha256:" + digest.hexdigest()))
         # Final generation-wide consistency check before any handle is exported.

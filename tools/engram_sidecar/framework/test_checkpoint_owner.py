@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from tools.engram_sidecar.framework.checkpoint_owner import (
-    digest, parser_for_owner, private_write, read_source,
+    digest, failure_fields, parser_for_owner, private_write, read_source,
 )
 
 
@@ -84,9 +84,23 @@ class OwnerInputTest(unittest.TestCase):
         parser = parser_for_owner()
         args = parser.parse_args(["--checkpoint", str(self.checkpoint), "--model-revision", "release", "--publication", str(self.root / "pub")])
         self.assertEqual((args.max_allocation_bytes, args.budget_bytes), (1 << 30, 64 << 20))
+        self.assertFalse(args.discard_private_checkpoint_cache)
         args = parser.parse_args(["--fixture-root", str(self.root), "--publication", str(self.root / "pub"),
                                   "--max-allocation-bytes", str(128 << 30), "--budget-bytes", str(256 << 30)])
         self.assertEqual((args.max_allocation_bytes, args.budget_bytes), (128 << 30, 256 << 30))
+
+    def test_cache_discard_requires_explicit_option(self):
+        args = parser_for_owner().parse_args([
+            "--checkpoint", str(self.checkpoint), "--model-revision", "release",
+            "--publication", str(self.root / "pub"), "--discard-private-checkpoint-cache"])
+        self.assertTrue(args.discard_private_checkpoint_cache)
+
+    def test_cuda_failure_diagnostics_do_not_copy_arbitrary_text(self):
+        error = RuntimeError("owner_create: CUDA_ERROR_OUT_OF_MEMORY (code=2): private secret payload")
+        self.assertEqual(failure_fields(error), dict(error_type="RuntimeError", code=None,
+                         cuda_stage="owner_create", cuda_error="CUDA_ERROR_OUT_OF_MEMORY", cuda_code=2))
+        for message in ("private capability data", "owner_create: CUDA_UNKNOWN (code=-1): secret"):
+            self.assertEqual(failure_fields(RuntimeError(message)), dict(error_type="RuntimeError", code=None))
 
     def test_capabilities_write_is_private_atomic_replace(self):
         path = self.root / "private.json"

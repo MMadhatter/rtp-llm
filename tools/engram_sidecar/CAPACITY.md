@@ -63,14 +63,24 @@ actual driver granularity must be queried, not assumed.
 All of this backing is allocated on the Owner's selected local NUMA node.
 NVL72 aggregate memory does not establish this local capacity. Check NUMA
 availability, allowed memory nodes, container memory limits, existing workloads
-and source-checkpoint disk space before a large run. A 64 GiB Owner container
-cannot hold this approximately 189 GiB generation.
+and source-checkpoint disk space before a large run. A container's ordinary
+memory quota alone does not establish either availability or enforcement for
+this approximately 189 GiB EGM generation. On the tested driver, a roughly
+95 GiB Owner RSS was not reflected in the container's much smaller recorded
+memory peak. Check actual process/NUMA/driver measurements and the platform's
+accounting behavior; do not assume every EGM byte is charged to memory.current.
 
 Budget measures unique padded EGM backing, counting shared weight/scale storage
-once. It excludes source-file mmap/page-cache residency, bounded staging chunks,
+once. It excludes source-file page-cache residency, bounded staging chunks,
 other model weights and runtime/driver metadata. The current Owner zeroes the
 complete allocation before chunked loading; each tensor is fully hashed before
 publication. Bounded chunks do not guarantee bounded total RSS or file cache.
+The loader now reads exact bytes through a checked file descriptor without
+keeping full tensor mmap views. The opt-in `discard_file_cache=True` (Owner CLI
+`--discard-private-checkpoint-cache`) advises release of private immutable
+source files before allocation and already consumed complete pages during
+streaming. It never drops global cache, and the advice does not guarantee
+reclamation. Defaults leave checkpoint cache untouched.
 
 ## Acceptance gates
 
@@ -79,6 +89,9 @@ with no skips: capacity policy/arithmetic 9, bootstrap 36 and checkpoint loading
 23. The checkpoint tests use real torch/safetensors with an accounting fake
 native backend. The official-size metadata test creates only small JSON files.
 These are direct Python test runs, not a new Bazel or native/GPU result.
+The subsequent raw-reader revision passed 38 real Torch/safetensors CPU tests
+without skips, including byte identity, >4 GiB seeks, partial reads, file
+mutation, cache-advice ordering/bounds/failure and allocation rollback.
 
 The subsequent enlarged-native GPU runs passed nine tests per host, including
 100 attach/view/drain/close cycles and constructor rollback. Both ended with all

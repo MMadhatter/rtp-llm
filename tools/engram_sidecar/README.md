@@ -88,6 +88,13 @@ local [capacity configuration](CAPACITY.md) can raise them to the new native
 remain. The rebuilt native bridge and a real cross-host 4.125 GiB
 [boundary lookup](framework/LARGE_OFFSET_PROBE.md) passed. Complete real-checkpoint
 capacity and [full-model HTTP](framework/FULL_MODEL_HTTP.md) acceptance remain pending.
+All 48 original checkpoint shards have now passed official SHA256 verification;
+the [staged consumer](framework/CHECKPOINT_STAGING_RESULTS.json) retains the full
+model while omitting complete Engram tables. The
+[real-checkpoint lookup harness](framework/REAL_CHECKPOINT_LOOKUP.md) and private
+cache streaming option cover the next capacity gate; current full-table loading
+has reached a first complete layer but encountered NUMA allocation pressure at
+the second layer.
 Next gates are the supported-shape fused gate,
 complete engine/rank integration and two independent serving instances. The
 additional 100-microsecond target remains unpassed. Production companion
