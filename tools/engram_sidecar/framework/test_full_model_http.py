@@ -101,13 +101,16 @@ class FullModelPreflightTest(unittest.TestCase):
         args = SimpleNamespace(checkpoint=self.root, bundle=self.root / "bundle.json", port=18630,
                                max_allocation_bytes=128 << 30, budget_bytes=256 << 30)
         env = launch_environment(args, {"ENABLE_CUDA_GRAPH": "1", "HACK_LAYER_NUM": "1", "SP_TYPE": "dspark",
-                                        "MODEL_SERVICE_CONFIG": "old", "CUDA_VISIBLE_DEVICES": "0,1,2,3"})
+                                        "MODEL_SERVICE_CONFIG": "old", "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                                        "FASTSAFETENSORS_NOGDS": "0"})
         self.assertEqual(env["ENABLE_CUDA_GRAPH"], "0")
         self.assertEqual(env["HACK_LAYER_NUM"], "0")
         self.assertEqual(env["SP_TYPE"], "")
         self.assertEqual(env["THINK_MODE"], "0")
         self.assertEqual(env["TP_SIZE"], "4")
         self.assertEqual(env["EP_SIZE"], "4")
+        self.assertEqual(env["LOAD_METHOD"], "fastsafetensors")
+        self.assertEqual(env["FASTSAFETENSORS_NOGDS"], "1")
         self.assertEqual(env["RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES"], str(256 << 30))
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
         self.assertNotIn("MODEL_SERVICE_CONFIG", env)
