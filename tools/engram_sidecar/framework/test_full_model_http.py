@@ -1,9 +1,11 @@
 """Preflight negative cases only; these fake files never run a model."""
 import json
+import subprocess
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from tools.engram_sidecar.framework.full_model_http import (
     NATIVE_LIBS, TEXT_FIELDS, chat_payload, checkpoint_preflight, launch_environment, runtime_preflight,
@@ -96,6 +98,64 @@ class FullModelPreflightTest(unittest.TestCase):
             (libs / name).touch()
         with self.assertRaisesRegex(RuntimeError, "libth_transformer.so,libth_grammar_tokenizer_info.so"):
             runtime_preflight(self.root)
+
+    def test_runtime_child_imports_real_service_entry_classes_with_gpu_hidden(self):
+        libs = self.root / "rtp_llm/libs"
+        libs.mkdir(parents=True)
+        for name in NATIVE_LIBS:
+            (libs / name).write_bytes(b"metadata-only-unit-test")
+        with patch("tools.engram_sidecar.framework.full_model_http.importlib.util.find_spec", return_value=object()), patch(
+            "tools.engram_sidecar.framework.full_model_http.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ) as run:
+            report = runtime_preflight(self.root, load_native=True)
+        children = [call for call in run.call_args_list if "-c" in call.args[0]]
+        self.assertEqual(len(children), 1)
+        child = children[0]
+        self.assertEqual(child.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "")
+        self.assertTrue(child.kwargs["check"])
+        for statement in (
+            "from rtp_llm.dash_sc.app import DashScApp",
+            "from rtp_llm.frontend.frontend_app import FrontendApp",
+            "from rtp_llm.server.backend_manager import BackendManager",
+            "import rtp_llm.start_backend_server",
+            "from flash_mla import flash_mla_sparse_fwd, flash_mla_with_kvcache, get_mla_metadata",
+            "from flash_mla import cuda as flash_mla_cuda",
+            "flash_mla_cuda.sparse_prefill_fwd, flash_mla_cuda.sparse_decode_fwd",
+            "assert all(callable(f)",
+            "assert not torch.cuda.is_initialized()",
+        ):
+            self.assertIn(statement, child.args[0][2])
+        self.assertNotIn("from tools.engram_sidecar", child.args[0][2])
+        self.assertTrue(report["native_import_checked"])
+
+    def test_runtime_rejects_missing_flash_mla_before_child(self):
+        libs = self.root / "rtp_llm/libs"
+        libs.mkdir(parents=True)
+        for name in NATIVE_LIBS:
+            (libs / name).touch()
+        with patch("tools.engram_sidecar.framework.full_model_http.importlib.util.find_spec",
+                   side_effect=lambda name: None if name == "flash_mla" else object()), patch(
+            "tools.engram_sidecar.framework.full_model_http.subprocess.run",
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "missing runtime Python packages: flash_mla"):
+                runtime_preflight(self.root, load_native=True)
+        run.assert_not_called()
+
+    def test_runtime_child_missing_dependency_is_fatal_before_launch(self):
+        libs = self.root / "rtp_llm/libs"
+        libs.mkdir(parents=True)
+        for name in NATIVE_LIBS:
+            (libs / name).touch()
+        def run(command, **kwargs):
+            if "-c" in command:
+                raise subprocess.CalledProcessError(1, command)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch("tools.engram_sidecar.framework.full_model_http.importlib.util.find_spec", return_value=object()), patch(
+            "tools.engram_sidecar.framework.full_model_http.subprocess.run", side_effect=run,
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                runtime_preflight(self.root, load_native=True)
 
     def test_launch_enforces_full_eager_no_draft_and_trusted_capacity(self):
         args = SimpleNamespace(checkpoint=self.root, bundle=self.root / "bundle.json", port=18630,

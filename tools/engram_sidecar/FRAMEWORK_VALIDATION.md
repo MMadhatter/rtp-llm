@@ -195,7 +195,8 @@ The GPU results above used the earlier small-capacity native build. A subsequent
 bridge and lookup across the 32-bit byte-offset boundary. The complete real
 [188.83 GiB generation](framework/REAL_CHECKPOINT_LOOKUP.md) subsequently passed
 12 exact cross-host lookup cases and consumer cleanup. That separate probe did
-not run full-model HTTP, which remains an unfinished acceptance gate.
+not run full-model HTTP. A later [40-layer TP4/EP4 eager HTTP smoke](framework/FULL_MODEL_HTTP.md)
+passed for one complete four-worker RTP instance; it is recorded separately.
 These ceilings do not establish available NUMA/container memory.
 The VMM/native bridge and required RTP
 native libraries must be prebuilt and importable before launching consumers;
@@ -205,8 +206,11 @@ latency measurement. These correctness runs do not establish warmed latency.
 
 The genuine Engram model-hook/layer-forward path is now validated for this small
 eager fixture on local and remote backing. Remaining acceptance covers the
-complete engine, all required ranks, a real model checkpoint, the supported-shape
-fused gate, and two independent RTP serving deployments under concurrency.
+local-table numerical comparison of the complete model, production-geometry
+fused-gate equivalence, and two independent RTP serving deployments under
+concurrency. The separate complete-model smoke exercised the engine and all
+four model ranks with the real checkpoint; it did not establish those remaining
+gates.
 Engine Graph, sCR, unload/reload and Owner/host failure recovery need explicit
 lifetimes and additional acceptance work.
 

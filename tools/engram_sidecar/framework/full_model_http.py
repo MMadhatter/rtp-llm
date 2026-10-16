@@ -22,7 +22,7 @@ sys.path.insert(0, str(REPO))
 NATIVE_LIBS = ("libth_transformer_config.so", "librtp_compute_ops.so",
                "libth_transformer.so", "libth_grammar_tokenizer_info.so")
 PYTHON_PACKAGES = ("torch", "transformers", "tokenizers", "safetensors", "fastsafetensors",
-                   "triton", "deep_gemm", "flashinfer", "tilelang", "fastapi", "uvicorn",
+                   "triton", "deep_gemm", "flashinfer", "flash_mla", "tilelang", "fastapi", "uvicorn",
                    "pydantic", "grpc", "requests", "PIL", "engram_native_dev_492ecf45")
 TOP_LEVEL_FIELDS = ("text_config", "vision_config", "quantization_config", "dtype",
                     "bos_token_id", "eos_token_id", "pad_token_id", "image_token_id")
@@ -116,6 +116,7 @@ def checkpoint_preflight(checkpoint):
             "index_sha256": sha256_file(checkpoint / "model.safetensors.index.json")}
 
 
+
 def runtime_preflight(repository=REPO, *, load_native=False):
     """Require bounded same-checkout library paths; no recursive .so fallback."""
     libs = Path(repository) / "rtp_llm" / "libs"
@@ -140,6 +141,18 @@ def runtime_preflight(repository=REPO, *, load_native=False):
             "import libth_grammar_tokenizer_info; import rtp_llm.start_server; "
             "import rtp_llm.models.deepseek_v41; "
             "import rtp_llm.openai.renderers.deepseekv41_renderer; "
+            "from rtp_llm.dash_sc.app import DashScApp; "
+            "from rtp_llm.frontend.frontend_app import FrontendApp; "
+            "from rtp_llm.server.backend_manager import BackendManager; "
+            "import rtp_llm.start_backend_server; "
+            # These are lazy in the RTP wrappers; load the actual wheel and
+            # its CUDA bindings before any complete-checkpoint allocation.
+            "from flash_mla import flash_mla_sparse_fwd, flash_mla_with_kvcache, get_mla_metadata; "
+            "from flash_mla import cuda as flash_mla_cuda; "
+            "assert all(callable(f) for f in (flash_mla_sparse_fwd, flash_mla_with_kvcache, "
+            "get_mla_metadata, flash_mla_cuda.sparse_prefill_fwd, flash_mla_cuda.sparse_decode_fwd)), "
+            "'missing V4.1 attention entrypoints'; "
+            "assert not torch.cuda.is_initialized(), 'preflight initialized CUDA'; "
             "print('FULL_HTTP_NATIVE_IMPORT_OK')"
         )
         subprocess.run([sys.executable, "-c", code], cwd=repository, env=env, check=True, timeout=180)
