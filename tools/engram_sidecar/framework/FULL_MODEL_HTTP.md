@@ -149,6 +149,15 @@ No script creates the other host's environment or transfers private handles.
    EGM or create Owner STOP. It fixes TP4/EP4/PDFUSION, BF16, no graph, no draft,
    no layer truncation and no inherited service-discovery config.
 
+   The experiment explicitly sets `FASTSAFETENSORS_NOGDS=1` while keeping
+   `LOAD_METHOD=fastsafetensors`. Main's database adapter then selects the
+   `nogds` file copier with `use_shm=False`. The locked `fastsafetensors` Python
+   package can import without the separate `fast_safetensors` native shared-memory
+   helper, which is absent in this development venv; the default shared-memory
+   copier would require it at weight-loading time. This selects the existing
+   non-GDS loading path, without installing a different native ABI. It affects
+   checkpoint loading, not the external Engram CUDA VMM/NVLink lookup path.
+
    This is a colocated PDFUSION frontend/backend. With `MODEL_SERVICE_CONFIG`
    absent, `HostService.service_available` is false, so the request skips domain
    routing and `ModelRpcClient` uses local world-info rank RPC addresses. The
