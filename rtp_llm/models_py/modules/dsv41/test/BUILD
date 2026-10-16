@@ -134,6 +134,17 @@ py_test(
     legacy_create_init = 0,
 )
 
+# Capacity policy and arithmetic must run without torch or CUDA.
+py_test(
+    name = "test_engram_capacity",
+    size = "small",
+    env = {"GPU_COUNT": "0"},
+    srcs = ["test_engram_capacity.py"],
+    main = "test_engram_capacity.py",
+    deps = ["//rtp_llm/models_py:engram_capacity"],
+    legacy_create_init = 0,
+)
+
 # This test loads the lightweight helper by file path and injects every model
 # factory. It must run without torch, CUDA, native libraries or the RTP engine.
 py_test(
@@ -169,6 +180,7 @@ py_test(
     py_test(
         name = name,
         size = "small",
+        env = {"GPU_COUNT": "0"} if name == "test_engram_checkpoint" else {},
         srcs = [name + ".py"],
         main = name + ".py",
         deps = ["//rtp_llm/models_py:" + library],

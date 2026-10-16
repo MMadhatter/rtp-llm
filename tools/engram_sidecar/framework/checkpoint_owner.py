@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -49,6 +50,69 @@ def digest(payload):
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+@dataclass(frozen=True)
+class CheckpointSource:
+    checkpoint: Path
+    config: dict
+    model_revision: str
+    expected_hash_abi: str | None
+    config_sha256: str
+    index_sha256: str
+    component_fixture: bool
+
+
+def read_source(*, fixture_root=None, checkpoint=None, model_revision=None):
+    """Resolve a trusted local input without importing Torch/native code.
+
+    Revision is an operator-supplied checkpoint identity, not a claim that the
+    weights match a public release. The manifest later binds table byte hashes;
+    config/index hashes are emitted separately for experiment provenance.
+    """
+    if (fixture_root is None) == (checkpoint is None):
+        raise ValueError("select exactly one of fixture_root and checkpoint")
+    expected_hash = None
+    if fixture_root is not None:
+        fixture_root = Path(fixture_root)
+        if not fixture_root.is_absolute() or model_revision is not None:
+            raise ValueError("fixture root must be absolute; fixture owns its revision")
+        fixture = json.loads((fixture_root / "fixture.json").read_text())
+        checkpoint = fixture_root / "owner_checkpoint"
+        model_revision, expected_hash = fixture["model_revision"], fixture["hash_abi"]
+    checkpoint = Path(checkpoint)
+    if (not checkpoint.is_absolute() or not isinstance(model_revision, str)
+            or not model_revision.strip() or len(model_revision) > 512
+            or any(ord(char) < 32 for char in model_revision)):
+        raise ValueError("absolute checkpoint and explicit nonempty model revision required")
+    config_bytes = (checkpoint / "config.json").read_bytes()
+    raw = json.loads(config_bytes)
+    if not isinstance(raw, dict) or not isinstance(raw.get("text_config", {}), dict):
+        raise ValueError("invalid checkpoint config")
+    config = {**raw, **raw.get("text_config", {})}
+    config.pop("text_config", None)
+    config["checkpoint_path"] = str(checkpoint)
+    if fixture_root is None and raw.get("fixture_component_only"):
+        raise ValueError("component fixture requires --fixture-root")
+    return CheckpointSource(checkpoint, config, model_revision, expected_hash,
+                            digest(config_bytes),
+                            digest((checkpoint / "model.safetensors.index.json").read_bytes()),
+                            fixture_root is not None)
+
+
+def parser_for_owner():
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--fixture-root", type=Path)
+    source.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--model-revision", help="Required with --checkpoint; immutable operator identity")
+    parser.add_argument("--publication", type=Path, required=True)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--numa", type=int, default=0)
+    parser.add_argument("--max-allocation-bytes", type=int, default=1 << 30)
+    parser.add_argument("--budget-bytes", type=int, default=64 << 20)
+    parser.add_argument("--report-timeout", type=float, default=1800)
+    return parser
+
+
 def selected_samples(checkpoint, manifest):
     """Bind small expected reads to checkpoint bytes, not to imported GPU data."""
     import torch
@@ -70,20 +134,22 @@ def selected_samples(checkpoint, manifest):
     return samples
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fixture-root", type=Path, required=True)
-    parser.add_argument("--publication", type=Path, required=True)
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--numa", type=int, default=0)
-    parser.add_argument("--report-timeout", type=float, default=1800)
-    args = parser.parse_args()
-    if (not args.fixture_root.is_absolute() or not args.publication.is_absolute()
+def main(argv=None):
+    parser = parser_for_owner()
+    args = parser.parse_args(argv)
+    if (not args.publication.is_absolute()
             or args.device < 0 or args.numa < 0
             or not 0 < args.report_timeout < float("inf")):
         parser.error("absolute paths, nonnegative ordinals and finite positive timeout required")
+    from rtp_llm.models_py.modules.dsv41.engram_capacity import validate_capacity
+    try:
+        validate_capacity(args.max_allocation_bytes, args.budget_bytes)
+        source = read_source(fixture_root=args.fixture_root, checkpoint=args.checkpoint,
+                             model_revision=args.model_revision)
+    except (ValueError, OSError, KeyError) as error:
+        parser.error(str(error))
     args.publication.mkdir(mode=0o700, parents=True, exist_ok=False)
-    checkpoint = args.fixture_root / "owner_checkpoint"
+    checkpoint = source.checkpoint
     published, failed, generation, native = False, False, None, None
 
     def hold_until_stop():
@@ -112,18 +178,24 @@ def main():
 
         torch.cuda.set_device(args.device)
         native = _load_native()
-        fixture = json.loads((args.fixture_root / "fixture.json").read_text())
-        config = json.loads((checkpoint / "config.json").read_text())
-        layout = EngramLayout(config)
+        layout = EngramLayout(source.config)
         actual_hash_abi = hash_state_digest(NgramHashState(layout, str(checkpoint)))
-        if actual_hash_abi != fixture["hash_abi"]:
+        if source.expected_hash_abi is not None and actual_hash_abi != source.expected_hash_abi:
             raise ValueError("fixture tokenizer changed")
         expected = ExpectedLayout(layers=tuple(zip(layout.layer_ids, layout.num_embeddings)),
-                                  head_dim=layout.head_dim, model_revision=fixture["model_revision"],
+                                  head_dim=layout.head_dim, model_revision=source.model_revision,
                                   hash_abi=actual_hash_abi)
         plan = inspect_checkpoint(checkpoint, expected,
                                   allocation_granularity=native.host_numa_granularity(args.numa, args.device),
-                                  budget_bytes=64 << 20)
+                                  budget_bytes=args.budget_bytes,
+                                  max_allocation_bytes=args.max_allocation_bytes)
+        if (source.index_sha256 != "sha256:" + plan.index.header_sha256
+                or source.config_sha256 != digest((checkpoint / "config.json").read_bytes())):
+            raise ValueError("checkpoint metadata changed during preflight")
+        emit("INSPECTED", model_revision=source.model_revision, hash_abi=actual_hash_abi,
+             config_sha256=source.config_sha256, index_sha256=source.index_sha256,
+             component_fixture=source.component_fixture, physical_bytes=plan.physical_bytes,
+             budget_bytes=args.budget_bytes, max_allocation_bytes=args.max_allocation_bytes)
         generation = load_checkpoint(plan, native=native, device=args.device, numa=args.numa)
         manifest = generation.manifest
         bundle = dict(schema_version=1, manifest="manifest.json", capabilities="capabilities.json",

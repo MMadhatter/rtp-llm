@@ -189,7 +189,24 @@ class CheckpointTest(unittest.TestCase):
         self.assert_code("BUDGET_EXCEEDED", self.inspect, budget_bytes=16383)
         self.assert_code("ALLOCATION_LIMIT", self.inspect, max_allocation_bytes=12287)
         self.assertEqual(self.inspect(max_allocation_bytes=12288).physical_bytes, 16384)
-        self.assert_code("INVALID_ARGUMENT", self.inspect, max_allocation_bytes=(1 << 30) + 1)
+        self.assert_code("INVALID_ARGUMENT", self.inspect, max_allocation_bytes=(128 << 30) + 1)
+
+    def test_explicit_large_policy_preserves_small_fixture_and_default(self):
+        default = self.inspect()
+        self.assertEqual(default.max_allocation_bytes, 1 << 30)
+        large = self.inspect(max_allocation_bytes=128 << 30, budget_bytes=256 << 30)
+        self.assertEqual(large.layers, default.layers)
+        self.assertEqual(large.physical_bytes, default.physical_bytes)
+        native = FakeNative()
+        loaded = self.load(native, large)
+        self.assertEqual(loaded.physical_bytes, default.physical_bytes)
+        loaded.close()
+
+    def test_capacity_policy_rejected_before_source_access_or_owner(self):
+        for options in (dict(budget_bytes=(256 << 30) + 1),
+                        dict(max_allocation_bytes=True), dict(budget_bytes=False)):
+            with patch.object(m, "_path", side_effect=AssertionError("must not access source")):
+                self.assert_code("INVALID_ARGUMENT", self.inspect, **options)
 
     def test_native_granularity_and_limits_rechecked_before_owner(self):
         plan = self.inspect()

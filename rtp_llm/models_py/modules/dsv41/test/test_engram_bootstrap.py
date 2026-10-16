@@ -68,12 +68,13 @@ class BundleFiles:
         for tensor in self.document["tensors"]:
             lid = int(tensor["name"].split(".")[1])
             rows = rows_by_layer[lid]
-            columns = 32 if tensor["name"].endswith(".weight") else 1
+            columns = self.layout.head_dim if tensor["name"].endswith(".weight") else self.layout.head_dim // 32
             tensor["shape"] = [rows, columns]
             part = tensor["shards"][0]
             part.update(row_end=rows, logical_bytes=rows * columns,
-                        byte_offset=0 if columns == 32 else rows * 32,
-                        allocation_bytes=((rows * 33 + 4095) // 4096) * 4096)
+                        byte_offset=0 if tensor["name"].endswith(".weight") else rows * self.layout.head_dim,
+                        allocation_bytes=((rows * (self.layout.head_dim + self.layout.head_dim // 32) + 4095) // 4096) * 4096)
+            tensor["row_bytes"] = columns
         self.document["hash_abi"] = self.abi
         self.document["dataset_id"] = m.compute_dataset_id(self.document)
         self.manifest_raw = json.dumps(self.document).encode()
@@ -107,7 +108,7 @@ class BundleFiles:
         return path
 
     def read(self):
-        return b._read_bundle(self.path, self.layout, self.abi)
+        return b._read_bundle(self.path, self.layout, self.abi, limits=b._configured_limits({}))
 
 
 class BundleFileTest(BundleFiles, unittest.TestCase):
@@ -127,6 +128,44 @@ class BundleFileTest(BundleFiles, unittest.TestCase):
         self.assertEqual(expected.layers, ((1, 3), (14, 5)))
         self.assertEqual(set(handles), set(self.capabilities))
         self.assertEqual(set(handles.values()), {b"private-handle-bytes"})
+
+    def test_large_metadata_requires_explicit_local_policy(self):
+        # Only small JSON files are created: no table memory or native imports.
+        rows = ((1 << 30) // 33) + 1
+        self.prepare_bundle(types.SimpleNamespace(layer_ids=(1, 14),
+                            num_embeddings=(rows, rows), head_dim=32))
+        self.assert_code("INVALID_ALLOCATION_SIZE")
+        limits = b._configured_limits({"RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(128 << 30),
+                                       "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": str(256 << 30)})
+        bundle, _, _, _ = b._read_bundle(self.path, self.layout, self.abi, limits=limits)
+        self.assertEqual(bundle["dataset_id"], self.document["dataset_id"])
+
+    def test_total_capacity_counts_unique_backing_and_cannot_be_in_bundle(self):
+        limits = b._configured_limits({"RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": "8191"})
+        self.assert_code("TOTAL_ALLOCATION_LIMIT", lambda: b._read_bundle(
+            self.path, self.layout, self.abi, limits=limits))
+        self.bundle["max_total_allocation_bytes"] = 256 << 30
+        self.write("launch.json", self.bundle)
+        self.assert_code("INVALID_BUNDLE_FIELDS")
+
+    def test_real_table_metadata_needs_both_local_capacity_settings(self):
+        self.prepare_bundle(types.SimpleNamespace(layer_ids=(1, 14),
+                            num_embeddings=(384006168, 384016682), head_dim=256))
+        self.assert_code("INVALID_ALLOCATION_SIZE")
+        env = {"RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(128 << 30)}
+        self.assert_code("TOTAL_ALLOCATION_LIMIT", lambda: b._read_bundle(
+            self.path, self.layout, self.abi, limits=b._configured_limits(env)))
+        env["RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES"] = str(256 << 30)
+        _, _, expected, handles = b._read_bundle(
+            self.path, self.layout, self.abi, limits=b._configured_limits(env))
+        self.assertEqual(expected.layers, ((1, 384006168), (14, 384016682)))
+        self.assertEqual(expected.head_dim, 256)
+        self.assertEqual(len(handles), 2)
+
+    def test_invalid_local_policy_is_a_bounded_error(self):
+        for value in ("0", "-1", str((128 << 30) + 1), "private-value"):
+            self.assert_code("INVALID_CAPACITY_LIMIT", lambda: b._configured_limits(
+                {"RTP_ENGRAM_MAX_ALLOCATION_BYTES": value}))
 
     def test_relative_bundle_rejected(self):
         self.assert_code("BUNDLE_PATH_MUST_BE_ABSOLUTE",
@@ -273,7 +312,7 @@ class AttachFailureTest(BundleFiles, unittest.TestCase):
         self.storage = mock.Mock()
         self.storage.verify.return_value = None
         self.storage.close.return_value = None
-        self.native = object()
+        self.native = types.SimpleNamespace(max_allocation_bytes=128 << 30)
         self.retained = []
         self.native_patch = mock.patch.object(b, "_load_native", return_value=self.native)
         self.storage_patch = mock.patch.object(b.FabricEngramStorage, "attach", return_value=self.storage)
@@ -285,9 +324,31 @@ class AttachFailureTest(BundleFiles, unittest.TestCase):
         self.addCleanup(self.storage_patch.stop)
         self.addCleanup(self.retain_patch.stop)
 
-    def do_attach(self, device="cuda:2"):
+    def do_attach(self, device="cuda:2", environ=None):
         return b.attach_from_bundle(self.path, layout=self.layout,
-                                    hash_state=self.hash_state, device=device)
+                                    hash_state=self.hash_state, device=device,
+                                    environ={} if environ is None else environ)
+
+    def test_native_capacity_mismatch_rejects_before_first_import(self):
+        for maximum in (None, True, 0, 4095):
+            self.native.max_allocation_bytes = maximum
+            with self.assertRaisesRegex(b.BootstrapError, "NATIVE_ALLOCATION_LIMIT"):
+                self.do_attach()
+            self.attach_mock.assert_not_called()
+
+    def test_explicit_policy_is_forwarded_as_one_immutable_limits_object(self):
+        env = {"RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(128 << 30),
+               "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": str(256 << 30)}
+        self.do_attach(environ=env)
+        limits = self.attach_mock.call_args.kwargs["limits"]
+        self.assertEqual(limits.max_allocation_bytes, 128 << 30)
+        self.assertEqual(limits.max_total_allocation_bytes, 256 << 30)
+
+    def test_bad_policy_fails_before_native_load(self):
+        with self.assertRaisesRegex(b.BootstrapError, "INVALID_CAPACITY_LIMIT"):
+            self.do_attach(environ={"RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": "0"})
+        self.native_mock.assert_not_called()
+        self.attach_mock.assert_not_called()
 
     def test_success_calls_verify_before_returning_storage(self):
         self.assertIs(self.do_attach(), self.storage)
