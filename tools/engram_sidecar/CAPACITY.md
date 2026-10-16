@@ -4,8 +4,9 @@ The capacity extension preserves the small checkpoint/bootstrap defaults.
 Increasing a ceiling authorizes a size; it does not reserve resources or prove
 that an Owner's NUMA node, container, driver or fabric can support that size.
 The rebuilt bridge passed nine native GPU tests on each of two hosts, followed
-by a real cross-host 4.125 GiB Triton lookup probe. Approximately 189 GiB of real
-tables and full-model serving remain separate acceptance gates.
+by a real cross-host 4.125 GiB Triton lookup probe. The complete 188.83 GiB real
+Engram generation subsequently passed [cross-host lookup](framework/REAL_CHECKPOINT_LOOKUP.md).
+Full-model HTTP serving remains a separate, unfinished acceptance gate.
 
 | Layer | Default | Maximum accepted by this development implementation |
 | --- | ---: | ---: |
@@ -65,10 +66,12 @@ NVL72 aggregate memory does not establish this local capacity. Check NUMA
 availability, allowed memory nodes, container memory limits, existing workloads
 and source-checkpoint disk space before a large run. A container's ordinary
 memory quota alone does not establish either availability or enforcement for
-this approximately 189 GiB EGM generation. On the tested driver, a roughly
-95 GiB Owner RSS was not reflected in the container's much smaller recorded
-memory peak. Check actual process/NUMA/driver measurements and the platform's
-accounting behavior; do not assume every EGM byte is charged to memory.current.
+this approximately 189 GiB EGM generation. In the successful real-table run,
+the two EGM mappings had exactly 202,758,946,816 resident bytes while the verified
+Owner container cgroup reported about 10.23 GiB current and 14.11 GiB peak.
+This is a measured driver/kernel-specific observation, not a claim about all
+ancestor cgroups or platform versions; see the [accounting evidence and limits](framework/REAL_CHECKPOINT_LOOKUP.md#platform-observation-resident-egm-and-container-accounting).
+Do not assume every EGM byte is charged to this container's memory.current.
 
 Budget measures unique padded EGM backing, counting shared weight/scale storage
 once. It excludes source-file page-cache residency, bounded staging chunks,

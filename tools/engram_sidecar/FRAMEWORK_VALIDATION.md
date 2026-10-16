@@ -192,8 +192,10 @@ adds explicit trusted-local opt-in up to 128 GiB per allocation and 256 GiB tota
 while retaining 64 MiB maximum loading chunks. See [capacity policy](CAPACITY.md).
 The GPU results above used the earlier small-capacity native build. A subsequent
 [4.125 GiB cross-host probe](framework/LARGE_OFFSET_PROBE.md) validated the rebuilt
-bridge and lookup across the 32-bit byte-offset boundary; a real approximately
-189 GiB table generation remains a separate acceptance gate.
+bridge and lookup across the 32-bit byte-offset boundary. The complete real
+[188.83 GiB generation](framework/REAL_CHECKPOINT_LOOKUP.md) subsequently passed
+12 exact cross-host lookup cases and consumer cleanup. That separate probe did
+not run full-model HTTP, which remains an unfinished acceptance gate.
 These ceilings do not establish available NUMA/container memory.
 The VMM/native bridge and required RTP
 native libraries must be prebuilt and importable before launching consumers;

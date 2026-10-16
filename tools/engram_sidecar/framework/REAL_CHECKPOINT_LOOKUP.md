@@ -6,6 +6,32 @@ and actual RTP eager hash/lookup path, without running attention, MoE, WKV,
 the scheduler or an HTTP server. It is a separate prerequisite to the
 [full-model HTTP experiment](FULL_MODEL_HTTP.md).
 
+## Verified result: complete real-table lookup
+
+On 2026-10-16 the complete two-layer generation passed on different hosts and
+containers in the validated fabric domain. See the
+[sanitized result record](REAL_CHECKPOINT_LOOKUP_RESULTS.json).
+
+| Observation | Result |
+|---|---:|
+| Owner backing, two allocations | 202,758,946,816 bytes / 188.83 GiB |
+| Lookup cases: 3 input families × 2 layers × 2 index dtypes | 12 / 12 exact BF16 bits |
+| Consumer checkpoint full-table entries and tensors | None |
+| PyTorch allocated-byte increase during attach | 0 bytes |
+| Probe PyTorch peak allocation increase | 1,234,432 bytes |
+| Consumer close | All eight native resource counters zero; process exited |
+
+The input families cover boundary/4 GiB addresses, real-tokenizer prefill and
+rolling decode history with int64 and int32 indices. The independent CPU oracle
+read only selected rows, matched the published samples and did not initialize
+CUDA. Attach verification also checked the first/middle/last published rows.
+The PyTorch counters do not account for all driver resource overhead.
+
+The Owner remains READY with both allocations held for the next experiment;
+consumer cleanup does not imply Owner cleanup. Complete full-model HTTP is in
+progress and has **not** passed acceptance in this record. This probe did not
+run WKV, attention, MoE, the scheduler or HTTP, and measured no latency SLO.
+
 ## Verified checkpoint preparation
 
 The [staging evidence](CHECKPOINT_STAGING_RESULTS.json) records all 48 original
@@ -35,7 +61,7 @@ The development loader currently makes one approximately 94.4 GiB allocation
 per layer on the selected local NUMA node. A large global `MemAvailable` value
 does not prove that a particular NUMA allocation will succeed.
 
-During preparation, `cuMemCreate(HOST_NUMA, FABRIC)` returned
+In an earlier preparation attempt, `cuMemCreate(HOST_NUMA, FABRIC)` returned
 `CUDA_ERROR_OUT_OF_MEMORY`. A subsequent isolated allocation of exactly one
 real layer succeeded after private-file cache advice and changing background
 memory pressure; the `after_create` test immediately rolled it back and left
@@ -48,8 +74,10 @@ and loaded the first complete layer, then failed at the second `cuMemCreate`.
 At that second call, node 0 reported 107,031,744 KiB free, yet the approximately
 94.4 GiB request still failed. Both Owner allocations were unpublished and all
 native resource counters returned to zero. Free-byte totals alone therefore
-remain insufficient admission evidence. Complete 188.83 GiB cross-host lookup
-and full-model HTTP acceptance are still pending in this recorded stage.
+remain insufficient admission evidence. These are historical attempts: the
+later run on a suitable Owner host loaded both layers and passed the complete
+cross-host lookup described above. Full-model HTTP is a separate, unfinished
+gate.
 
 A later read-only snapshot found 253.81 GiB of free buddy memory on that node,
 but only 134.75 GiB in blocks of at least 2 MiB. On this 64 KiB-page kernel,
@@ -60,9 +88,9 @@ proven root cause: the snapshot was taken after cleanup, and no failing-call
 page-order trace was captured. See the official
 [EGM allocator](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/580.95.05/src/nvidia/src/kernel/mem_mgr/egm_mem.c)
 and [page allocation implementation](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/580.95.05/kernel-open/nvidia/nv-vm.c).
-The next full run should record free buddy blocks before each allocation and
-use a suitable Owner host; changing global kernel memory settings is not part
-of this experiment.
+The successful full run recorded free buddy blocks before each allocation on
+a suitable Owner host. It did not change global kernel memory settings, and
+does not establish the root cause of the earlier failure.
 
 Use fresh NUMA, container and host measurements. Never drop global caches or
 stop unrelated processes to make this test pass. The optional Owner argument
@@ -70,6 +98,28 @@ stop unrelated processes to make this test pass. The optional Owner argument
 immutable checkpoint copy. It advises release of source file cache while
 streaming; the kernel may retain pages, so the return value is not a proof of
 reclaimed memory. Defaults do not discard checkpoint cache.
+
+## Platform observation: resident EGM and container accounting
+
+A read-only check of the live successful Owner found two `/dev/nvidiactl`
+mappings with RSS of 101,378,424,832 and 101,380,521,984 bytes. Their sum exactly
+matches the 202,758,946,816-byte physical EGM backing. Total process RSS was
+203,914,018,816 bytes (189.91 GiB).
+
+The same container cgroup reported `memory.current=10,979,508,224` bytes
+(10.23 GiB), `memory.peak=15,146,745,856` bytes (14.11 GiB), and zero memory events.
+The process, container init and observer were verified in the same cgroup;
+host/container memory counter files had matching device and inode identities.
+The host's slightly earlier current reading was 10,966,990,848 bytes. These
+samples were not atomic, so that small difference is expected.
+
+This observation applies to NVIDIA driver **580.95.05**, Linux **6.6.71** with
+**64 KiB base pages**, and this runtime's HOST_NUMA + FABRIC path. It shows that
+this container's memcg counters did not charge the EGM at its physical size.
+It does not prove that all ancestor cgroups are uncharged, identify a driver
+defect or establish accounting behavior on other versions. Production must use
+explicit EGM byte budgets and NUMA admission; a container `memory.max` value
+alone is not an EGM resource admission or host-capacity protection guarantee.
 
 ## Run order
 
