@@ -63,3 +63,58 @@ py_test(
         "//conditions:default": ["@platforms//:incompatible"],
     }),
 )
+
+# This metadata test needs only Python's standard library, on any CPU.
+py_test(
+    name = "test_engram_manifest",
+    srcs = ["test_engram_manifest.py"],
+    main = "test_engram_manifest.py",
+    deps = ["//rtp_llm/models_py:engram_manifest"],
+    legacy_create_init = 0,
+)
+
+# Standalone unittest entry points: the real modules are declared as deps,
+# while native allocation / CUDA graph behavior is injected by the CPU tests.
+# Do not route these through pytest_main, testlib or the GPU _TESTS loop.
+py_test(
+    name = "test_engram_storage",
+    size = "small",
+    srcs = ["test_engram_storage.py"],
+    main = "test_engram_storage.py",
+    deps = [
+        "//rtp_llm/models_py:engram_manifest",
+        "//rtp_llm/models_py:engram_storage_cpu",
+    ],
+    legacy_create_init = 0,
+)
+
+py_test(
+    name = "test_engram_sessions",
+    size = "small",
+    srcs = ["test_engram_sessions.py"],
+    main = "test_engram_sessions.py",
+    deps = ["//rtp_llm/models_py:engram_sessions"],
+    legacy_create_init = 0,
+)
+
+# CPU execution with the validated CUDA13 ARM dependency versions. These
+# tests need modern FP8/E8M0 torch/safetensors, but no GPU allocation or runtime.
+[
+    py_test(
+        name = name,
+        size = "small",
+        srcs = [name + ".py"],
+        main = name + ".py",
+        deps = ["//rtp_llm/models_py:" + library],
+        legacy_create_init = 0,
+        target_compatible_with = select({
+            "@//:using_cuda13_arm": [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
+    )
+    for name, library in [
+        ("test_engram_checkpoint", "engram_checkpoint_cpu"),
+        ("test_engram_external_checkpoint", "engram_model_cpu"),
+        ("test_engram_external_warmup", "engram_warmup_cpu"),
+    ]
+]
