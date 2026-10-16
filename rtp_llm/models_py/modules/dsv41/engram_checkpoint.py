@@ -19,8 +19,11 @@ from uuid import uuid4
 from .engram_manifest import (ExpectedLayout, LAYOUT_ABI, Limits, compute_dataset_id,
                              parse_manifest, validate_for_attach)
 from .engram_storage import CleanupPendingError
+from .engram_capacity import (CapacityError, DEFAULT_MAX_ALLOCATION_BYTES,
+                              HARD_MAX_ALLOCATION_BYTES, checked_allocation_bytes,
+                              validate_capacity)
 
-MAX_ALLOCATION_BYTES = 1 << 30  # Current native implementation; never bypass it.
+MAX_ALLOCATION_BYTES = HARD_MAX_ALLOCATION_BYTES
 MAX_LOAD_CHUNK_BYTES = 64 << 20
 _MAX_JSON_BYTES = 32 << 20
 
@@ -182,7 +185,7 @@ def _validated_document(document, layout):
 
 def inspect_checkpoint(checkpoint_dir, expected_layout: ExpectedLayout, *,
                        allocation_granularity, budget_bytes,
-                       max_allocation_bytes=MAX_ALLOCATION_BYTES):
+                       max_allocation_bytes=DEFAULT_MAX_ALLOCATION_BYTES):
     """Validate every expected table and budget without constructing any Owner.
 
     Obtain granularity through native.host_numa_granularity(numa, device).
@@ -199,8 +202,10 @@ def inspect_checkpoint(checkpoint_dir, expected_layout: ExpectedLayout, *,
     if len(expected_layout.layers) * 2 > Limits().max_tensors:
         raise CheckpointError("MANIFEST_LIMIT")
     granularity = _positive(allocation_granularity, MAX_ALLOCATION_BYTES)
-    _positive(budget_bytes)
-    _positive(max_allocation_bytes, MAX_ALLOCATION_BYTES)
+    try:
+        validate_capacity(max_allocation_bytes, budget_bytes)
+    except CapacityError:
+        raise CheckpointError("INVALID_ARGUMENT") from None
     root = Path(checkpoint_dir).resolve(strict=True)
     index_path = _path(root, "model.safetensors.index.json", tensor_file=False)
     token = _stat(index_path)
@@ -262,9 +267,10 @@ def inspect_checkpoint(checkpoint_dir, expected_layout: ExpectedLayout, *,
         prefix = f"layers.{layer}.engram.embed."
         pair = (tensors[prefix + "weight"], tensors[prefix + "scale"])
         logical = sum(t.shape[0] * t.shape[1] for t in pair)
-        padded = (logical + granularity - 1) // granularity * granularity
-        if padded > max_allocation_bytes:
-            raise CheckpointError("ALLOCATION_LIMIT")
+        try:
+            padded = checked_allocation_bytes(logical, granularity, max_allocation_bytes)
+        except CapacityError as error:
+            raise CheckpointError(error.code) from None
         layers.append(LayerPlan(layer, logical, padded, pair))
     if sum(layer.allocation_bytes for layer in layers) > budget_bytes:
         raise CheckpointError("BUDGET_EXCEEDED")

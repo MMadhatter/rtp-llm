@@ -2,8 +2,12 @@
 
 `engram_native.cc` uses CUDA Driver VMM to create HOST_NUMA + FABRIC memory,
 import it on a consumer GPU and expose uint8 ATen views without a full table
-copy. This development extension allows at most 1 GiB per allocation and 64 MiB
-per `Owner.load` call. It is not the production Bazel extension.
+copy. This development extension has a hard ceiling of 128 GiB per allocation
+and 64 MiB per `Owner.load` call. The Python checkpoint/bootstrap policy keeps
+the original 1 GiB per-allocation default; bootstrap also defaults to 8 GiB total.
+Larger mappings require explicit local configuration described in
+[capacity policy](../CAPACITY.md). A hard ceiling is not a capacity guarantee.
+It is not the production Bazel extension.
 
 ## Build
 
@@ -24,6 +28,8 @@ Set `CUDA_DRIVER_LINK_DIR` if link-time `libcuda.so` is not under
 `$CUDA_HOME/lib64/stubs`. Stubs are for linking only: never put them in runtime
 `LD_LIBRARY_PATH` or RPATH. Runtime must resolve the actual container driver.
 The loader preserves torch's ABI settings. Import alone does not initialize CUDA.
+Rebuild the bridge on both sides when changing this capacity ceiling; consumers
+reject allocations larger than their loaded bridge advertises before import.
 
 ## API and ownership
 

@@ -19,9 +19,12 @@
 namespace py = pybind11;
 namespace {
 
-constexpr uint64_t kMaxAllocation = uint64_t{1} << 30;
+// Python launch policy keeps the original small defaults. This is only the
+// low-level hard ceiling; it does not establish available NUMA/container memory.
+constexpr uint64_t kMaxAllocation = uint64_t{128} << 30;
 constexpr uint64_t kMaxLoadChunk = uint64_t{64} << 20;
 constexpr size_t kMaxRank = 32;
+static_assert(sizeof(size_t) >= sizeof(uint64_t), "EGM bridge requires 64-bit size_t");
 
 struct Counters {
     std::atomic<int64_t> contexts{0}, owner_allocations{0}, imports{0};
@@ -114,7 +117,7 @@ public:
 
     static std::shared_ptr<Mapping> make_owner(uint64_t size, int numa, int device,
                                                const std::string& fail_stage) {
-        require(size > 0 && size <= kMaxAllocation, "size must be in 1..1GiB for this development slice");
+        require(size > 0 && size <= kMaxAllocation, "size must be in 1..128GiB for this development slice");
         require(numa >= 0, "numa must be a local nonnegative HOST_NUMA ID");
         validate_fail_stage(fail_stage, true);
         auto state = std::shared_ptr<Mapping>(new Mapping(true));
@@ -131,8 +134,9 @@ public:
         check(cuMemGetAllocationGranularity(&state->granularity_, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
               "owner_granularity");
         state->validate_granularity();
-        state->bytes_ = ((size + state->granularity_ - 1) / state->granularity_) * state->granularity_;
-        require(state->bytes_ <= kMaxAllocation, "padded allocation exceeds development limit 1GiB");
+        const uint64_t padding = (state->granularity_ - size % state->granularity_) % state->granularity_;
+        require(padding <= kMaxAllocation - size, "padded allocation exceeds development limit 128GiB");
+        state->bytes_ = static_cast<size_t>(size + padding);
         check(cuMemCreate(&state->handle_, state->bytes_, &prop, 0), "owner_create");
         state->has_handle_ = true;
         ++counters.owner_allocations;
@@ -154,7 +158,7 @@ public:
     static std::shared_ptr<Mapping> make_consumer(const CUmemFabricHandle& fabric, uint64_t bytes,
                                                   uint64_t advertised_granularity, int device,
                                                   const std::string& fail_stage) {
-        require(bytes > 0 && bytes <= kMaxAllocation, "allocation_bytes must be in 1..1GiB");
+        require(bytes > 0 && bytes <= kMaxAllocation, "allocation_bytes must be in 1..128GiB");
         require(advertised_granularity > 0 && advertised_granularity <= kMaxAllocation,
                 "invalid advertised granularity");
         require(bytes % advertised_granularity == 0, "allocation_bytes must be aligned to granularity");

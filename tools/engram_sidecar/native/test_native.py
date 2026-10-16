@@ -93,7 +93,8 @@ class NativeStorageTests(unittest.TestCase):
 
     def test_owner_bounds_seal_and_repeated_export(self):
         before = dict(self.native.resource_counters())
-        for invalid_size in (0, self.native.max_allocation_bytes + 1):
+        self.assertEqual(self.native.max_allocation_bytes, 128 << 30)
+        for invalid_size in (0, self.native.max_allocation_bytes + 1, (1 << 64) - 1):
             with self.subTest(size=invalid_size):
                 with self.assertRaises(ValueError):
                     self.native.Owner(size=invalid_size, numa=self.numa, device=self.device)

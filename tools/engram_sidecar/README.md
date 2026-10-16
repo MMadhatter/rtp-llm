@@ -82,8 +82,13 @@ does not yet independently pin those identities. This path is eager only, retain
 mappings for process lifetime and rejects unsupported engine Graph capture.
 There is no live detach, reload, service discovery or silent table fallback.
 
-The native 1 GiB/allocation limit, 64 MiB loading chunks and bootstrap 8 GiB total
-limit are development bounds. Next gates are the supported-shape fused gate,
+The default 1 GiB/allocation and bootstrap 8 GiB total limits remain. Explicit
+local [capacity configuration](CAPACITY.md) can raise them to the new native
+128 GiB/allocation ceiling and a 256 GiB generation budget; 64 MiB loading chunks
+remain. The rebuilt native bridge and a real cross-host 4.125 GiB
+[boundary lookup](framework/LARGE_OFFSET_PROBE.md) passed. Complete real-checkpoint
+capacity and [full-model HTTP](framework/FULL_MODEL_HTTP.md) acceptance remain pending.
+Next gates are the supported-shape fused gate,
 complete engine/rank integration and two independent serving instances. The
 additional 100-microsecond target remains unpassed. Production companion
 containers, Owner service deployment and HA are outside this checkpoint.
