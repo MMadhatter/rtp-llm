@@ -237,3 +237,79 @@ py_library(
     }),
     visibility = ["//visibility:public"],
 )
+
+# Pure metadata contract, without the model/CUDA dependency closure.
+py_library(
+    name = "engram_manifest",
+    srcs = ["modules/dsv41/engram_manifest.py"],
+    visibility = ["//visibility:public"],
+)
+
+# CPU unit-test closure for attach/lifetime orchestration. CUDA graph methods
+# import torch lazily and are exercised with an injected test double here.
+# Production GPU users use :modules, which supplies the model/CUDA closure.
+py_library(
+    name = "engram_storage_cpu",
+    testonly = True,
+    srcs = ["modules/dsv41/engram_storage.py"],
+    deps = [":engram_manifest"],
+    visibility = ["//visibility:public"],
+)
+
+# The in-process session registry uses only stdlib. Keep the manifest type
+# contract in the closure without pulling in model, torch or CUDA libraries.
+py_library(
+    name = "engram_sessions",
+    srcs = ["modules/dsv41/engram_sessions.py"],
+    deps = [":engram_manifest"],
+    visibility = ["//visibility:public"],
+)
+
+# Checkpoint loading is tested with real CPU torch/safetensors and FakeNative.
+# Keep this separate from :modules and its CUDA/operator dependency closure.
+py_library(
+    name = "engram_checkpoint_cpu",
+    testonly = True,
+    srcs = ["modules/dsv41/engram_checkpoint.py"],
+    deps = [
+        ":engram_manifest",
+        ":engram_storage_cpu",
+        "//rtp_llm:numpy",
+        "//rtp_llm:safetensors",
+        "//rtp_llm:torch",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "engram_model_cpu",
+    testonly = True,
+    srcs = [
+        "modules/__init__.py",
+        "modules/dsv41/__init__.py",
+        "modules/dsv41/engram.py",
+    ],
+    data = ["//rtp_llm:__init__.py"],
+    deps = [
+        "//rtp_llm:numpy",
+        "//rtp_llm:safetensors",
+        "//rtp_llm:torch",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Actual warmup orchestration; tests replace only the GPU execution boundary.
+py_library(
+    name = "engram_warmup_cpu",
+    testonly = True,
+    srcs = [
+        "modules/dsv41/dsv4_kernel_jit_warmup.py",
+        "modules/dsv41/dsv41_kernel_jit_warmup.py",
+    ],
+    deps = [
+        ":engram_model_cpu",
+        "//rtp_llm:torch",
+        "//rtp_llm:warmup",
+    ],
+    visibility = ["//visibility:public"],
+)
