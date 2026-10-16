@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Hold an immutable EGM checkpoint for cross-host model-hook development.
+
+This is a test coordinator endpoint, not a production service. The launcher must
+keep this process alive and create publication/STOP only after every consumer
+process has exited. No timeout or lost output pipe releases published backing.
+Private capabilities and their values must never be copied into public evidence.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import threading
+import time
+from uuid import uuid4
+
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO))
+
+
+def emit(status, **fields):
+    try:
+        print(json.dumps(dict(status=status, **fields), sort_keys=True), flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def private_write(path, payload):
+    temporary = path.with_name(path.name + ".tmp-" + uuid4().hex)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def digest(payload):
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def selected_samples(checkpoint, manifest):
+    """Bind small expected reads to checkpoint bytes, not to imported GPU data."""
+    import torch
+    from safetensors import safe_open
+
+    index = json.loads((checkpoint / "model.safetensors.index.json").read_text())
+    samples = {}
+    for tensor in manifest.tensors:
+        rows = sorted({0, tensor.shape[0] // 2, tensor.shape[0] - 1})
+        relative = Path(index["weight_map"][tensor.name])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("unsafe checkpoint relative path")
+        with safe_open(checkpoint / relative, framework="pt", device="cpu") as source:
+            sliced = source.get_slice(tensor.name)
+            # Slice the mapped file a row at a time; never duplicate a full table.
+            payload = b"".join(sliced[row:row + 1].contiguous().view(torch.uint8).numpy().tobytes()
+                               for row in rows)
+        samples[tensor.name] = {"row_ids": rows, "sha256": digest(payload)}
+    return samples
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fixture-root", type=Path, required=True)
+    parser.add_argument("--publication", type=Path, required=True)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--numa", type=int, default=0)
+    parser.add_argument("--report-timeout", type=float, default=1800)
+    args = parser.parse_args()
+    if (not args.fixture_root.is_absolute() or not args.publication.is_absolute()
+            or args.device < 0 or args.numa < 0
+            or not 0 < args.report_timeout < float("inf")):
+        parser.error("absolute paths, nonnegative ordinals and finite positive timeout required")
+    args.publication.mkdir(mode=0o700, parents=True, exist_ok=False)
+    checkpoint = args.fixture_root / "owner_checkpoint"
+    published, failed, generation, native = False, False, None, None
+
+    def hold_until_stop():
+        deadline = time.monotonic() + args.report_timeout
+        reported = False
+        while not (args.publication / "STOP").is_file():
+            if not reported and time.monotonic() >= deadline:
+                emit("WAITING_FOR_STOP", action="backing_retained")
+                reported = True
+            threading.Event().wait(1)
+
+    def interrupt(signum, frame):
+        nonlocal failed
+        if not published:
+            raise SystemExit(128 + signum)
+        failed = True
+        emit("SIGNAL_WHILE_PUBLISHED", signal=signum, action="backing_retained_until_STOP")
+
+    previous = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        import torch
+        from rtp_llm.models_py.modules.dsv41.engram import EngramLayout, NgramHashState
+        from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _load_native, hash_state_digest
+        from rtp_llm.models_py.modules.dsv41.engram_checkpoint import inspect_checkpoint, load_checkpoint
+        from rtp_llm.models_py.modules.dsv41.engram_manifest import ExpectedLayout
+
+        torch.cuda.set_device(args.device)
+        native = _load_native()
+        fixture = json.loads((args.fixture_root / "fixture.json").read_text())
+        config = json.loads((checkpoint / "config.json").read_text())
+        layout = EngramLayout(config)
+        actual_hash_abi = hash_state_digest(NgramHashState(layout, str(checkpoint)))
+        if actual_hash_abi != fixture["hash_abi"]:
+            raise ValueError("fixture tokenizer changed")
+        expected = ExpectedLayout(layers=tuple(zip(layout.layer_ids, layout.num_embeddings)),
+                                  head_dim=layout.head_dim, model_revision=fixture["model_revision"],
+                                  hash_abi=actual_hash_abi)
+        plan = inspect_checkpoint(checkpoint, expected,
+                                  allocation_granularity=native.host_numa_granularity(args.numa, args.device),
+                                  budget_bytes=64 << 20)
+        generation = load_checkpoint(plan, native=native, device=args.device, numa=args.numa)
+        manifest = generation.manifest
+        bundle = dict(schema_version=1, manifest="manifest.json", capabilities="capabilities.json",
+                      manifest_sha256=digest(generation.manifest_bytes),
+                      dataset_id=manifest.dataset_id, generation=manifest.generation,
+                      model_revision=manifest.model_revision, hash_abi=actual_hash_abi,
+                      samples=selected_samples(checkpoint, manifest))
+        capabilities = {key: base64.b64encode(value).decode("ascii")
+                        for key, value in generation.private_handles.items()}
+        # Once any export may be visible, cleanup requires confirmed consumer exit.
+        published = True
+        private_write(args.publication / "capabilities.json", json.dumps(capabilities).encode())
+        private_write(args.publication / "manifest.json", generation.manifest_bytes)
+        private_write(args.publication / "bundle.json", json.dumps(bundle, sort_keys=True).encode())
+        del capabilities
+        emit("READY", dataset_id=manifest.dataset_id, generation=manifest.generation,
+             physical_bytes=generation.physical_bytes, allocation_count=len(generation.private_handles),
+             device=args.device, numa=args.numa, counters=native.resource_counters())
+        hold_until_stop()
+    except BaseException as error:
+        failed = True
+        emit("FAILED", error_type=type(error).__name__, code=getattr(error, "code", None))
+        if published:
+            hold_until_stop()
+    finally:
+        if published and not (args.publication / "STOP").is_file():
+            hold_until_stop()
+        if generation is not None:
+            try:
+                generation.close()
+            except BaseException as error:
+                failed = True
+                emit("CLEANUP_FAILED", error_type=type(error).__name__)
+        if native is not None:
+            counters = native.resource_counters()
+            failed = failed or any(counters.values())
+            emit("CLOSED" if not any(counters.values()) else "RESOURCES_REMAIN", counters=counters)
+        for name in ("bundle.json", "capabilities.json"):
+            (args.publication / name).unlink(missing_ok=True)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return int(failed)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

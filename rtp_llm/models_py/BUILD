@@ -296,6 +296,29 @@ py_library(
     visibility = ["//visibility:public"],
 )
 
+# Model binding control flow is stdlib-only under injected CPU test factories.
+# Its real, lazy model/bootstrap defaults are supplied by :modules in serving.
+py_library(
+    name = "engram_model_attach_cpu",
+    testonly = True,
+    srcs = ["modules/dsv41/engram_model_attach.py"],
+    visibility = ["//visibility:public"],
+)
+
+# Bootstrap tests use real CPU NgramHashState/torch constants and file metadata.
+# Keep :modules, testlib, native engine ops and GPU execution out of this closure.
+py_library(
+    name = "engram_bootstrap_cpu",
+    testonly = True,
+    srcs = ["modules/dsv41/engram_bootstrap.py"],
+    deps = [
+        ":engram_manifest",
+        ":engram_model_cpu",
+        ":engram_storage_cpu",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 # Actual warmup orchestration; tests replace only the GPU execution boundary.
 py_library(
     name = "engram_warmup_cpu",

@@ -8,6 +8,10 @@ from typing import Any
 import torch
 
 from rtp_llm.models_py.model_desc.deepseek_v41_base_model import DeepSeekV4Model
+from rtp_llm.models_py.modules.dsv41.engram_model_attach import (
+    initialize_model_engram,
+    require_eager_engram,
+)
 from rtp_llm.models_py.modules.dsv41.kv_cache_utils import as_tagged_attention_inputs
 
 
@@ -53,35 +57,20 @@ class DeepSeekV41Model(DeepSeekV4Model):
         return 4
 
     def _load_extra_weights(self, weights) -> None:
-        from rtp_llm.models_py.modules.dsv41.engram import (
-            Engram,
-            EngramLayout,
-            NgramHashState,
-        )
-
         if not isinstance(self.v4.embed, _V41ImageEmbedding):
             self.v4.embed = _V41ImageEmbedding(self.v4.embed, self)
-        config = self._v4_args.v41_config
-        layout = EngramLayout(config)
-        if not layout.layer_ids:
+        attachment = initialize_model_engram(self)
+        if attachment.phase == "EMPTY":
             return
-        checkpoint_path = config["checkpoint_path"]
-        modules = []
-        device = self.v4.embed.weight.device
-        self._engram_hash_state = NgramHashState(layout, checkpoint_path, device=device)
-        for layer_id in layout.layer_ids:
-            if layer_id >= len(self.v4.layers):
-                continue
-            layer = self.v4.layers[layer_id]
-            layer.engram = Engram.from_checkpoint(
-                config, layer_id, checkpoint_path, device
-            )
-            modules.append((layer_id, layout.layer_ids.index(layer_id)))
-        self._engram_layers = tuple(modules)
         logging.info(
-            "DeepSeek V4.1 Engram initialized on layers %s",
-            [layer_id for layer_id, _ in modules],
+            "DeepSeek V4.1 Engram initialized on layers %s (external=%s)",
+            [layer_id for layer_id, _ in self._engram_layers],
+            attachment.external,
         )
+
+    def prepare_fmha_impl(self, inputs, is_cuda_graph: bool = False):
+        require_eager_engram(self, is_cuda_graph=is_cuda_graph)
+        return super().prepare_fmha_impl(inputs, is_cuda_graph=is_cuda_graph)
 
     def _prepare_engram(self, inputs) -> None:
         if not self._engram_layers:
@@ -200,6 +189,7 @@ class DeepSeekV41Model(DeepSeekV4Model):
 
     @torch.inference_mode()
     def forward(self, inputs, fmha_impl: Any = None):
+        require_eager_engram(self, capture_check=torch.cuda.is_current_stream_capturing)
         if self.kv_cache is not None:
             self._prepare_engram(inputs)
         self._prepare_image_features(inputs)
