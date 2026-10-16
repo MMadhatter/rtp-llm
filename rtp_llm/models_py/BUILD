@@ -248,6 +248,12 @@ py_library(
     visibility = ["//visibility:public"],
 )
 
+py_library(
+    name = "engram_capacity",
+    srcs = ["modules/dsv41/engram_capacity.py"],
+    visibility = ["//visibility:public"],
+)
+
 # CPU unit-test closure for attach/lifetime orchestration. CUDA graph methods
 # import torch lazily and are exercised with an injected test double here.
 # Production GPU users use :modules, which supplies the model/CUDA closure.
@@ -275,6 +281,7 @@ py_library(
     testonly = True,
     srcs = ["modules/dsv41/engram_checkpoint.py"],
     deps = [
+        ":engram_capacity",
         ":engram_manifest",
         ":engram_storage_cpu",
         "//rtp_llm:numpy",
@@ -317,6 +324,7 @@ py_library(
     testonly = True,
     srcs = ["modules/dsv41/engram_bootstrap.py"],
     deps = [
+        ":engram_capacity",
         ":engram_manifest",
         ":engram_model_cpu",
         ":engram_storage_cpu",

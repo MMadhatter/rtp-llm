@@ -186,10 +186,16 @@ outside this public repository.
 
 ## Development limits and remaining gates
 
-The native bridge still limits each allocation to 1 GiB and each load chunk to
-64 MiB. File bootstrap allows at most 8 GiB total mapped allocations; the test
-Owner additionally uses a 64 MiB loading budget. These are development bounds,
-not production Engram capacity claims. The VMM/native bridge and required RTP
+The small defaults remain 1 GiB per allocation and 8 GiB total at file bootstrap;
+the fixture Owner defaults to a 64 MiB loading budget. The capacity extension
+adds explicit trusted-local opt-in up to 128 GiB per allocation and 256 GiB total,
+while retaining 64 MiB maximum loading chunks. See [capacity policy](CAPACITY.md).
+The GPU results above used the earlier small-capacity native build. A subsequent
+[4.125 GiB cross-host probe](framework/LARGE_OFFSET_PROBE.md) validated the rebuilt
+bridge and lookup across the 32-bit byte-offset boundary; a real approximately
+189 GiB table generation remains a separate acceptance gate.
+These ceilings do not establish available NUMA/container memory.
+The VMM/native bridge and required RTP
 native libraries must be prebuilt and importable before launching consumers;
 bootstrap does not compile the bridge extension inside model forward. Triton
 and DeepGEMM kernels may still JIT on first use and need warmup before steady-state

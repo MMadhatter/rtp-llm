@@ -21,6 +21,7 @@ from uuid import UUID
 
 from .engram_manifest import ExpectedLayout, Limits, parse_manifest, validate_for_attach
 from .engram_storage import CleanupPendingError, FabricEngramStorage
+from .engram_capacity import CapacityError, capacity_from_environ
 
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -29,8 +30,6 @@ _BUNDLE_FIELDS = frozenset((
     "schema_version", "manifest", "manifest_sha256", "capabilities",
     "dataset_id", "generation", "model_revision", "hash_abi", "samples",
 ))
-_LIMITS = Limits(max_manifest_bytes=1 << 20, max_tensors=1024,
-                 max_allocation_bytes=1 << 30, max_total_allocation_bytes=8 << 30)
 _PROCESS_STORAGES = []
 _PROCESS_LOCK = threading.Lock()
 
@@ -41,6 +40,15 @@ class BootstrapError(ValueError):
     def __init__(self, code):
         self.code = code
         super().__init__(code)
+
+
+def _configured_limits(environ=None):
+    try:
+        allocation, total = capacity_from_environ(environ)
+    except CapacityError as error:
+        raise BootstrapError(error.code) from None
+    return Limits(max_manifest_bytes=1 << 20, max_tensors=1024,
+                  max_allocation_bytes=allocation, max_total_allocation_bytes=total)
 
 
 def retain_for_process(storage):
@@ -126,7 +134,8 @@ def hash_state_digest(hash_state):
     return "sha256:" + digest.hexdigest()
 
 
-def _read_bundle(path, layout, actual_hash_abi):
+def _read_bundle(path, layout, actual_hash_abi, *, limits=None):
+    limits = _configured_limits() if limits is None else limits
     path = Path(path)
     if not path.is_absolute():
         raise BootstrapError("BUNDLE_PATH_MUST_BE_ABSOLUTE")
@@ -153,11 +162,11 @@ def _read_bundle(path, layout, actual_hash_abi):
     expected = ExpectedLayout(layers=tuple(zip(layout.layer_ids, layout.num_embeddings)),
                               head_dim=layout.head_dim, model_revision=bundle["model_revision"],
                               hash_abi=actual_hash_abi)
-    raw = _private_read(path.parent / bundle["manifest"], _LIMITS.max_manifest_bytes)
+    raw = _private_read(path.parent / bundle["manifest"], limits.max_manifest_bytes)
     if _digest(raw) != bundle["manifest_sha256"]:
         raise BootstrapError("MANIFEST_DIGEST_MISMATCH")
-    validated = validate_for_attach(parse_manifest(raw, _LIMITS), expected,
-                                    bundle["dataset_id"], bundle["generation"], _LIMITS)
+    validated = validate_for_attach(parse_manifest(raw, limits), expected,
+                                    bundle["dataset_id"], bundle["generation"], limits)
     samples = bundle["samples"]
     names = {tensor.name for tensor in validated.manifest.tensors}
     if type(samples) is not dict or samples.keys() != names:
@@ -208,20 +217,29 @@ def _verify_samples(views, validated, samples, device):
     return True
 
 
-def attach_from_bundle(bundle_path, *, layout, hash_state, device):
+def attach_from_bundle(bundle_path, *, layout, hash_state, device, environ=None):
     """Validate the model's real layout/hash, map once and verify before READY."""
     import torch
 
     target = torch.device(device)
     if target.type != "cuda":
         raise BootstrapError("CUDA_DEVICE_REQUIRED")
-    bundle, raw, expected, handles = _read_bundle(bundle_path, layout, hash_state_digest(hash_state))
+    limits = _configured_limits(environ)
+    bundle, raw, expected, handles = _read_bundle(
+        bundle_path, layout, hash_state_digest(hash_state), limits=limits)
     ordinal = target.index if target.index is not None else torch.cuda.current_device()
+    native = _load_native()
+    # Reject an older/smaller bridge before importing even the first allocation.
+    manifest = parse_manifest(raw, limits)
+    native_limit = getattr(native, "max_allocation_bytes", None)
+    if (type(native_limit) is not int or native_limit <= 0
+            or any(t.shards[0].allocation_bytes > native_limit for t in manifest.tensors)):
+        raise BootstrapError("NATIVE_ALLOCATION_LIMIT")
     try:
         storage = FabricEngramStorage.attach(
             raw, expected_layout=expected, dataset_id=bundle["dataset_id"],
             generation=bundle["generation"], handles=handles, device=ordinal,
-            native=_load_native(), limits=_LIMITS)
+            native=native, limits=limits)
     except CleanupPendingError as error:
         retain_for_process(error.resource)
         raise
