@@ -5,15 +5,14 @@ The real runtime dependencies are mandatory: missing wheels fail this suite
 instead of reporting success after skipping the checkpoint loader tests.
 """
 import hashlib
+import io
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-
-import torch
-from safetensors.torch import save_file
 
 from rtp_llm.models_py.modules.dsv41 import engram_checkpoint as m
 
@@ -105,7 +104,103 @@ class DependencyFreeTest(unittest.TestCase):
         generation.close()
 
 
+class RawReaderTest(unittest.TestCase):
+    def test_short_reads_are_completed_and_eof_is_rejected(self):
+        class Fragmented(io.BytesIO):
+            def read(self, size):
+                return super().read(min(size, 3))
+        source = Fragmented(bytes(range(64)))
+        self.assertEqual(m._read_exact(source, 63), bytes(range(63)))
+        with self.assertRaises(m.CheckpointError) as error:
+            m._read_exact(source, 2)
+        self.assertEqual(error.exception.code, "SHORT_READ")
+
+    def test_validated_header_drives_nonzero_offset_and_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            path = root / "sample.safetensors"
+            header = b'{"test":"header"}' + b" " * 23
+            payload = bytes(range(97))
+            path.write_bytes(len(header).to_bytes(8, "little") + header + payload)
+            _, start, snapshot = m._header(path, path.name)
+            with m._open_tensor_source(root, snapshot) as (source, actual_start):
+                self.assertEqual(actual_start, start)
+                source.seek(actual_start + 31)
+                self.assertEqual(m._read_exact(source, 66), payload[31:])
+            with self.assertRaises(m.CheckpointError) as error:
+                with m._open_tensor_source(root, replace(snapshot, header_sha256="0" * 64)):
+                    self.fail("changed header must not yield")
+            self.assertEqual(error.exception.code, "CHECKPOINT_CHANGED")
+
+    def test_open_descriptor_detects_mutation_after_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            path = root / "sample.safetensors"
+            header = b'{"test":"header"}'
+            path.write_bytes(len(header).to_bytes(8, "little") + header + b"payload")
+            _, _, snapshot = m._header(path, path.name)
+            with self.assertRaises(m.CheckpointError) as error:
+                with m._open_tensor_source(root, snapshot) as (source, _):
+                    m._read_exact(source, 7)
+                    with path.open("ab") as writer:
+                        writer.write(b"changed")
+            self.assertEqual(error.exception.code, "CHECKPOINT_CHANGED")
+
+    def test_sparse_file_seek_above_four_gib_is_not_truncated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "offset.bin"
+            offset = (4 << 30) + 123
+            with path.open("wb") as source:
+                source.seek(offset)
+                source.write(b"large-offset-tail")
+            with path.open("rb", buffering=0) as source:
+                source.seek(offset)
+                self.assertEqual(m._read_exact(source, 17), b"large-offset-tail")
+
+    def test_cache_configuration_is_explicit_and_dynamic(self):
+        with patch.object(m.os, "sysconf", side_effect=AssertionError("default must not query")):
+            self.assertIsNone(m._cache_page_size(False))
+        with patch.object(m.os, "posix_fadvise", lambda *args: None, create=True), \
+                patch.object(m.os, "POSIX_FADV_DONTNEED", 4, create=True), \
+                patch.object(m.os, "sysconf", return_value=65536) as query:
+            self.assertEqual(m._cache_page_size(True), 65536)
+            query.assert_called_once_with("SC_PAGESIZE")
+        for invalid in (1, "yes", None):
+            with self.assertRaises(m.CheckpointError) as error:
+                m._cache_page_size(invalid)
+            self.assertEqual(error.exception.code, "INVALID_ARGUMENT")
+        with patch.object(m.os, "posix_fadvise", None, create=True):
+            with self.assertRaises(m.CheckpointError) as error:
+                m._cache_page_size(True)
+            self.assertEqual(error.exception.code, "CACHE_ADVICE_UNSUPPORTED")
+
+    def test_discard_range_contains_only_fully_consumed_pages(self):
+        with tempfile.TemporaryFile() as source, \
+                patch.object(m.os, "posix_fadvise", create=True) as advise, \
+                patch.object(m.os, "POSIX_FADV_DONTNEED", 4, create=True):
+            self.assertEqual(m._discard_consumed_pages(source, 1, 131073, 65536), 131072)
+            advise.assert_called_once_with(source.fileno(), 65536, 65536, 4)
+            advise.reset_mock()
+            self.assertEqual(m._discard_consumed_pages(source, 131072, 131073, 65536), 131072)
+            advise.assert_not_called()
+
+    def test_discard_error_has_explicit_code(self):
+        with tempfile.TemporaryFile() as source, \
+                patch.object(m.os, "posix_fadvise", side_effect=OSError("advice failed"), create=True), \
+                patch.object(m.os, "POSIX_FADV_DONTNEED", 4, create=True):
+            with self.assertRaises(m.CheckpointError) as error:
+                m._discard_consumed_pages(source, 0, 4096, 4096)
+            self.assertEqual(error.exception.code, "CACHE_ADVICE_FAILED")
+
+
 class CheckpointTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Missing real runtime dependencies are an error for this suite, not a skip.
+        global torch, save_file
+        import torch
+        from safetensors.torch import save_file
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -184,6 +279,142 @@ class CheckpointTest(unittest.TestCase):
             self.assertEqual(tensor.shards[0].sha256,
                              "sha256:" + hashlib.sha256(self.payloads[tensor.name]).hexdigest())
         result.close()
+
+    def test_stream_uses_raw_bytes_not_safetensors_tensor_materialization(self):
+        import safetensors
+        original = safetensors.safe_open
+        calls = []
+        def metadata_only(*args, **kwargs):
+            calls.append(args[0])
+            # Inspection needs two metadata readers; streaming must not open a third.
+            if len(calls) > 2:
+                raise AssertionError("stream must not mmap tensors")
+            return original(*args, **kwargs)
+        plan = self.inspect()
+        with patch.object(safetensors, "safe_open", side_effect=metadata_only):
+            result = self.load(plan=plan, chunk_bytes=129)
+        self.assertEqual(len(calls), 2)
+        for tensor in result.manifest.tensors:
+            self.assertEqual(tensor.shards[0].sha256,
+                             "sha256:" + hashlib.sha256(self.payloads[tensor.name]).hexdigest())
+        result.close()
+
+    def test_default_never_advises_file_cache(self):
+        with patch.object(m.os, "posix_fadvise", side_effect=AssertionError("unexpected cache advice"), create=True):
+            result = self.load()
+            result.close()
+
+    def test_raw_tensor_offset_above_four_gib_with_real_safetensors_metadata(self):
+        prefix = 4 << 30
+        header = {"unused": {"dtype": "U8", "shape": [prefix], "data_offsets": [0, prefix]}}
+        offset = prefix
+        for name, payload in self.payloads.items():
+            layer = int(name.split(".")[1])
+            rows = dict(self.layout.layers)[layer]
+            columns = 64 if name.endswith(".weight") else 2
+            header[name] = dict(dtype="F8_E4M3" if columns == 64 else "U8",
+                                shape=[rows, columns], data_offsets=[offset, offset + len(payload)])
+            offset += len(payload)
+        encoded = json.dumps(header).encode()
+        encoded += b" " * (-len(encoded) % 8)
+        path = self.root / "sparse.safetensors"
+        with path.open("wb") as source:
+            source.write(len(encoded).to_bytes(8, "little") + encoded)
+            source.seek(8 + len(encoded) + prefix)
+            for payload in self.payloads.values():
+                source.write(payload)
+        self.index = {name: path.name for name in self.payloads}
+        self.write_index()
+        result = self.load()
+        for tensor in result.manifest.tensors:
+            self.assertEqual(tensor.shards[0].sha256,
+                             "sha256:" + hashlib.sha256(self.payloads[tensor.name]).hexdigest())
+        result.close()
+
+    def test_raw_short_read_rolls_back_before_any_export(self):
+        original = m._read_exact
+        def truncate_payload(source, size):
+            if size == 128:
+                raise m.CheckpointError("SHORT_READ")
+            return original(source, size)
+        native = FakeNative()
+        with patch.object(m, "_read_exact", side_effect=truncate_payload):
+            self.assert_code("SHORT_READ", self.load, native)
+        self.assertEqual(native.close_attempts, [0])
+        self.assertFalse(any(event[0] == "export" for event in native.events))
+
+    def test_cache_preflight_failure_never_allocates(self):
+        native = FakeNative()
+        with patch.object(m, "_cache_page_size", return_value=32), \
+                patch.object(m.os, "POSIX_FADV_DONTNEED", 4, create=True), \
+                patch.object(m.os, "posix_fadvise", side_effect=OSError("cannot advise"), create=True):
+            self.assert_code("CACHE_ADVICE_FAILED", self.load, native, discard_file_cache=True)
+        self.assertEqual(native.owners, [])
+
+    def test_payload_mutation_during_raw_stream_rolls_back(self):
+        native = FakeNative()
+        def mutate(call):
+            if call == 1:
+                with (self.root / "weights.safetensors").open("ab") as source:
+                    source.write(b"changed")
+        native.load_hook = mutate
+        self.assert_code("CHECKPOINT_CHANGED", self.load, native)
+        self.assertEqual(native.close_attempts, [0])
+        self.assertFalse(any(event[0] == "export" for event in native.events))
+
+    def test_private_cache_advice_precedes_allocation_and_follows_completed_load(self):
+        native = FakeNative()
+        plan = self.inspect()
+        events = []
+        original_discard = m._discard_consumed_pages
+        def discard(source, start, end, page_size):
+            events.append(("discard", Path(source.name).name, start, end, len(native.events)))
+            return original_discard(source, start, end, page_size)
+        calls = []
+        def advise(fd, offset, length, advice):
+            calls.append((offset, length, advice))
+        with patch.object(m, "_cache_page_size", return_value=32), \
+                patch.object(m, "_DISCARD_INTERVAL_BYTES", 256), \
+                patch.object(m, "_discard_consumed_pages", side_effect=discard), \
+                patch.object(m.os, "posix_fadvise", side_effect=advise, create=True), \
+                patch.object(m.os, "POSIX_FADV_DONTNEED", 4, create=True):
+            result = self.load(native, plan, discard_file_cache=True)
+        self.assertEqual(len(events[:2]), len(plan.files))
+        self.assertTrue(all(event[4] == 0 for event in events[:2]))
+        self.assertEqual({event[1] for event in events[:2]}, {snapshot.relative_path for snapshot in plan.files})
+        for event in events[2:]:
+            previous = native.events[event[4] - 1]
+            self.assertEqual(previous[0], "load")
+            tensor = next(t for t in plan.layers[previous[1]].tensors if t.relative_path == event[1])
+            _, data_start, _ = m._header(self.root / event[1], event[1])
+            tensor_start = data_start + tensor.data_range[0]
+            self.assertGreaterEqual(event[2], tensor_start)
+            self.assertEqual(event[3], tensor_start + previous[2] - tensor.target_offset + previous[3])
+            self.assertGreaterEqual(event[3], event[2])
+        self.assertTrue(all(offset % 32 == length % 32 == 0 and length > 0
+                            for offset, length, _ in calls))
+        self.assertGreater(len(events), 4)
+        result.close()
+
+    def test_stream_cache_advice_failure_rolls_back_loaded_owner(self):
+        native = FakeNative()
+        original = m._discard_consumed_pages
+        calls = 0
+        def discard(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 3:  # Two private files before allocation, then consumed bytes.
+                raise m.CheckpointError("CACHE_ADVICE_FAILED")
+            return original(*args)
+        with patch.object(m, "_cache_page_size", return_value=32), \
+                patch.object(m, "_DISCARD_INTERVAL_BYTES", 256), \
+                patch.object(m, "_discard_consumed_pages", side_effect=discard), \
+                patch.object(m.os, "posix_fadvise", create=True), \
+                patch.object(m.os, "POSIX_FADV_DONTNEED", 4, create=True):
+            self.assert_code("CACHE_ADVICE_FAILED", self.load, native, discard_file_cache=True)
+        self.assertEqual(native.close_attempts, [0])
+        self.assertTrue(any(event[0] == "load" for event in native.events))
+        self.assertFalse(any(event[0] == "export" for event in native.events))
 
     def test_budget_and_padded_allocation_limits_are_preallocation(self):
         self.assert_code("BUDGET_EXCEEDED", self.inspect, budget_bytes=16383)
@@ -348,18 +579,9 @@ class CheckpointTest(unittest.TestCase):
             self.assertFalse(any(event[0] == "export" for event in native.events))
 
     def test_file_open_failure_after_preflight_rolls_back_first_owner(self):
-        import safetensors
-        original = safetensors.safe_open
         plan = self.inspect()
         native = FakeNative()
-        calls = 0
-        def safe_open(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 3:  # Two preflight files; then first streaming read.
-                raise RuntimeError("injected file read failure")
-            return original(*args, **kwargs)
-        with patch.object(safetensors, "safe_open", side_effect=safe_open):
+        with patch.object(m, "_open_tensor_source", side_effect=RuntimeError("injected file read failure")):
             with self.assertRaisesRegex(RuntimeError, "file read failure"):
                 self.load(native, plan)
         self.assertEqual(native.close_attempts, [0])

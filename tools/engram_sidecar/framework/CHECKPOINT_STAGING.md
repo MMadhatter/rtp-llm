@@ -1,5 +1,9 @@
 # Prepare a real checkpoint without consumer table copies
 
+The [recorded real-checkpoint staging result](CHECKPOINT_STAGING_RESULTS.json)
+contains verified full-source shard hashes and the exact Owner/consumer sizes.
+Staging success is separate from GPU lookup and full-model HTTP acceptance.
+
 `stage_checkpoint.py` splits an existing, immutable local safetensors checkpoint
 using Python 3.6 or newer and an 8 MiB streaming buffer. It does not load torch,
 initialize CUDA, or modify the source. Omitting `--execute` prints a read-only
@@ -40,6 +44,6 @@ Fresh-copy hashing covers the streamed bytes; only resume re-reads a completed
 destination file. Keep these scopes distinct when reporting verification.
 
 Publication uses a private staging directory, a lock and an atomic no-replace
-rename. The 25 CPU tests cover actual subset bytes/headers, source mutation,
+rename. The 26 CPU tests cover actual subset bytes/headers, source mutation,
 space/path checks, SHA rejection, restart boundaries and destination races.
 This preparation step alone proves neither GPU loading nor HTTP serving.
