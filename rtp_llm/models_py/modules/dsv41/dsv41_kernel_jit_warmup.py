@@ -385,7 +385,7 @@ def warmup_v41_engram_jit(model, *, max_m, device):
             (
                 tuple(layer.q_weight.shape),
                 layer.eps,
-                tuple(layer.embed_tokens.weight.shape),
+                tuple(layer.embed_tokens.table_shape),
             )
             for layer in layers
         ),
