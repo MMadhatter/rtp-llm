@@ -5,7 +5,9 @@ Based on public RTP-LLM `main` at
 This is an experimental external-storage backend, file bootstrap and opt-in
 model loading hook. The small-fixture Engram loading/hash/lookup/native
 quantization/DeepGEMM/layer-forward path has passed locally and across
-hosts/containers. Complete RTP serving remains untested.
+hosts/containers. The complete 188.83 GiB real Engram generation has also passed
+cross-host lookup. Complete RTP HTTP serving is in progress and has not passed
+acceptance at this checkpoint.
 
 An owner allocates immutable Engram weights/scales in Grace host NUMA memory.
 Independent consumers import the same CUDA Fabric allocations and expose
@@ -86,15 +88,21 @@ The default 1 GiB/allocation and bootstrap 8 GiB total limits remain. Explicit
 local [capacity configuration](CAPACITY.md) can raise them to the new native
 128 GiB/allocation ceiling and a 256 GiB generation budget; 64 MiB loading chunks
 remain. The rebuilt native bridge and a real cross-host 4.125 GiB
-[boundary lookup](framework/LARGE_OFFSET_PROBE.md) passed. Complete real-checkpoint
-capacity and [full-model HTTP](framework/FULL_MODEL_HTTP.md) acceptance remain pending.
-All 48 original checkpoint shards have now passed official SHA256 verification;
-the [staged consumer](framework/CHECKPOINT_STAGING_RESULTS.json) retains the full
-model while omitting complete Engram tables. The
-[real-checkpoint lookup harness](framework/REAL_CHECKPOINT_LOOKUP.md) and private
-cache streaming option cover the next capacity gate; current full-table loading
-has reached a first complete layer but encountered NUMA allocation pressure at
-the second layer.
+[boundary lookup](framework/LARGE_OFFSET_PROBE.md) passed. The complete real-table
+[188.83 GiB cross-host lookup](framework/REAL_CHECKPOINT_LOOKUP.md) now also passed:
+12 cases were exact in BF16, the consumer checkpoint contained no full tables,
+PyTorch attach allocation was zero, and the consumer closed with all eight
+native counters zero. The Owner remains alive for the
+[full-model HTTP experiment](framework/FULL_MODEL_HTTP.md), which is in progress
+and has not passed acceptance in this record.
+All 48 original checkpoint shards passed official SHA256 verification; the
+[staged consumer](framework/CHECKPOINT_STAGING_RESULTS.json) retains the full
+model while omitting complete Engram tables. Earlier second-layer allocation
+OOMs are historical attempts, retained as NUMA admission evidence.
+On the measured driver/kernel, the two EGM mappings had 188.83 GiB resident RSS
+while the verified Owner container cgroup reported about 10.23 GiB current
+memory. Container quotas alone therefore do not guarantee EGM admission or
+capacity enforcement for this path; keep explicit budgets and NUMA checks.
 Next gates are the supported-shape fused gate,
 complete engine/rank integration and two independent serving instances. The
 additional 100-microsecond target remains unpassed. Production companion
