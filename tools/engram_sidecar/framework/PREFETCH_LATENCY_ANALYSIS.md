@@ -1,8 +1,24 @@
 # Engram 预取与 decode 延迟隐藏
 
-2026-10-21。源码依据是本实验锁定的 RTP-LLM **main `492ecf45b3ef55b22fd4882622abfdb2e2f664f2`**，另核对当前 external-EGM 接入分支。以下把已实现行为、实测结果与拟开发优化分开。多 stream 预取尚未实现或验收。
+2026-10-21。本页保留原实验基线 RTP-LLM **main `492ecf45b3ef55b22fd4882622abfdb2e2f664f2`** 的分析与实测，并补充本日迁移到 `feature/dsv41-release-20261019` 的源码差异。历史结果不能作为新基线的验收。
 
-## 当前实现：提前计算 hash，到层后才查表
+## 新 release：prefill 已有预取，decode 尚未使用
+
+新开发分支 `codex/engram-sidecar-dsv41-release-20261019` 基于 release **`cb42b084a8a6350daa70897555f18d5f1b47f58e`**。该版本的预取行为如下：
+
+| 路径 | release 行为 | 对 external EGM 的意义 |
+|---|---|---|
+| 普通 target prefill，非 decode role | 默认 `DSV41_CPU_ENGRAM_LOOKUP=1`：CPU 后台 hash/gather，选中行经侧流 H2D；可保留 packed FP8/scale | EGM consumer 没有 CPU weight/scale 视图，不能直接使用这条路径 |
+| 普通 target prefill，可选 GPU 预取 | CPU lookup 关闭，且 `DSV41_ASYNC_ENGRAM_LOOKUP=1`；两层 lookahead、最多一个 pending lookup，以 event 连接生产和消费 | 需要独立验证外部 allocation 的跨 stream 持有与清理，不能照搬本机 `_pinned` 事件容器 |
+| decode、target verify、CUDA capture | 不创建上述 prefetch plan，继续同步 GPU 查表 | 目前没有现成的 decode 预取收益；下面的 decode 隐藏方案仍需实现和测量 |
+
+源码：[prefetch 选择](https://github.com/alibaba/rtp-llm/blob/cb42b084a8a6350daa70897555f18d5f1b47f58e/rtp_llm/models_py/model_desc/deepseek_v41_model.py)、[CPU/GPU lookup 调度](https://github.com/alibaba/rtp-llm/blob/cb42b084a8a6350daa70897555f18d5f1b47f58e/rtp_llm/models_py/modules/dsv41/engram.py)。两条现有 prefill 优化均提前查表；不能据此认为 WKV、gate 或整个 Engram 层已经移到前面。
+
+本次 rebase 保留本机 release 优化；外部 EGM 暂时按能力关闭不兼容的 CPU/异步预取入口，继续既有直接 GPU 读取。后续“存储开销”对照需在两边显式使用相同策略，例如都设 `DSV41_CPU_ENGRAM_LOOKUP=0`、`DSV41_ASYNC_ENGRAM_LOOKUP=0`；release 默认本机 prefill 性能另列。不得把不对称开关造成的差异全部归因于 EGM。
+
+新 release 还改变了 native ABI、Graph 路径和 CUDA13 ARM 依赖；完整模型必须重新构建并验证，不能沿用旧 main 运行库或历史性能数字。
+
+## 旧 main 实现：提前计算 hash，到层后才查表
 
 | 阶段 | 当前行为 | 能否算在线权重预取 |
 |---|---|---|

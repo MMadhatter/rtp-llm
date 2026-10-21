@@ -109,6 +109,18 @@ class FullModelPreflightTest(unittest.TestCase):
         self.assertEqual(report["full_layer_count"], 2)
         self.assertFalse(report["consumer_has_table_entries"])
 
+    def test_storage_comparison_cannot_inherit_asymmetric_release_prefetch(self):
+        for graph in (False, True):
+            for inherited in ({}, {"DSV41_CPU_ENGRAM_LOOKUP": "1", "DSV41_ASYNC_ENGRAM_LOOKUP": "1"}):
+                for storage in ("local-pinned", "external-egm"):
+                    with self.subTest(graph=graph, inherited=inherited, storage=storage):
+                        args = SimpleNamespace(checkpoint=self.root, bundle=self.root / "bundle.json", port=18630,
+                                               max_allocation_bytes=128 << 30, budget_bytes=256 << 30,
+                                               cuda_graph=graph, storage_mode=storage)
+                        env = launch_environment(args, inherited)
+                        self.assertEqual(env["DSV41_CPU_ENGRAM_LOOKUP"], "0")
+                        self.assertEqual(env["DSV41_ASYNC_ENGRAM_LOOKUP"], "0")
+
     def test_component_checkpoint_rejected(self):
         self.config["fixture_component_only"] = True
         self.save()

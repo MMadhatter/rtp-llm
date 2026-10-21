@@ -5,6 +5,17 @@ result**. It starts no model and touches no remote host. CPU protocol fixtures
 are unit tests only. Existing HTTP smoke and component results do not establish
 this A/B comparison or the user's <=100 us additional decode-time requirement.
 
+**Release rebase, 2026-10-21:** this development branch now targets
+`feature/dsv41-release-20261019` at `cb42b084a8a6350daa70897555f18d5f1b47f58e`.
+`full_model_http.py` explicitly fixes `DSV41_CPU_ENGRAM_LOOKUP=0` and
+`DSV41_ASYNC_ENGRAM_LOOKUP=0` in both modes, including when inherited flags
+enable them. This measures the same synchronous GPU lookup strategy on both
+storage backends. The release's default local CPU-prefill optimization is a
+separate comparison: external EGM has no CPU-readable table. Decode prefetch
+is not implemented by the release's ordinary-prefill optimization. Rebuild
+the matching native runtime and rerun model/Graph validation before measuring
+this new baseline; historical main results do not establish its performance.
+
 ## What changes between A and B
 
 | Setting | A: `local-pinned` | B: `external-egm` |

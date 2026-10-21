@@ -1,5 +1,13 @@
 # Real DeepSeek V4.1 checkpoint / HTTP experiment
 
+**Historical evidence:** the smoke and runtime results below were collected on
+the earlier main-derived Engram branch. On 2026-10-21 development moved to
+`feature/dsv41-release-20261019` at `cb42b084a8a6350daa70897555f18d5f1b47f58e`.
+The release changes native ABI, Graph behavior and dependency versions; these
+results must not be reported as validation of the rebased branch. See the
+[updated A/B protocol](HTTP_DECODE_BENCHMARK.md) and
+[prefetch analysis](PREFETCH_LATENCY_ANALYSIS.md).
+
 This step uses the complete checkpoint and the actual RTP server. The earlier
 `checkpoint_fixture.py` / `consumer_model_hook.py` results prove the two-layer
 Engram component path only; they do not prove an LLM, model quality, or HTTP.
