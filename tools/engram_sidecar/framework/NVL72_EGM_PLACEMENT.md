@@ -128,3 +128,17 @@ M=1 优先，先 100 paired screen，再对有价值 case 做 10,000 pairs。更
 consumer 本地 C2C 在 55 s 内没有 GB 级 bulk 流量，支持“读取经 GPU NVLink fabric 到 owner Grace 内存”的路径判断。但这是 system-wide socket PMU、单次运行、55 s reader，且 N 轮含冷启动；**不构成带宽、延迟或 ≤100 μs 结论**。PMU 本身不计 C2C latency，`physical-link scope` 仍未独立核验。历史 207.424 μs 长尾仍未解释或修复。
 
 本次只把 N0（owner HOST_NUMA0 → consumer GPU0）的**功能格**标记为已通过；N1/N2/F2 与 L0/L1/C0/C1/C2 仍未执行。完整去标识数据与边界见 [跨机 C2C 路径诊断](results/20261021_c2c_path/README.md)。
+
+## 9. 组件放置 screen：g0 与 g2 本地基线
+
+在完整 ABBA 之前，已用同一 native runtime、同一真实表和**单层模式**分别固定两个 consumer Grace 组的本地 pinned 基线。两组都通过 `SINGLE_PLACEMENT_COMPONENT_CLOSED_COMPLETE`，每层独立驻留（约 101.38 GB），两层结果没有相加，native counters 全为零。
+
+| case | consumer GPU | GPU 本地 NUMA | source cache NUMA | 结果 |
+|---|---|---|---:|---|
+| g0 | host GPU0 | 0 | 1 | CLOSED_COMPLETE，counters 0 |
+| g2 | host GPU2 | 1 | 0 | CLOSED_COMPLETE，counters 0 |
+
+**边界：**
+- g0 支撑 GPU0/NUMA0 的本地 pinned 基线；g2 支撑 GPU2/NUMA1 的本地 pinned 基线（source 在 NUMA0），说明跨 Grace 组的本地 pinned 路径可完整驻留并运行。
+- g2 **不是** N1。N1（owner 远端 backing → consumer GPU2）仍未执行；不能把 g2 的本地时延当作远端 C2C 时延。
+- N1、N2、F2、EP、C1 仍未执行；历史 207.424 μs 长尾仍独立保留。
