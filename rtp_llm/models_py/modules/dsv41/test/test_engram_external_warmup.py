@@ -63,6 +63,13 @@ class ExternalEngramWarmupTest(unittest.TestCase):
             self.stack.enter_context(mock.patch.object(
                 torch.cuda, name, side_effect=AssertionError("GPU call in CPU regression")
             ))
+        # This CPU test exercises orchestration with CUDA placement replaced at
+        # tensor/kernel boundaries. Hidden GPUs must not skip that orchestration
+        # at the hardware-availability guard before the real lookup loop runs.
+        self.stack.enter_context(mock.patch.object(
+            warmup.common, "_is_cuda_device",
+            side_effect=lambda device: torch.device(device).type == "cuda",
+        ))
         self.stack.enter_context(mock.patch.object(warmup.common, "_assert_not_capturing"))
         self.sync = self.stack.enter_context(mock.patch.object(warmup.common, "_sync_cuda"))
         self.stack.enter_context(mock.patch.object(
