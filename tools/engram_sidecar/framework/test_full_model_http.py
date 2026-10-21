@@ -1,5 +1,7 @@
 """Preflight negative cases only; these fake files never run a model."""
 import json
+import io
+import struct
 import subprocess
 from pathlib import Path
 import tempfile
@@ -8,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from tools.engram_sidecar.framework.full_model_http import (
-    NATIVE_LIBS, TEXT_FIELDS, chat_payload, checkpoint_preflight, launch_environment, runtime_preflight,
+    EXTERNAL_ENV, NATIVE_LIBS, TEXT_FIELDS, chat_payload, checkpoint_preflight, launch_environment, runtime_preflight, main,
 )
 
 
@@ -16,7 +18,7 @@ class FullModelPreflightTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         text = dict.fromkeys(TEXT_FIELDS, 1)
         text.update(num_hidden_layers=2, engram_layer_ids=[0, 1], engram_num_embeddings=[100, 101], engram_head_dim=64)
         self.config = {"text_config": text, "vision_config": {}, "quantization_config": {}, "dtype": "bfloat16",
@@ -28,7 +30,6 @@ class FullModelPreflightTest(unittest.TestCase):
         for layer in range(2):
             for key in ("attn.fake", "ffn.fake", "engram.wkv.weight", "engram.wkv.scale", "engram.q_weight", "engram.k_weight"):
                 self.weights[f"layers.{layer}.{key}"] = "weights.safetensors"
-        (self.root / "weights.safetensors").write_bytes(b"metadata-only-unit-test")
         (self.root / "encoding").mkdir()
         for name in ("tokenizer.json", "tokenizer_config.json", "encoding/encoding.py"):
             (self.root / name).write_text("{}")
@@ -37,6 +38,70 @@ class FullModelPreflightTest(unittest.TestCase):
     def save(self):
         (self.root / "config.json").write_text(json.dumps(self.config))
         (self.root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": self.weights}))
+        self.write_header()
+
+    def write_header(self, overrides=None, extra=None):
+        header, offset = {}, 0
+        for name in sorted(set(self.weights) | set(extra or [])):
+            dtype, shape, count = "BF16", [1], 2
+            if ".engram.embed." in name:
+                layer = int(name.split(".")[1])
+                width = 64 if name.endswith("weight") else 2
+                dtype, shape = ("F8_E4M3" if width == 64 else "U8"), [100 + layer, width]
+                count = shape[0] * shape[1]
+            header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + count]}
+            offset += count
+        for name, fields in (overrides or {}).items():
+            header[name].update(fields)
+        data = json.dumps(header).encode()
+        (self.root / "weights.safetensors").write_bytes(struct.pack("<Q", len(data)) + data + bytes(offset))
+
+    def add_tables(self):
+        for layer in (0, 1):
+            for role in ("weight", "scale"):
+                self.weights[f"layers.{layer}.engram.embed.{role}"] = "weights.safetensors"
+        self.save()
+
+    def test_local_requires_complete_exact_tables_and_checks_headers(self):
+        with self.assertRaisesRegex(ValueError, "exactly every"):
+            checkpoint_preflight(self.root, "local-pinned")
+        self.add_tables()
+        report = checkpoint_preflight(self.root, "local-pinned")
+        self.assertTrue(report["consumer_has_table_entries"])
+        self.assertEqual(len(report["shard_header_sha256"]), 1)
+        self.write_header({"layers.0.engram.embed.weight": {"dtype": "U8"}})
+        with self.assertRaisesRegex(ValueError, "dtype/shape"):
+            checkpoint_preflight(self.root, "local-pinned")
+
+    def test_external_refuses_hidden_header_table_and_unindexed_files(self):
+        self.write_header(extra=["layers.0.engram.embed.weight"])
+        with self.assertRaisesRegex(ValueError, "header/index"):
+            checkpoint_preflight(self.root)
+        self.save()
+        (self.root / "extra.safetensors").touch()
+        with self.assertRaisesRegex(ValueError, "unindexed"):
+            checkpoint_preflight(self.root)
+
+    def test_local_preflight_does_not_read_external_bundle(self):
+        self.add_tables()
+        with patch("tools.engram_sidecar.framework.full_model_http.runtime_preflight", return_value={}), patch(
+            "tools.engram_sidecar.framework.full_model_http.verify_bundle", side_effect=AssertionError("must not attach")), patch(
+            "sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(main(["preflight", "--checkpoint", str(self.root), "--storage-mode", "local-pinned",
+                                   "--model-revision", "test", "--cuda-graph"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertNotIn("bundle", report)
+        self.assertEqual(report["experiment_environment"]["DECODE_CAPTURE_CONFIG"], "1")
+
+    def test_local_clears_external_env_with_same_normal_graph_configuration(self):
+        args = SimpleNamespace(checkpoint=self.root, bundle=self.root / "bundle.json", port=18630,
+                               max_allocation_bytes=128 << 30, budget_bytes=256 << 30, cuda_graph=True)
+        external = launch_environment(args, {})
+        args.storage_mode = "local-pinned"
+        local = launch_environment(args, dict.fromkeys(EXTERNAL_ENV, "stale-sensitive-value"))
+        for name in EXTERNAL_ENV:
+            self.assertNotIn(name, local)
+        self.assertEqual({k: v for k, v in external.items() if k not in EXTERNAL_ENV}, local)
 
     def test_metadata_screen_counts_geometry_without_weight_loading(self):
         report = checkpoint_preflight(self.root)
