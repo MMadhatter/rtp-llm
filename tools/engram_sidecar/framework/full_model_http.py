@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit eager TP4 full-checkpoint experiment, separate from component tests.
+"""Explicit TP4 full-checkpoint experiment with opt-in decode Graph, separate from component tests.
 
 runtime/preflight never start a model or allocate EGM. launch starts the actual
 RTP server in this process; its lifetime and the Owner's STOP belong to the
@@ -162,11 +162,16 @@ def runtime_preflight(repository=REPO, *, load_native=False):
 
 def launch_environment(args, inherited=None):
     env = dict(os.environ if inherited is None else inherited)
+    cuda_graph = getattr(args, "cuda_graph", False)
+    if type(cuda_graph) is not bool:
+        raise ValueError("cuda_graph must be an explicit boolean")
     # Dedicated test slice: no inherited service discovery, drafts, truncation,
     # or model overrides. Driver/library/device visibility remains operator set.
     for key in ("MODEL_SERVICE_CONFIG", "REMOTE_RPC_SERVER_IP", "REMOTE_VIT_SERVER_IP",
                 "RTP_LLM_DECODE_CM2_CONFIG", "RTP_LLM_MULTIMODAL_PART_CM2_CONFIG",
-                "SP_CHECKPOINT_PATH", "PTUNING_PATH", "LORA_INFO"):
+                "SP_CHECKPOINT_PATH", "PTUNING_PATH", "LORA_INFO",
+                "GENERATION_PREFILL_CAPTURE_CONFIG", "GENERATION_PREFILL_CUDA_GRAPH_MAX_REQUESTS",
+                "PREFILL_CAPTURE_CONFIG", "DECODE_CAPTURE_CONFIG"):
         env.pop(key, None)
     env.update({
         "MODEL_TYPE": "deepseek_v41", "CHECKPOINT_PATH": str(args.checkpoint),
@@ -175,7 +180,10 @@ def launch_environment(args, inherited=None):
         "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": str(args.budget_bytes),
         "LOAD_PYTHON_MODEL": "1", "ROLE_TYPE": "PDFUSION", "USE_LOCAL": "1", "THINK_MODE": "0", "ACT_TYPE": "BF16",
         "TP_SIZE": "4", "EP_SIZE": "4", "DP_SIZE": "1", "WORLD_SIZE": "4", "WORLD_RANK": "0",
-        "ENABLE_CUDA_GRAPH": "0", "SP_TYPE": "", "SP_MODEL_TYPE": "", "HACK_LAYER_NUM": "0",
+        "ENABLE_CUDA_GRAPH": "1" if cuda_graph else "0",
+        "RTP_ENGRAM_GRAPH_MODE": "process_lifetime" if cuda_graph else "eager",
+        "ENABLE_NATIVE_CUDA_GRAPH": "0", "DECODE_CAPTURE_CONFIG": "1" if cuda_graph else "",
+        "SP_TYPE": "", "SP_MODEL_TYPE": "", "HACK_LAYER_NUM": "0",
         "JSON_MODEL_OVERRIDE_ARGS": "", "LOAD_METHOD": "fastsafetensors", "FASTSAFETENSORS_NOGDS": "1",
         "VIT_SEPARATION": "0",
         "DSV4_MOE_STRATEGY": "mega", "DSV4_USE_MEGA_MOE_SE": "0", "DSV4_USE_MEGA_MOE_FUSED": "0",
@@ -236,6 +244,8 @@ def main(argv=None):
     parser.add_argument("--max-allocation-bytes", type=int, default=1 << 30)
     parser.add_argument("--budget-bytes", type=int, default=8 << 30)
     parser.add_argument("--port", type=int, default=18630)
+    parser.add_argument("--cuda-graph", action="store_true",
+                        help="Experimental decode-only batch-1 Graph; mappings remain pinned until worker exit")
     parser.add_argument("--load-native", action="store_true", help="Probe exact native + start_server imports in a GPU-hidden child")
     args = parser.parse_args(argv)
     if not 1024 <= args.port <= 65000:

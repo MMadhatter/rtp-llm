@@ -1,10 +1,13 @@
-# Real DeepSeek V4.1 checkpoint / eager HTTP experiment
+# Real DeepSeek V4.1 checkpoint / HTTP experiment
 
 This step uses the complete checkpoint and the actual RTP server. The earlier
 `checkpoint_fixture.py` / `consumer_model_hook.py` results prove the two-layer
 Engram component path only; they do not prove an LLM, model quality, or HTTP.
 These scripts do not implement service discovery, production service lifecycle,
-automatic failover, performance acceptance, or CUDA Graph support.
+automatic failover or performance acceptance. Eager remains the default. An
+experimental, explicitly enabled batch-1 decode Graph path is described in
+[External decode Graph](EXTERNAL_DECODE_GRAPH.md); it is not production lifecycle
+or hot-unload support, and the earlier eager results do not validate it.
 
 ## Verified full-model HTTP smoke
 
@@ -108,7 +111,7 @@ The unmodified main smoke test
 `rtp_llm/test/smoke/deepseek_v41_contract_test.py` defaults to
 `/mnt/nas1/hf/DeepSeek-V4.1-Flash`, and its BUILD target uses SM100 CUDA13,
 TP4/EP4/DP1. It requires graph capture/replay, so it cannot be used unchanged for
-the external eager-only path. The launcher here follows that four-GPU geometry,
+the default external eager path. The launcher here follows that four-GPU geometry,
 with graph/speculation disabled and a single PDFUSION instance.
 
 ## Checkpoint contract and resources

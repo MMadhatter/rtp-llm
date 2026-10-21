@@ -84,6 +84,7 @@ py_test(
     deps = [
         "//rtp_llm/models_py:engram_manifest",
         "//rtp_llm/models_py:engram_storage_cpu",
+        "//rtp_llm/models_py:engram_model_attach_cpu",
     ],
     legacy_create_init = 0,
 )
