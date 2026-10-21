@@ -18,8 +18,19 @@ class Storage:
     def __init__(self, trace, *, close_error=False):
         self.trace = trace
         self.close_error = close_error
+        self.pins = 0
+
+    def _pin_graph(self):
+        self.trace.append("pin")
+        self.pins += 1
+
+    def _unpin_graph(self):
+        self.trace.append("unpin")
+        self.pins -= 1
 
     def close(self):
+        if self.pins:
+            raise RuntimeError("pinned storage")
         self.trace.append("close")
         if self.close_error:
             raise RuntimeError("injected close failure")
@@ -138,6 +149,113 @@ class ModelAttachTest(unittest.TestCase):
         with self.assertRaisesRegex(attach.EngramModelInitializationError, "GRAPH_UNSUPPORTED"):
             self.run_init()
         self.assertEqual(self.trace, ["layout"])
+
+    def graph_env(self):
+        return {**self.env, attach.EXTERNAL_GRAPH_MODE_ENV: attach.PROCESS_LIFETIME_GRAPH}
+
+    def test_decode_graph_opt_in_pins_once_before_ready_and_is_process_retained(self):
+        self.model.py_hw_kernel_config.enable_cuda_graph = True
+        state = self.run_init(environ=self.graph_env())
+        self.assertEqual(state.phase, "READY")
+        self.assertEqual(self.storage.pins, 1)
+        self.assertTrue(state.graph_pin_held and state.process_retained)
+        self.assertEqual(self.retained, [self.storage])
+        self.assertIs(self.run_init(environ={}), state)
+        self.assertEqual(self.storage.pins, 1)
+        attach.require_engram_runtime(self.model, is_cuda_graph=True)
+        attach.require_engram_runtime(self.model, capture_check=lambda: self.fail("decode does not poll CUDA"))
+        with self.assertRaisesRegex(RuntimeError, "pinned"):
+            self.storage.close()
+        self.assertNotIn("close", self.trace)
+
+    def test_graph_mode_is_explicit_and_cannot_be_enabled_after_initialization(self):
+        self.run_init()
+        self.run_init(environ=self.graph_env())
+        with self.assertRaisesRegex(attach.EngramModelInitializationError, "GRAPH_UNSUPPORTED"):
+            attach.require_engram_runtime(self.model, is_cuda_graph=True)
+        self.assertEqual(self.storage.pins, 0)
+
+    def test_invalid_graph_mode_fails_before_import(self):
+        with self.assertRaisesRegex(attach.EngramModelInitializationError, "INVALID_EXTERNAL_ENGRAM_GRAPH_MODE"):
+            self.run_init(environ={**self.env, attach.EXTERNAL_GRAPH_MODE_ENV: "1"})
+        self.assertEqual(self.trace, ["layout"])
+
+    def test_opt_in_only_accepts_decode_graph_but_keeps_prefill_eager(self):
+        self.run_init(environ=self.graph_env())
+        attach.require_engram_runtime(self.model, is_prefill=True, capture_check=lambda: False)
+        for fields in (dict(is_cuda_graph=True, is_prefill=True),
+                       dict(is_prefill=True, capture_check=lambda: True),
+                       dict(is_cuda_graph=True, is_target_verify=True)):
+            with self.subTest(fields=fields), self.assertRaisesRegex(
+                attach.EngramModelInitializationError, "DECODE_GRAPH_ONLY"
+            ):
+                attach.require_engram_runtime(self.model, **fields)
+
+    def test_graph_layer_construction_failure_never_pins_or_publishes(self):
+        def fail_second(config, layer_id, path, device, **kwargs):
+            if layer_id == 2:
+                raise RuntimeError("second layer failed")
+            return self.make_layer(config, layer_id, path, device, **kwargs)
+        with self.assertRaisesRegex(RuntimeError, "second layer failed"):
+            self.run_init(environ=self.graph_env(), layer_factory=fail_second)
+        self.assertNotIn("pin", self.trace)
+        self.assertEqual(self.trace[-2:], [("release", 0), "close"])
+        self.assertTrue(all(layer.engram is None for layer in self.model.v4.layers))
+        self.assertEqual(self.retained, [])
+
+    def test_graph_pin_failure_leaves_no_ready_binding(self):
+        def fail_pin():
+            raise RuntimeError("injected pin failure")
+        self.storage._pin_graph = fail_pin
+        with self.assertRaisesRegex(RuntimeError, "pin failure"):
+            self.run_init(environ=self.graph_env())
+        self.assertEqual(self.model._engram_attachment.phase, "FAILED")
+        self.assertEqual(self.storage.pins, 0)
+        self.assertEqual(self.trace[-3:], [("release", 2), ("release", 0), "close"])
+        self.assertEqual(self.retained, [])
+
+    def test_graph_retention_failure_unpins_before_pre_ready_close(self):
+        def fail_retain(storage):
+            self.assertEqual(storage.pins, 1)
+            self.assertEqual(self.model._engram_attachment.phase, "INITIALIZING")
+            raise RuntimeError("injected retention failure")
+        with self.assertRaisesRegex(RuntimeError, "retention failure"):
+            self.run_init(environ=self.graph_env(), retain=fail_retain)
+        self.assertEqual(self.storage.pins, 0)
+        self.assertEqual(self.trace[-4:], ["unpin", ("release", 2), ("release", 0), "close"])
+        self.assertTrue(all(layer.engram is None for layer in self.model.v4.layers))
+
+    def test_failed_graph_rollback_retains_resource_without_unmapping(self):
+        def fail_unpin():
+            raise RuntimeError("injected unpin failure")
+        self.storage._unpin_graph = fail_unpin
+        def fail_retain(storage):
+            if self.model._engram_attachment.phase == "INITIALIZING":
+                raise RuntimeError("injected retention failure")
+            self.retained.append(storage)
+        with self.assertRaisesRegex(attach.EngramModelInitializationError, "CLEANUP_INCOMPLETE"):
+            self.run_init(environ=self.graph_env(), retain=fail_retain)
+        self.assertEqual(self.storage.pins, 1)
+        self.assertNotIn("close", self.trace)
+        self.assertEqual(self.retained, [self.storage])
+
+    def test_missing_lifetime_anchor_rejects_capture_without_releasing_pin(self):
+        state = self.run_init(environ=self.graph_env())
+        state.process_retained = False
+        with self.assertRaisesRegex(attach.EngramModelInitializationError, "LIFETIME_UNPINNED"):
+            attach.require_engram_runtime(self.model, is_cuda_graph=True)
+        self.assertEqual(self.storage.pins, 1)
+        self.assertNotIn("close", self.trace)
+
+    def test_ready_binding_cannot_be_replaced_before_capture_or_reinitialized(self):
+        state = self.run_init(environ=self.graph_env())
+        self.model.v4.layers[0].engram = object()
+        for call in (lambda: attach.require_engram_runtime(self.model, is_cuda_graph=True), self.run_init):
+            with self.assertRaisesRegex(attach.EngramModelInitializationError, "BINDING_CHANGED"):
+                call()
+        self.assertEqual(state.phase, "READY")
+        self.assertEqual(self.storage.pins, 1)
+        self.assertNotIn("close", self.trace)
 
     def test_invalid_explicit_bundle_does_not_enable_legacy_fallback(self):
         for value in ("", "relative.json", 12):

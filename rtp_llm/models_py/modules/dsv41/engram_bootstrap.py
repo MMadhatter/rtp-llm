@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental file bootstrap for eager, process-lifetime external Engram.
+"""Experimental file bootstrap for process-lifetime external Engram.
 
 The trusted launcher transfers small private files over an authenticated channel.
 This module does not discover an Owner, load a checkpoint table, run RPC, compile
 native code, or permit live generation replacement. The Owner must outlive all
-consumer processes. Engine CUDA Graph and in-process detach are not supported.
+consumer processes. Experimental decode Graph requires the model attachment's
+permanent process-lifetime pin; in-process detach is not supported.
 """
 from __future__ import annotations
 
