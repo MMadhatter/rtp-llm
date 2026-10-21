@@ -34,6 +34,9 @@ TEXT_FIELDS = ("num_hidden_layers", "hidden_size", "vocab_size", "num_attention_
                "engram_layer_ids", "engram_num_embeddings", "engram_max_ngram_size",
                "engram_n_heads", "engram_head_dim", "engram_compressed_vocab_size",
                "engram_pad_token_id", "engram_vocab_size")
+STORAGE_MODES = ("external-egm", "local-pinned")
+EXTERNAL_ENV = ("RTP_ENGRAM_EXTERNAL_BUNDLE", "RTP_ENGRAM_GRAPH_MODE",
+                "RTP_ENGRAM_MAX_ALLOCATION_BYTES", "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES")
 
 
 def sha256_file(path):
@@ -44,16 +47,21 @@ def sha256_file(path):
     return "sha256:" + value.hexdigest()
 
 
-def checkpoint_preflight(checkpoint):
+def checkpoint_preflight(checkpoint, storage_mode="external-egm"):
     """Read config, index, and file metadata only; never materialize weights.
 
     This is a fail-fast screen, not a proof all model descriptors are satisfiable.
-    Real loading/forward/HTTP still must pass. Consumer must omit full tables.
+    Real loading/forward/HTTP still must pass. Both modes check every shard
+    header against its index; only local-pinned may contain the exact tables.
     """
     checkpoint = Path(checkpoint)
     if not checkpoint.is_absolute():
         raise ValueError("absolute checkpoint path required")
-    raw = json.loads((checkpoint / "config.json").read_text())
+    if storage_mode not in STORAGE_MODES:
+        raise ValueError("invalid storage mode")
+    from tools.engram_sidecar.framework.stage_checkpoint import _canonical, _small_file, _header, _snapshot, _decode
+    checkpoint = _canonical(checkpoint)
+    raw = _decode(_small_file(checkpoint / "config.json")[0])
     if raw.get("fixture_component_only"):
         raise ValueError("component fixture is not a full LLM checkpoint")
     missing = [key for key in TOP_LEVEL_FIELDS if key not in raw]
@@ -71,16 +79,29 @@ def checkpoint_preflight(checkpoint):
     if (not text["engram_layer_ids"]
             or len(text["engram_layer_ids"]) != len(text["engram_num_embeddings"])):
         raise ValueError("full Engram layer geometry required")
+    layers, rows, dim = text["engram_layer_ids"], text["engram_num_embeddings"], text["engram_head_dim"]
+    if (type(text["num_hidden_layers"]) is not int or text["num_hidden_layers"] <= 0
+            or any(type(x) is not int or not 0 <= x < text["num_hidden_layers"] for x in layers)
+            or len(set(layers)) != len(layers)
+            or any(type(x) is not int or x <= 0 for x in rows)
+            or type(dim) is not int or dim <= 0 or dim % 32):
+        raise ValueError("invalid Engram layer geometry")
     for required in ("tokenizer.json", "tokenizer_config.json", "encoding/encoding.py"):
         if not (checkpoint / required).is_file():
             raise ValueError("missing HTTP tokenizer/encoding asset: " + required)
-    index = json.loads((checkpoint / "model.safetensors.index.json").read_text())
+    index = _decode(_small_file(checkpoint / "model.safetensors.index.json")[0])
     weights = index.get("weight_map")
     if not isinstance(weights, dict) or not weights:
         raise ValueError("nonempty safetensors weight_map required")
-    forbidden = [name for name in weights if ".engram.embed." in name]
-    if forbidden:
+    actual_tables = {name for name in weights if ".engram.embed." in name}
+    expected_tables = {f"layers.{layer}.engram.embed.{role}": (count, width, dtypes)
+                       for layer, count in zip(layers, rows)
+                       for role, width, dtypes in (("weight", dim, {"F8_E4M3", "F8_E4M3FN"}),
+                                                   ("scale", dim // 32, {"F8_E8M0", "U8"}))}
+    if storage_mode == "external-egm" and actual_tables:
         raise ValueError("consumer checkpoint must omit Engram embedding table entries")
+    if storage_mode == "local-pinned" and actual_tables != set(expected_tables):
+        raise ValueError("local-pinned requires exactly every configured Engram weight and scale")
     for layer in text["engram_layer_ids"]:
         for suffix in ("wkv.weight", "wkv.scale", "q_weight", "k_weight"):
             if f"layers.{layer}.engram.{suffix}" not in weights:
@@ -100,18 +121,35 @@ def checkpoint_preflight(checkpoint):
     files = set()
     for relative in weights.values():
         if (not isinstance(relative, str) or Path(relative).is_absolute()
-                or ".." in Path(relative).parts or not relative.endswith(".safetensors")):
+                or Path(relative).name != relative or "\\" in relative
+                or not relative.endswith(".safetensors")):
             raise ValueError("unsafe checkpoint index path")
         path = checkpoint / relative
         if not path.is_file():
             raise ValueError("checkpoint shard unavailable: " + relative)
         files.add(path)
+    if {path.name for path in checkpoint.glob("*.safetensors")} != {path.name for path in files}:
+        raise ValueError("unindexed checkpoint tensor files")
+    header_hashes = {}
+    for path in sorted(files):
+        _canonical(path)
+        header, _, header_hash = _header(path, _snapshot(path))
+        names = set(header) - {"__metadata__"}
+        if names != {name for name, shard in weights.items() if shard == path.name}:
+            raise ValueError("checkpoint header/index mismatch")
+        header_hashes[path.name] = header_hash
+        for name in names & actual_tables:
+            count, width, dtypes = expected_tables[name]
+            if header[name]["shape"] != [count, width] or header[name]["dtype"] not in dtypes:
+                raise ValueError("Engram table dtype/shape mismatch")
     engram_bytes = sum(text["engram_num_embeddings"]) * (text["engram_head_dim"] + text["engram_head_dim"] // 32)
     return {"model_type": "deepseek_v41", "full_layer_count": text["num_hidden_layers"],
             "engram_layers": text["engram_layer_ids"], "engram_logical_bytes": engram_bytes,
             "consumer_tensor_count": len(weights), "consumer_shard_count": len(files),
             "consumer_shard_file_bytes": sum(path.stat().st_size for path in files),
-            "consumer_has_table_entries": False,
+            "consumer_has_table_entries": bool(actual_tables), "storage_mode": storage_mode,
+            "shard_header_sha256": header_hashes,
+            "tokenizer_sha256": sha256_file(checkpoint / "tokenizer.json"),
             "config_sha256": sha256_file(checkpoint / "config.json"),
             "index_sha256": sha256_file(checkpoint / "model.safetensors.index.json")}
 
@@ -165,6 +203,11 @@ def launch_environment(args, inherited=None):
     cuda_graph = getattr(args, "cuda_graph", False)
     if type(cuda_graph) is not bool:
         raise ValueError("cuda_graph must be an explicit boolean")
+    storage_mode = getattr(args, "storage_mode", "external-egm")
+    if storage_mode not in STORAGE_MODES:
+        raise ValueError("invalid storage mode")
+    for key in EXTERNAL_ENV:
+        env.pop(key, None)
     # Dedicated test slice: no inherited service discovery, drafts, truncation,
     # or model overrides. Driver/library/device visibility remains operator set.
     for key in ("MODEL_SERVICE_CONFIG", "REMOTE_RPC_SERVER_IP", "REMOTE_VIT_SERVER_IP",
@@ -175,13 +218,10 @@ def launch_environment(args, inherited=None):
         env.pop(key, None)
     env.update({
         "MODEL_TYPE": "deepseek_v41", "CHECKPOINT_PATH": str(args.checkpoint),
-        "TOKENIZER_PATH": str(args.checkpoint), "RTP_ENGRAM_EXTERNAL_BUNDLE": str(args.bundle),
-        "RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(args.max_allocation_bytes),
-        "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": str(args.budget_bytes),
+        "TOKENIZER_PATH": str(args.checkpoint),
         "LOAD_PYTHON_MODEL": "1", "ROLE_TYPE": "PDFUSION", "USE_LOCAL": "1", "THINK_MODE": "0", "ACT_TYPE": "BF16",
         "TP_SIZE": "4", "EP_SIZE": "4", "DP_SIZE": "1", "WORLD_SIZE": "4", "WORLD_RANK": "0",
         "ENABLE_CUDA_GRAPH": "1" if cuda_graph else "0",
-        "RTP_ENGRAM_GRAPH_MODE": "process_lifetime" if cuda_graph else "eager",
         "ENABLE_NATIVE_CUDA_GRAPH": "0", "DECODE_CAPTURE_CONFIG": "1" if cuda_graph else "",
         "SP_TYPE": "", "SP_MODEL_TYPE": "", "HACK_LAYER_NUM": "0",
         "JSON_MODEL_OVERRIDE_ARGS": "", "LOAD_METHOD": "fastsafetensors", "FASTSAFETENSORS_NOGDS": "1",
@@ -194,6 +234,11 @@ def launch_environment(args, inherited=None):
         "FRONTEND_SERVER_COUNT": "1", "START_PORT": str(args.port), "WARM_UP": "1", "MODEL_WARM_UP": "1",
         "PYTHONPATH": str(REPO) + os.pathsep + env.get("PYTHONPATH", ""),
     })
+    if storage_mode == "external-egm":
+        env.update({"RTP_ENGRAM_EXTERNAL_BUNDLE": str(args.bundle),
+                    "RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(args.max_allocation_bytes),
+                    "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": str(args.budget_bytes),
+                    "RTP_ENGRAM_GRAPH_MODE": "process_lifetime" if cuda_graph else "eager"})
     return env
 
 
@@ -241,6 +286,7 @@ def main(argv=None):
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--model-revision")
+    parser.add_argument("--storage-mode", choices=STORAGE_MODES, default="external-egm")
     parser.add_argument("--max-allocation-bytes", type=int, default=1 << 30)
     parser.add_argument("--budget-bytes", type=int, default=8 << 30)
     parser.add_argument("--port", type=int, default=18630)
@@ -257,15 +303,26 @@ def main(argv=None):
     if args.command == "runtime":
         print(json.dumps(report, sort_keys=True, indent=2))
         return 0
-    if (args.checkpoint is None or args.bundle is None or not args.bundle.is_absolute()
-            or not args.model_revision):
-        parser.error("checkpoint, absolute bundle and model revision required")
-    from rtp_llm.models_py.modules.dsv41.engram_capacity import validate_capacity
-    validate_capacity(args.max_allocation_bytes, args.budget_bytes)
-    os.environ["RTP_ENGRAM_MAX_ALLOCATION_BYTES"] = str(args.max_allocation_bytes)
-    os.environ["RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES"] = str(args.budget_bytes)
-    report["checkpoint"] = checkpoint_preflight(args.checkpoint)
-    report["bundle"] = verify_bundle(args)
+    if args.checkpoint is None or not args.model_revision:
+        parser.error("checkpoint and model revision required")
+    report["checkpoint"] = checkpoint_preflight(args.checkpoint, args.storage_mode)
+    report["storage_mode"] = args.storage_mode
+    report["model_revision"] = args.model_revision
+    if args.storage_mode == "external-egm":
+        if args.bundle is None or not args.bundle.is_absolute():
+            parser.error("absolute bundle required for external-egm")
+        from rtp_llm.models_py.modules.dsv41.engram_capacity import validate_capacity
+        validate_capacity(args.max_allocation_bytes, args.budget_bytes)
+        os.environ["RTP_ENGRAM_MAX_ALLOCATION_BYTES"] = str(args.max_allocation_bytes)
+        os.environ["RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES"] = str(args.budget_bytes)
+        report["bundle"] = verify_bundle(args)
+    elif args.bundle is not None:
+        parser.error("local-pinned must not supply an external bundle")
+    # Public reproducibility record: never include capabilities or inherited
+    # secrets. The normal main server receives the full prepared environment.
+    fixed = launch_environment(args, {})
+    report["experiment_environment"] = {k: v for k, v in fixed.items()
+                                        if k not in (*EXTERNAL_ENV, "CHECKPOINT_PATH", "TOKENIZER_PATH", "PYTHONPATH")}
     print(json.dumps(report, sort_keys=True, indent=2), flush=True)
     if args.command == "launch":
         # Preflight made no CUDA allocation. exec starts the real main server;
