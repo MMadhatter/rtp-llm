@@ -1,0 +1,21 @@
+{
+ "n1": {
+  "scope": "functional_path_only_not_latency",
+  "runs": {
+   "v1": {"n_logical_bytes": 2179457280, "two_n_logical_bytes": 4358914560,
+          "owner_c2c0_pmu0_n": 2377687552, "owner_c2c0_pmu0_two_n": 4755374592,
+          "exact_bf16": true, "total_seconds": 6.391420062631369},
+   "v2": {"n_logical_bytes": 2179457280, "two_n_logical_bytes": 4358914560,
+          "owner_c2c0_pmu0_n": 2377687040, "owner_c2c0_pmu0_two_n": 4755377664,
+          "exact_bf16": true, "total_seconds": 6.923229033127427}
+  }
+ },
+ "f2": {
+  "scope": "functional_concurrency_only_not_bandwidth",
+  "consumer_gpu0": {"n_logical_bytes": 2179457280, "two_n_logical_bytes": 4358914560, "exact_bf16": true, "total_seconds": 7.406819488853216},
+  "consumer_gpu2": {"n_logical_bytes": 2179457280, "two_n_logical_bytes": 4358914560, "exact_bf16": true, "total_seconds": 7.511257507838309},
+  "owner_c2c0_pmu0_window": 14307650560,
+  "two_route_logical_sum": 13076743680,
+  "ratio": 1.094129464499835
+ }
+}
