@@ -709,5 +709,268 @@ class SourceCacheContractTest(unittest.TestCase):
         self.assertIs(h._FAILED_RESOURCES[-1][0], batch)
 
 
+class DiagnosticContractTest(unittest.TestCase):
+    def test_default_has_no_declaration_or_cuda_nvtx_access(self):
+        args = SimpleNamespace()
+        self.assertEqual(h.diagnostic_declaration(args), {})
+        self.assertIsNone(h.create_diagnostic_trace(args, object()))
+
+    def test_capture_options_require_markers_and_one_case_distribution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = LatencyContractTest().options(Path(directory))
+            original.diagnostic_nvtx = original.diagnostic_cuda_profiler = True
+            original.layer_mode, original.layers = "together", "1,14"
+            original.batches, original.modes, original.distributions = "1", "graph", "random"
+            self.assertEqual(h.check_options(copy.copy(original)).layers, [1, 14])
+            for changes in (dict(diagnostic_nvtx=False), dict(batches="1,2"),
+                            dict(modes="eager,graph"), dict(distributions="hot,random"),
+                            dict(layer_mode="single")):
+                args = copy.copy(original)
+                for key, value in changes.items():
+                    setattr(args, key, value)
+                with self.subTest(changes=changes), self.assertRaises(ValueError):
+                    h.check_options(args)
+            original.diagnostic_cuda_profiler = False
+            original.batches, original.modes, original.distributions = "1,2", "eager,graph", "hot,random"
+            self.assertEqual(h.check_options(original).batches, [1, 2])
+
+    def test_marker_uses_only_allowlisted_geometry_and_rejects_arbitrary_content(self):
+        secret = "opaque-private-pointer-row-contents"
+        metadata = dict(layer_ids_measured=[1, 14], batch=1, mode="graph", secret=secret)
+        label = h.diagnostic_marker(metadata, "random", 1509, "remote_raw", 0)
+        self.assertEqual(label, "engram_lookup.layers=1,14.M=1.mode=graph.ids=random.pair=1509.path=remote_raw.order=0")
+        self.assertNotIn(secret, label)
+        for changes in (dict(layer_ids_measured=[secret]), dict(batch=True), dict(mode=secret)):
+            with self.assertRaises(ValueError):
+                h.diagnostic_marker(dict(metadata, **changes), "random", 0, "local_raw", 1)
+        for values in ((secret, 0, "local_raw", 0), ("hot", -1, "local_raw", 0),
+                       ("hot", 0, secret, 0), ("hot", 0, "local_raw", True)):
+            with self.assertRaises(ValueError):
+                h.diagnostic_marker(metadata, *values)
+
+    def fake_case(self, root, *, diagnostic=True, profiler=True, mode="graph",
+                  fail_invoke=None, fail_verify=False, stop_status=0, fail_pop=False):
+        calls, events, guards = [], [], []
+        state = dict(active=False, verified=0, clock=0)
+        class Stream:
+            def wait_stream(self, other):
+                calls.append("wait_stream")
+            def synchronize(self):
+                calls.append("stream_sync")
+        stream = Stream()
+        class Event:
+            def __init__(self, **kwargs):
+                self.index = len(events)
+                events.append(self)
+            def record(self, stream=None):
+                calls.append("event_record")
+            def synchronize(self):
+                calls.append("event_sync")
+            def elapsed_time(self, other):
+                calls.append("event_elapsed")
+                return .001
+        class Guard:
+            @classmethod
+            def capture(cls, forward, storages, warmup):
+                calls.append("capture")
+                result = cls()
+                result.output = forward()
+                guards.append(result)
+                return result
+            def replay(self):
+                calls.append("replay")
+                if state["active"] and fail_invoke is not None:
+                    raise fail_invoke
+                return self.output
+            def close(self):
+                calls.append("graph_close")
+        def push(label):
+            calls.append(("push", label))
+            state["active"] = True
+        def pop():
+            calls.append("pop")
+            state["active"] = False
+            if fail_pop:
+                raise RuntimeError("private-nvtx-detail")
+        nvtx = SimpleNamespace(range_push=push, range_pop=pop)
+        def start():
+            calls.append("profiler_start")
+            return (0,)
+        def stop():
+            calls.append("profiler_stop")
+            return (stop_status,)
+        runtime = SimpleNamespace(cudaProfilerStart=start, cudaProfilerStop=stop)
+        trace = h.DiagnosticTrace(nvtx, runtime if profiler else None) if diagnostic else None
+        cuda = SimpleNamespace(Stream=lambda **_: stream, current_stream=lambda _: stream,
+                               stream=lambda _: nullcontext(), Event=Event, nvtx=nvtx)
+        torch = SimpleNamespace(cuda=cuda, inference_mode=nullcontext)
+        expected = {name: (object(), object()) for name in ("local_raw", "remote_raw")}
+        def path(name):
+            def forward():
+                calls.append("lookup")
+                if state["active"] and fail_invoke is not None:
+                    raise fail_invoke
+                return expected[name]
+            return forward
+        def update(pair, distribution):
+            calls.append(("update", pair, distribution))
+        def verify(pair, distribution, outputs):
+            calls.append(("verify", pair, distribution))
+            state["verified"] += 1
+            for name, value in outputs.items():
+                self.assertIs(value, expected[name])
+            if fail_verify and state["verified"] == 3:
+                raise AssertionError("oracle failure")
+        def clock():
+            calls.append("clock")
+            state["clock"] += 1000
+            return state["clock"]
+        def switches():
+            calls.append("switches")
+            return (0, 0)
+        args = SimpleNamespace(device=0, l2_disturb=False, warmup=1, samples=2,
+                               distributions=["random"], seed=7, threshold_us=100.0,
+                               calibration_samples=0, diagnostic_nvtx=diagnostic,
+                               diagnostic_cuda_profiler=diagnostic and profiler)
+        metadata = dict(mode=mode, batch=1, layer_ids_measured=[1, 14])
+        kwargs = dict(paths={name: path(name) for name in expected}, storage=object(),
+                      update=update, verify=verify, args=args, metadata=metadata, output=root)
+        def execute():
+            with patch.dict(sys.modules, {"torch": torch,
+                    "rtp_llm.models_py.modules.dsv41.engram_storage": SimpleNamespace(CapturedEngramGraph=Guard)}), \
+                 patch.object(h, "create_diagnostic_trace", return_value=trace), \
+                 patch.object(h.bench, "_l2_bytes", return_value=128), \
+                 patch.object(h.bench, "_thread_switches_reader", return_value=switches), \
+                 patch.object(h.time, "perf_counter_ns", side_effect=clock), \
+                 patch.object(h, "retain_failed"):
+                return h.benchmark_case(**kwargs)
+        return execute, calls, trace
+
+    def test_actual_case_keeps_graph_tuple_oracles_outside_profile_and_clocks_inside_ranges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            execute, calls, trace = self.fake_case(root)
+            summary = execute()
+            records = [json.loads(s) for s in (root / "samples.jsonl").read_text().splitlines()]
+        self.assertEqual(calls.count("profiler_start"), 1)
+        self.assertEqual(calls.count("profiler_stop"), 1)
+        start, stop = calls.index("profiler_start"), calls.index("profiler_stop")
+        self.assertTrue(all(calls.index(item) < start for item in ("capture", ("verify", 0, "random"), ("verify", 1, "random"))))
+        self.assertGreater(max(i for i, c in enumerate(calls) if isinstance(c, tuple) and c[0] == "verify"), stop)
+        self.assertGreater(calls.index("graph_close"), stop)
+        labels = []
+        for i, item in enumerate(calls):
+            if isinstance(item, tuple) and item[0] == "push":
+                labels.append(item[1])
+                self.assertEqual(calls[i-1], "stream_sync")
+                self.assertEqual(calls[i+1:i+9], ["switches", "clock", "replay", "clock", "event_sync", "clock", "switches", "pop"])
+        self.assertEqual([r["diagnostic_nvtx_range"] for r in records], [v for label in labels for v in (label, label)])
+        self.assertTrue(all(r["measurement_status"] == "PROFILE_ONLY" for r in records))
+        self.assertEqual(summary["measurement_status"], "PROFILE_ONLY")
+        self.assertTrue(all(c["threshold_observation"] == "PROFILE_ONLY" for c in summary["paired_deltas"]))
+        self.assertEqual((trace.pushes, trace.pops, trace.stop_status), (4, 4, "SUCCESS"))
+
+    def test_default_case_retains_existing_fields_and_makes_no_diagnostic_calls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            execute, calls, trace = self.fake_case(root, diagnostic=False)
+            summary = execute()
+            records = [json.loads(s) for s in (root / "samples.jsonl").read_text().splitlines()]
+        self.assertIsNone(trace)
+        self.assertNotIn("measurement_status", summary)
+        self.assertNotIn("diagnostics", summary)
+        self.assertTrue(all(set(r) == set(LatencyContractTest().records()[0]) for r in records))
+        self.assertFalse(any(isinstance(c, tuple) and c[0] == "push" for c in calls))
+        self.assertNotIn("profiler_start", calls)
+        self.assertNotIn("profiler_stop", calls)
+
+    def test_nvtx_only_eager_has_markers_without_profiler_api(self):
+        with tempfile.TemporaryDirectory() as directory:
+            execute, calls, trace = self.fake_case(Path(directory), profiler=False, mode="eager")
+            summary = execute()
+        self.assertEqual(summary["measurement_status"], "PROFILE_ONLY")
+        self.assertNotIn("capture", calls)
+        self.assertNotIn("profiler_start", calls)
+        self.assertEqual((trace.start_status, trace.stop_status), ("NOT_REQUESTED", "NOT_REQUESTED"))
+        for i, item in enumerate(calls):
+            if isinstance(item, tuple) and item[0] == "push":
+                self.assertEqual(calls[i+1:i+11], ["switches", "clock", "event_record", "lookup", "event_record", "clock", "event_sync", "clock", "switches", "pop"])
+
+    def test_failed_invoke_preserves_primary_when_nvtx_and_profiler_cleanup_fail(self):
+        primary = ValueError("private-original-exception")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            execute, calls, trace = self.fake_case(root, fail_invoke=primary, fail_pop=True, stop_status=1)
+            with self.assertRaises(ValueError) as caught:
+                execute()
+            self.assertIs(caught.exception, primary)
+            self.assertFalse((root / "summary.json").exists())
+        self.assertEqual(calls.count("pop"), 1)
+        self.assertEqual(calls.count("profiler_stop"), 1)
+        self.assertEqual(trace.cleanup_errors, ["NVTX_POP_FAILED", "PROFILER_STOP_FAILED"])
+        self.assertNotIn("private", json.dumps(trace.evidence()))
+
+    def test_normal_stop_nonzero_is_fatal_before_oracle_and_success_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            execute, calls, trace = self.fake_case(root, stop_status=1)
+            with self.assertRaisesRegex(RuntimeError, "cudaProfilerStop"):
+                execute()
+            self.assertFalse((root / "summary.json").exists())
+        self.assertEqual(calls.count("profiler_stop"), 1)
+        self.assertEqual(sum(isinstance(c, tuple) and c[0] == "verify" for c in calls), 2)
+        self.assertEqual(trace.stop_status, "FAILED")
+
+    def test_normal_pop_failure_still_stops_and_is_not_masked_by_stop_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            execute, calls, trace = self.fake_case(root, fail_pop=True, stop_status=1)
+            with self.assertRaisesRegex(RuntimeError, "NVTX pop failed"):
+                execute()
+            self.assertFalse((root / "summary.json").exists())
+        self.assertEqual(calls.count("profiler_stop"), 1)
+        self.assertEqual(trace.cleanup_errors, ["NVTX_POP_FAILED", "PROFILER_STOP_FAILED"])
+
+    def test_postmeasurement_oracle_failure_occurs_after_stop_and_keeps_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            execute, calls, trace = self.fake_case(root, fail_verify=True)
+            with self.assertRaisesRegex(AssertionError, "oracle failure"):
+                execute()
+            self.assertFalse((root / "summary.json").exists())
+        self.assertEqual(calls.count("profiler_stop"), 1)
+        self.assertEqual(trace.stop_status, "SUCCESS")
+
+    def test_partial_start_failure_attempts_stop_and_never_exposes_api_arguments(self):
+        runtime = SimpleNamespace(cudaProfilerStart=Mock(side_effect=TypeError("Invoked with: PRIVATE_HANDLE")),
+                                  cudaProfilerStop=Mock(return_value=(0,)))
+        trace = h.DiagnosticTrace(Mock(), runtime)
+        with self.assertRaisesRegex(RuntimeError, "cudaProfilerStart") as caught:
+            trace.start()
+        trace.close(caught.exception)
+        self.assertNotIn("PRIVATE_HANDLE", str(caught.exception))
+        runtime.cudaProfilerStop.assert_called_once_with()
+        self.assertEqual((trace.start_status, trace.stop_status), ("FAILED", "SUCCESS"))
+
+    def test_profiler_requires_explicit_success_status_and_preserves_interrupt(self):
+        for result in (None, 0, (), (1,), (0, 0)):
+            runtime = SimpleNamespace(cudaProfilerStart=Mock(return_value=(0,)),
+                                      cudaProfilerStop=Mock(return_value=result))
+            trace = h.DiagnosticTrace(Mock(), runtime)
+            trace.start()
+            with self.subTest(result=result), self.assertRaises(RuntimeError):
+                trace.stop()
+            self.assertEqual(trace.stop_status, "FAILED")
+        interrupt = KeyboardInterrupt()
+        runtime = SimpleNamespace(cudaProfilerStart=Mock(side_effect=interrupt),
+                                  cudaProfilerStop=Mock(return_value=(0,)))
+        trace = h.DiagnosticTrace(Mock(), runtime)
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            trace.start()
+        self.assertIs(caught.exception, interrupt)
+        trace.close(interrupt)
+        runtime.cudaProfilerStop.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()
