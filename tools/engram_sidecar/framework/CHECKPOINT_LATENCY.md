@@ -213,3 +213,96 @@ python -B tools/engram_sidecar/framework/test_checkpoint_latency.py -v
 
 These UTs do not execute GPU timing, complete-table allocation, Graphs or remote
 reads. Actual GPU results must be recorded separately.
+
+## Optional NVTX / Nsight diagnostics
+
+Both diagnostic flags are **off by default**. Normal runs make no NVTX or CUDA
+Profiler API calls, retain their existing fields and use the same timing event,
+replay, synchronization and correctness sequence. Diagnostics are a separate
+experiment with a fresh output directory; never replace previous latency runs.
+Do not overlap this experiment with compilation, other GPU measurements or
+full-model startup on the tested consumer.
+
+- `--diagnostic-nvtx` brackets each measured local/remote invocation with a host
+  NVTX range. Labels include only layer numbers, batch, mode, distribution,
+  pair number, path name and execution-order index. They contain no row IDs,
+  table contents, capabilities, addresses or filesystem paths. Labels are built
+  before scratch/input synchronization, outside both clocks. Push occurs after
+  that synchronization and before thread-counter/wall timing; pop occurs after
+  the completion timestamp and thread counter. No NVTX call is inserted inside
+  captured Graphs or the measured wall/event interval.
+- `--diagnostic-cuda-profiler` additionally starts CUDA profiling after warmup,
+  capture and both premeasurement actual-output checks. It stops after the last
+  paired invocation completes, before the final CPU oracle check. This requires
+  NVTX and exactly **one layer group, batch, mode and distribution**. Existing
+  together mode can select the real two-layer chain as that one group. A normal
+  Start/Stop must return explicit CUDA success; failed Stop refuses a successful
+  summary. Error paths attempt balanced marker cleanup and Stop while preserving
+  the original exception. They retain the existing Graph/storage failure chain.
+
+`run.json`, `complete.json`, diagnostic raw records and summaries are marked
+`PROFILE_ONLY`; raw records also carry their exact `diagnostic_nvtx_range` label.
+Summary comparison labels become `PROFILE_ONLY` while actual counts/quantiles
+remain available. A successful API return is not proof Nsight collected a valid
+trace: `summary.diagnostics` records API and marker bookkeeping and requires a
+separate Nsight artifact. These profiled numbers are not SLO acceptance results,
+even when small, and do not override any earlier anomaly.
+
+The following command uses options checked against the installed Nsight Systems
+2026.3.2 help. Replace all example paths and choose the actual source NUMA node.
+Use fresh private result/profile directories; preserve the original private
+bundle/oracle inputs and keep the Owner alive as for an ordinary run.
+
+```bash
+umask 077
+nsys profile \
+  --trace=cuda,nvtx,osrt --cuda-graph-trace=node:host-only \
+  --sample=none --cpuctxsw=process-tree \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  --discard-environment=true \
+  -o /absolute/private-profile/fresh-joint-M1-random \
+  python tools/engram_sidecar/framework/checkpoint_latency.py \
+    --checkpoint /absolute/consumer-checkpoint \
+    --source-checkpoint /absolute/private-original-table-source \
+    --bundle /absolute/private-consumer/bundle.json \
+    --private-inputs /absolute/private-oracle/oracle.json \
+    --output /absolute/results/fresh-profile-only-M1 \
+    --layer-mode together --layers 1,14 \
+    --batches 1 --modes graph --distributions random \
+    --samples 10000 --warmup 20 --seed 20261023 \
+    --source-cache-numa 1 --discard-private-source-cache \
+    --l2-disturb --calibration-samples 0 \
+    --diagnostic-nvtx --diagnostic-cuda-profiler
+```
+
+`capture-range-end=stop` ends collection while allowing the process to continue
+through oracle verification and ordered cleanup. Do not substitute
+`stop-shutdown`, which can terminate the target before those checks. The node
+trace records individual graph-node activities and may add significant runtime
+overhead. This setup uses host launch ranges and does not require experimental
+`nvtx-precapture` or capture-time NVTX projection onto nodes.
+
+For an anomalous raw pair, find its full NVTX label, then the `cudaGraphLaunch`
+inside that range. Follow its CUDA correlation/graph/stream identity to the GPU
+node timeline, retaining the paired other backend and nearby pairs. The two
+same-named lookup nodes belong to the source-ordered layers 1 then 14; check the
+actual captured node sequence instead of assigning layers from a kernel name
+alone. A tuple Graph's actual outputs still undergo the independent layer-by-
+layer checks outside capture. `wall_begin_perf_counter_ns` is useful within the
+raw run, but its origin must not be assumed equal to Nsight's time axis; labels
+and CUDA launch correlation provide the association.
+
+Distinguish a long kernel/node activity, a gap between nodes, a long host launch
+call, and a long completion API call. Event intervals alone do not distinguish
+those causes. Thread context-switch events and OS runtime spans can supply more
+evidence, but neither automatic OS nor fabric blame is justified. A repeated
+seed/pair does not guarantee reproduction of a transient system anomaly.
+Scratch remains `scratch_disturbed_not_guaranteed_cold`, with its execution
+outside both measured clocks but visible in the surrounding captured range.
+
+Keep `.nsys-rep` and exports private: despite disabling environment capture,
+profilers can retain command-line paths, API addresses and system metadata.
+Only reviewed, redacted evidence should enter a public result report. CPU tests
+cover marker/clock ordering, tuple replay oracle boundaries, default no-op
+behavior and failure/Stop handling; they cannot certify node trace collection
+or a GPU performance result.
