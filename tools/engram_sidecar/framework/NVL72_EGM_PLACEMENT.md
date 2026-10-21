@@ -157,3 +157,13 @@ consumer 本地 C2C 在 55 s 内没有 GB 级 bulk 流量，支持“读取经 G
 **边界：** owner PMU 是 system-wide、55 s 窗口；v2 另一 C2C PMU 的 121 GB 总计数与本轮采样区间不对应，按背景流量保留，不归因给本次读取。该实验只证明 **N1 功能路径**（内容、计数口径、consumer 本地无 bulk），不证明带宽、延迟或逐 step ≤100 μs。GPU2 的本地 pinned 基线是另一项组件 screen，不能与 N1 的远端时延混用。
 
 **矩阵状态：** N0（GPU0）与 N1（GPU2）功能格已实测通过；N2、F2、EP、C1 仍未执行。consumer Grace 组变化没有破坏远端读取路径，但尚不能回答跨组延迟差异。
+
+## 11. F2：GPU0 + GPU2 并发读同一 owner backing
+
+consumer 的 GPU0 与 GPU2（两个 Grace 组）同时映射同一 owner 的两张完整表，并行执行 N=4 / 2N=8。两路都 `exact_bf16=true`、exit 0，READY/GO 同时满足；CLOSED 7.407 s / 7.511 s，单路逻辑均为 2,179,457,280 / 4,358,914,560 B。
+
+两路逻辑合计 **13,076,743,680 B**；owner `c2c0_pmu_0` 窗口累计 **14,307,650,560 B**，比值 **1.09413**（单路约 1.09095，高 0.29%）。owner 逐 0.5 s 增量出现 4.755/6.473/3.038 GB 的分段，符合两路窗口部分重叠与采样边界切分，未强行归给单路。
+
+**边界：** 这是功能并发，不是固定 offered load 的带宽/尾延迟实验；owner PMU system-wide、55 s；另一 C2C PMU 的 32 GB 背景流量不归因；consumer 本地 C2C 未采。不能据此声称单路延迟不变或 owner 热点上限。
+
+**矩阵状态：** N0、N1、F2 功能格通过；N2、EP、C1、F4 仍未执行。
