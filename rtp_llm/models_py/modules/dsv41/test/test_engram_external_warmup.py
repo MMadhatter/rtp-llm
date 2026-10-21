@@ -8,6 +8,7 @@ boundaries; cache-key creation, metadata access and the warmup loop are real.
 
 from contextlib import ExitStack
 import os
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -28,6 +29,7 @@ class ExternalEmbeddingForWarmup(engram.HostEngramEmbedding):
         self._uses_external_storage = True
         self._table_shape = table_shape
         self._num_sms = 2
+        self._pinned = None
         self.lookups = []
 
     def __call__(self, indices, device):
@@ -36,11 +38,26 @@ class ExternalEmbeddingForWarmup(engram.HostEngramEmbedding):
         self.lookups.append((indices.clone(), str(device)))
 
 
+class LocalEmbeddingForWarmup(ExternalEmbeddingForWarmup):
+    """Same kernel boundary with real small CPU tensors and local capabilities."""
+
+    def __init__(self, table_shape):
+        engram.HostEngramEmbedding.__init__(
+            self, torch.empty(table_shape, dtype=torch.uint8),
+            torch.empty((table_shape[0], table_shape[1] // 32), dtype=torch.uint8),
+        )
+        self._num_sms = 2
+        self.lookups = []
+
+
 class ExternalEngramWarmupTest(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        self.stack.enter_context(mock.patch.dict(os.environ, {"WARM_UP": "1", "MODEL_WARM_UP": "1"}))
+        self.stack.enter_context(mock.patch.dict(os.environ, {
+            "WARM_UP": "1", "MODEL_WARM_UP": "1",
+            "DSV41_CPU_ENGRAM_LOOKUP": "1", "DSV41_ASYNC_ENGRAM_LOOKUP": "0",
+        }))
         self.stack.enter_context(mock.patch.object(warmup, "_ENGRAM_WARMED", set()))
         for name in ("_lazy_init", "init", "synchronize", "current_device"):
             self.stack.enter_context(mock.patch.object(
@@ -53,6 +70,10 @@ class ExternalEngramWarmupTest(unittest.TestCase):
             side_effect=lambda label, description, launch, **kwargs: launch(),
         ))
         self.gate = self.stack.enter_context(mock.patch.object(engram, "gated_engram_residual"))
+        self.cpu_runtime = self.stack.enter_context(mock.patch.object(
+            engram, "EngramCPULookupRuntime",
+            side_effect=AssertionError("CPU runtime must not use external host views"),
+        ))
 
         # Only CUDA placement is changed. Real torch tensors exercise slicing,
         # contiguity and masking in the production loop. Large allocations fail.
@@ -90,11 +111,19 @@ class ExternalEngramWarmupTest(unittest.TestCase):
             layout=SimpleNamespace(layer_ids=(1, 14), n_hash_cols=4, head_dim=32, max_ngram_size=3),
             hash_token_windows=mock.Mock(side_effect=hash_windows),
         )
-        layers = [SimpleNamespace(engram=SimpleNamespace(
+        self.active_layers = [SimpleNamespace(engram=SimpleNamespace(
             embed_tokens=embedding, q_weight=torch.ones((4, 8)),
             k_weight=torch.ones((4, 8)), eps=1e-20, layer_hash_index=index,
+            prepare_lookup_prefetch=mock.Mock(), _lookup_stream=None,
         )) for index, embedding in enumerate(self.embeddings)]
-        self.model = SimpleNamespace(_engram_hash_state=self.state, v4=SimpleNamespace(layers=layers))
+        layers = [SimpleNamespace(engram=None) for _ in range(15)]
+        for layer_id, layer in zip(self.state.layout.layer_ids, self.active_layers):
+            layers[layer_id] = layer
+        self.model = SimpleNamespace(
+            _engram_hash_state=self.state, v4=SimpleNamespace(layers=layers),
+            _engram_layers=((1, 0), (14, 1)), _engram_cpu_runtime=None,
+            _is_decode_role=False,
+        )
 
     def run_warmup(self):
         warmup.warmup_v41_engram_jit(self.model, max_m=3, device="cuda:0")
@@ -114,6 +143,9 @@ class ExternalEngramWarmupTest(unittest.TestCase):
         self.assertTrue(self.allocation_numels)
         self.assertLess(max(self.allocation_numels), 65536)
         self.assertEqual(len(warmup._ENGRAM_WARMED), 1)
+        self.cpu_runtime.assert_not_called()
+        for layer in self.active_layers:
+            layer.engram.prepare_lookup_prefetch.assert_not_called()
 
     def test_cache_uses_each_external_table_shape(self):
         self.run_warmup()
@@ -124,13 +156,62 @@ class ExternalEngramWarmupTest(unittest.TestCase):
         old_embedding = self.embeddings[1]
         replacement = ExternalEmbeddingForWarmup((2_000_000_001, 32))
         self.embeddings[1] = replacement
-        self.model.v4.layers[1].engram.embed_tokens = replacement
+        self.model.v4.layers[14].engram.embed_tokens = replacement
         self.run_warmup()
         self.assertEqual(self.state.hash_token_windows.call_count, 6)
         self.assertEqual([len(e.lookups) for e in self.embeddings], [6, 3])
         self.assertEqual(len(old_embedding.lookups), 3)
         self.assertEqual(len(warmup._ENGRAM_WARMED), 2)
-        self.assertEqual(self.sync.call_count, 2)
+        self.assertEqual(self.sync.call_count, 3)
+
+    def test_external_async_flag_skips_special_kernel_and_stream_on_cache_hit(self):
+        with mock.patch.dict(os.environ, {
+            "DSV41_CPU_ENGRAM_LOOKUP": "0", "DSV41_ASYNC_ENGRAM_LOOKUP": "1",
+        }), mock.patch.object(
+            ExternalEmbeddingForWarmup, "warmup_prefetch",
+            side_effect=AssertionError("external prefetch warmup must not run"),
+        ) as prefetch:
+            self.run_warmup()
+            self.run_warmup()
+        self.assertEqual(self.state.hash_token_windows.call_count, 3)
+        prefetch.assert_not_called()
+        self.cpu_runtime.assert_not_called()
+        for layer in self.active_layers:
+            layer.engram.prepare_lookup_prefetch.assert_not_called()
+
+    def test_cache_distinguishes_same_geometry_backend_capabilities(self):
+        for layer in self.active_layers:
+            layer.engram.embed_tokens=ExternalEmbeddingForWarmup((3,32))
+        with mock.patch.dict(os.environ, {
+            "DSV41_CPU_ENGRAM_LOOKUP": "0", "DSV41_ASYNC_ENGRAM_LOOKUP": "0",
+        }):
+            self.run_warmup()
+            for layer in self.active_layers:
+                layer.engram.embed_tokens=LocalEmbeddingForWarmup((3,32))
+            self.run_warmup()
+            self.run_warmup()
+        self.assertEqual(self.state.hash_token_windows.call_count,6)
+        self.assertEqual(len(warmup._ENGRAM_WARMED),2)
+        for layer in self.active_layers:
+            self.assertEqual(layer.engram.prepare_lookup_prefetch.call_count,2)
+        self.cpu_runtime.assert_not_called()
+
+    def test_mixed_warmup_prefetches_only_capable_layer(self):
+        local=LocalEmbeddingForWarmup((3,32))
+        local.warmup_prefetch=mock.Mock()
+        self.model.v4.layers[1].engram.embed_tokens=local
+        name="rtp_llm.models_py.modules.dsv41._engram_triton"
+        kernel=SimpleNamespace(PREFETCH_LOOKUP_CONFIG=(4,4),PREFETCH_LOOKUP_CARVEOUT=100)
+        with mock.patch.dict(os.environ, {
+            "DSV41_CPU_ENGRAM_LOOKUP": "0", "DSV41_ASYNC_ENGRAM_LOOKUP": "1",
+        }), mock.patch.dict(sys.modules,{name:kernel}):
+            self.run_warmup()
+            self.run_warmup()
+        self.assertEqual(local.warmup_prefetch.call_count,3)
+        self.assertEqual(self.model.v4.layers[1].engram.prepare_lookup_prefetch.call_count,2)
+        self.model.v4.layers[14].engram.prepare_lookup_prefetch.assert_not_called()
+        self.assertEqual(len(self.embeddings[1].lookups),3)
+        self.cpu_runtime.assert_not_called()
 
 
 if __name__ == "__main__":

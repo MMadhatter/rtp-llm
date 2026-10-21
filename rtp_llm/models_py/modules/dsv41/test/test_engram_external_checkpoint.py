@@ -150,5 +150,78 @@ class ExternalCheckpointTests(unittest.TestCase):
         external.weight=None
         self.assertEqual(external.table_shape,(1000,32))
 
+    def external_embedding(self):
+        embedding=e.HostEngramEmbedding.__new__(e.HostEngramEmbedding)
+        embedding._uses_external_storage=True
+        embedding.weight=embedding.scales=None
+        embedding._pinned=None
+        return embedding
+
+    def lookup_model(self, embedding):
+        return SimpleNamespace(
+            _is_decode_role=False, _engram_cpu_runtime=None,
+            _engram_layers=((1,0),(14,1)),
+            v4=SimpleNamespace(layers={i:SimpleNamespace(
+                engram=SimpleNamespace(embed_tokens=embedding)
+            ) for i in (1,14)}),
+        )
+
+    def test_cpu_and_prefetch_capabilities_distinguish_backends(self):
+        local=e.HostEngramEmbedding(torch.zeros(3,32,dtype=torch.uint8),torch.ones(3,1,dtype=torch.uint8))
+        external=self.external_embedding()
+        self.assertTrue(local.supports_cpu_lookup)
+        self.assertTrue(local.supports_async_prefetch)
+        self.assertFalse(external.supports_cpu_lookup)
+        self.assertFalse(external.supports_async_prefetch)
+
+    def test_local_default_cpu_lookup_still_prepares_once(self):
+        local=e.HostEngramEmbedding(torch.zeros(3,32,dtype=torch.uint8),torch.ones(3,1,dtype=torch.uint8))
+        model=self.lookup_model(local)
+        runtime=SimpleNamespace(capacity=16,slots={})
+        with patch.dict('os.environ',{},clear=True), \
+             patch.object(e,'EngramCPULookupRuntime',return_value=runtime) as create:
+            self.assertTrue(e.engram_cpu_lookup_enabled())
+            self.assertFalse(e.engram_cpu_lookup_enabled(is_decode_role=True))
+            e.prepare_engram_cpu_lookup(model,max_m=16)
+            e.prepare_engram_cpu_lookup(model,max_m=16)
+        create.assert_called_once_with(model,16)
+        self.assertIs(model._engram_cpu_runtime,runtime)
+
+    def test_external_cpu_flag_never_creates_runtime_or_reads_missing_host_views(self):
+        for env in ({},{'DSV41_CPU_ENGRAM_LOOKUP':'1'},
+                    {'DSV41_CPU_ENGRAM_LOOKUP':'1','DSV41_ASYNC_ENGRAM_LOOKUP':'1'}):
+            model=self.lookup_model(self.external_embedding())
+            with self.subTest(env=env), patch.dict('os.environ',env,clear=True), \
+                 patch.object(e,'EngramCPULookupRuntime',side_effect=AssertionError('CPU runtime for external views')) as create:
+                e.prepare_engram_cpu_lookup(model,max_m=16)
+                e.prepare_engram_cpu_lookup(model,max_m=16)
+                create.assert_not_called()
+                self.assertIsNone(model._engram_cpu_runtime)
+
+    def test_mixed_model_does_not_submit_cpu_work_for_gpu_only_layer(self):
+        local=e.HostEngramEmbedding(torch.zeros(3,32,dtype=torch.uint8),torch.ones(3,1,dtype=torch.uint8))
+        model=self.lookup_model(local)
+        model.v4.layers[14].engram.embed_tokens=self.external_embedding()
+        with patch.dict('os.environ',{'DSV41_CPU_ENGRAM_LOOKUP':'1'}), \
+             patch.object(e,'EngramCPULookupRuntime') as create:
+            e.prepare_engram_cpu_lookup(model,max_m=16)
+        create.assert_not_called()
+
+    def test_external_async_flag_creates_no_stream_event_or_lookup(self):
+        external=self.external_embedding()
+        # Missing CUDA metadata deliberately makes any access beyond the
+        # capability check fail, without initializing a CUDA context.
+        module=SimpleNamespace(embed_tokens=external,_lookup_stream=None)
+        with patch.dict('os.environ',{'DSV41_CPU_ENGRAM_LOOKUP':'0','DSV41_ASYNC_ENGRAM_LOOKUP':'1'}), \
+             patch.object(torch.cuda,'Stream',side_effect=AssertionError('stream created')) as stream, \
+             patch.object(torch.cuda,'Event',side_effect=AssertionError('event created')) as event:
+            e.Engram.prepare_lookup_prefetch(module)
+            self.assertIsNone(e.Engram.prefetch_lookup(module,object()))
+            self.assertIsNone(external.warmup_prefetch(object(),'cuda:0'))
+            with self.assertRaisesRegex(RuntimeError,'asynchronous prefetch is not supported'):
+                external(object(),'cuda:0',prefetch=True)
+        stream.assert_not_called()
+        event.assert_not_called()
+
 
 if __name__=='__main__': unittest.main()

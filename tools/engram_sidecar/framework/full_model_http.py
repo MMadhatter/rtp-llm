@@ -228,6 +228,11 @@ def launch_environment(args, inherited=None):
         "VIT_SEPARATION": "0",
         "DSV4_MOE_STRATEGY": "mega", "DSV4_USE_MEGA_MOE_SE": "0", "DSV4_USE_MEGA_MOE_FUSED": "0",
         "DSV41_SWA_BOUNDED_REPLAY": "0", "DSV41_CED": "0", "FP8_KV_CACHE": "1",
+        # Compare the same direct GPU lookup path on both storage backends.
+        # Release defaults to CPU prefill lookup for local tables, unavailable
+        # to the device-only external EGM view. Default-prefill speed is a
+        # separate experiment, not part of this storage-cost comparison.
+        "DSV41_CPU_ENGRAM_LOOKUP": "0", "DSV41_ASYNC_ENGRAM_LOOKUP": "0",
         "SEQ_SIZE_PER_BLOCK": "128", "KERNEL_SEQ_SIZE_PER_BLOCK": "128",
         "MAX_SEQ_LEN": "4096", "MAX_CONTEXT_BATCH_SIZE": "1", "CONCURRENCY_LIMIT": "1",
         "REUSE_CACHE": "1", "RESERVER_RUNTIME_MEM_MB": "32768", "KV_CACHE_MEM_MB": "8192",

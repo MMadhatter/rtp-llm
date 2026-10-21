@@ -510,6 +510,8 @@ class HostEngramEmbedding:
 
     def warmup_prefetch(self, indices: torch.Tensor, device):
         """Compile and configure the asynchronous lookup during model startup."""
+        if not self.supports_async_prefetch:
+            return
         from rtp_llm.models_py.modules.dsv41._engram_triton import (
             warmup_lookup_prefetch_rows,
         )
@@ -558,6 +560,16 @@ class HostEngramEmbedding:
             return self._table_shape
         return tuple(self.weight.shape)
 
+    @property
+    def supports_cpu_lookup(self):
+        """External Fabric views are GPU addresses, not CPU-readable tensors."""
+        return not self._uses_external_storage
+
+    @property
+    def supports_async_prefetch(self):
+        """External side-stream reader ownership has not been qualified yet."""
+        return not self._uses_external_storage
+
     def release_external_views(self):
         """Drop this embedding's views after the caller has stopped requests."""
         storage = self._external_storage
@@ -570,6 +582,8 @@ class HostEngramEmbedding:
     def __call__(
         self, indices: torch.Tensor, device, *, prefetch=False
     ) -> torch.Tensor:
+        if prefetch and not self.supports_async_prefetch:
+            raise RuntimeError("external Engram asynchronous prefetch is not supported")
         if self._uses_external_storage:
             from rtp_llm.models_py.modules.dsv41 import _engram_triton
 
@@ -1020,6 +1034,17 @@ def prepare_engram_cpu_lookup(model, *, max_m):
         is_decode_role
         or not engram_cpu_lookup_enabled(is_decode_role=is_decode_role)
         or max_m <= 0
+        # Capability selection is startup-only. Do not create a worker, compile
+        # CPU code or dereference None host views for a GPU-only backing.
+        or any(
+            not getattr(
+                model.v4.layers[layer_id].engram.embed_tokens,
+                "supports_cpu_lookup",
+                True,
+            )
+            for layer_id, _ in getattr(model, "_engram_layers", ())
+            if layer_id < 20
+        )
     ):
         return
     runtime = getattr(model, "_engram_cpu_runtime", None)
@@ -1384,7 +1409,8 @@ class Engram(nn.Module):
     def prepare_lookup_prefetch(self):
         """Called after lookup JIT warmup, never from a request or capture."""
         if (
-            not engram_lookup_prefetch_enabled()
+            not getattr(self.embed_tokens, "supports_async_prefetch", True)
+            or not engram_lookup_prefetch_enabled()
             or not self.q_weight.is_cuda
             or self.embed_tokens._uva is None
             or self._lookup_stream is not None
@@ -1405,7 +1431,8 @@ class Engram(nn.Module):
 
     def prefetch_lookup(self, hash_ids):
         if (
-            self._lookup_stream is None
+            not getattr(self.embed_tokens, "supports_async_prefetch", True)
+            or self._lookup_stream is None
             or self._lookup_work is not None
             or not hash_ids.is_cuda
             or hash_ids.device != self.q_weight.device
