@@ -1,0 +1,254 @@
+[
+  {
+    "actual_output_correctness": {
+      "eager": [
+        {
+          "mode": "eager",
+          "phase": "before_measurement",
+          "trace_index": 0
+        },
+        {
+          "mode": "eager",
+          "phase": "before_measurement",
+          "trace_index": 1
+        },
+        {
+          "distribution": "hot",
+          "mode": "eager",
+          "phase": "after_distribution",
+          "trace_index": 0
+        },
+        {
+          "distribution": "random",
+          "mode": "eager",
+          "phase": "after_distribution",
+          "trace_index": 99
+        }
+      ],
+      "graph": [
+        {
+          "mode": "graph",
+          "phase": "before_measurement",
+          "trace_index": 0
+        },
+        {
+          "mode": "graph",
+          "phase": "before_measurement",
+          "trace_index": 1
+        },
+        {
+          "distribution": "hot",
+          "mode": "graph",
+          "phase": "after_distribution",
+          "trace_index": 0
+        },
+        {
+          "distribution": "random",
+          "mode": "graph",
+          "phase": "after_distribution",
+          "trace_index": 99
+        }
+      ]
+    },
+    "complete_counters": {
+      "cleanup_failures": 0,
+      "contexts": 0,
+      "deferred_cleanups": 0,
+      "imports": 0,
+      "mappings": 0,
+      "owner_allocations": 0,
+      "reservations": 0,
+      "view_storages": 0
+    },
+    "layers": [
+      {
+        "alias": {
+          "cuda_allocated_delta_bytes": 0,
+          "scale_alias": true,
+          "weight_alias": true
+        },
+        "budget_checks": "BEFORE_PREFAULT_PREFAULTED_AFTER_LOAD_PASS",
+        "layer": 1,
+        "pinned": {
+          "expected_node": 0,
+          "expected_pages": 1546900,
+          "node_pages": {
+            "0": 1546900
+          },
+          "page_bytes": 65536,
+          "resident_bytes": 101377638400,
+          "resident_pages": 1546900
+        },
+        "source": [
+          {
+            "expected_pages": 1549304,
+            "node_pages": {
+              "1": 1549304
+            },
+            "page_bytes": 65536,
+            "resident_bytes": 101535186944,
+            "resident_pages": 1549304
+          }
+        ]
+      },
+      {
+        "alias": {
+          "cuda_allocated_delta_bytes": 0,
+          "scale_alias": true,
+          "weight_alias": true
+        },
+        "budget_checks": "BEFORE_PREFAULT_PREFAULTED_AFTER_LOAD_PASS",
+        "layer": 14,
+        "pinned": {
+          "expected_node": 0,
+          "expected_pages": 1546943,
+          "node_pages": {
+            "0": 1546943
+          },
+          "page_bytes": 65536,
+          "resident_bytes": 101380456448,
+          "resident_pages": 1546943
+        },
+        "source": [
+          {
+            "expected_pages": 1549346,
+            "node_pages": {
+              "1": 1549346
+            },
+            "page_bytes": 65536,
+            "resident_bytes": 101537939456,
+            "resident_pages": 1549346
+          }
+        ]
+      }
+    ],
+    "run": "screen-v1",
+    "source_files_verified": 7
+  },
+  {
+    "actual_output_correctness": {
+      "eager": [
+        {
+          "mode": "eager",
+          "phase": "before_measurement",
+          "trace_index": 0
+        },
+        {
+          "mode": "eager",
+          "phase": "before_measurement",
+          "trace_index": 1
+        },
+        {
+          "distribution": "hot",
+          "mode": "eager",
+          "phase": "after_distribution",
+          "trace_index": 0
+        },
+        {
+          "distribution": "random",
+          "mode": "eager",
+          "phase": "after_distribution",
+          "trace_index": 9999
+        }
+      ],
+      "graph": [
+        {
+          "mode": "graph",
+          "phase": "before_measurement",
+          "trace_index": 0
+        },
+        {
+          "mode": "graph",
+          "phase": "before_measurement",
+          "trace_index": 1
+        },
+        {
+          "distribution": "hot",
+          "mode": "graph",
+          "phase": "after_distribution",
+          "trace_index": 0
+        },
+        {
+          "distribution": "random",
+          "mode": "graph",
+          "phase": "after_distribution",
+          "trace_index": 9999
+        }
+      ]
+    },
+    "complete_counters": {
+      "cleanup_failures": 0,
+      "contexts": 0,
+      "deferred_cleanups": 0,
+      "imports": 0,
+      "mappings": 0,
+      "owner_allocations": 0,
+      "reservations": 0,
+      "view_storages": 0
+    },
+    "layers": [
+      {
+        "alias": {
+          "cuda_allocated_delta_bytes": 0,
+          "scale_alias": true,
+          "weight_alias": true
+        },
+        "budget_checks": "BEFORE_PREFAULT_PREFAULTED_AFTER_LOAD_PASS",
+        "layer": 1,
+        "pinned": {
+          "expected_node": 0,
+          "expected_pages": 1546900,
+          "node_pages": {
+            "0": 1546900
+          },
+          "page_bytes": 65536,
+          "resident_bytes": 101377638400,
+          "resident_pages": 1546900
+        },
+        "source": [
+          {
+            "expected_pages": 1549304,
+            "node_pages": {
+              "1": 1549304
+            },
+            "page_bytes": 65536,
+            "resident_bytes": 101535186944,
+            "resident_pages": 1549304
+          }
+        ]
+      },
+      {
+        "alias": {
+          "cuda_allocated_delta_bytes": 0,
+          "scale_alias": true,
+          "weight_alias": true
+        },
+        "budget_checks": "BEFORE_PREFAULT_PREFAULTED_AFTER_LOAD_PASS",
+        "layer": 14,
+        "pinned": {
+          "expected_node": 0,
+          "expected_pages": 1546943,
+          "node_pages": {
+            "0": 1546943
+          },
+          "page_bytes": 65536,
+          "resident_bytes": 101380456448,
+          "resident_pages": 1546943
+        },
+        "source": [
+          {
+            "expected_pages": 1549346,
+            "node_pages": {
+              "1": 1549346
+            },
+            "page_bytes": 65536,
+            "resident_bytes": 101537939456,
+            "resident_pages": 1549346
+          }
+        ]
+      }
+    ],
+    "run": "normal-v1",
+    "source_files_verified": 7
+  }
+]

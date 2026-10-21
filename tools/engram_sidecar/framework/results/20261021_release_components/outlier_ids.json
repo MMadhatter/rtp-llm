@@ -1,0 +1,2334 @@
+[
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 201.50398463010788,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 72,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "screen-v1",
+    "wall_delta_us": 203.64799999999997
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 1671.0400208830833,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 90,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "screen-v1",
+    "wall_delta_us": 1671.398
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -1.2480001896619797,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 14,
+    "positive_clocks": [],
+    "run": "screen-v1",
+    "wall_delta_us": -111.425
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 104.22399640083313,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 72,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 104.76899999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 1390.3040289878845,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 157,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1393.1570000000002
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 1104.959987103939,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 169,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1105.572
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 106.65600001811981,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 266,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 106.752
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 117.47200042009354,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 459,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 117.345
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 114.94400352239609,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 653,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 116.06299999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 1509.8239555954933,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 690,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1512.26
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 108.09600353240967,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 710,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 114.272
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 112.73599416017532,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 771,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 112.28699999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 124.4800016283989,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 906,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 125.632
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -150.91201663017273,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 1044,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -151.93599999999998
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 176.32000893354416,
+    "mode": "eager",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 1276,
+    "positive_clocks": [
+      "gpu"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": -785.027
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 140.57599753141403,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1310,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 141.505
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 104.5760065317154,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1444,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 107.42399999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 1005.2479654550552,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1579,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1005.923
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 144.03199404478073,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1714,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 145.76
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 1475.7760390639305,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1846,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1475.429
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 105.3759977221489,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1848,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 109.18499999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -204.44800704717636,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 1861,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -234.785
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 1516.8959945440292,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1941,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1517.507
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 142.33600348234177,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1983,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 143.64800000000002
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 141.02400839328766,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2118,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 141.695
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 114.08000439405441,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2387,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 115.169
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 38.912005722522736,
+    "mode": "eager",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 2425,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -848.995
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 163.90398889780045,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2426,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 169.24899999999997
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 111.77599430084229,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2522,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 111.328
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 103.64799946546555,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2791,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 103.13499999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 123.71200323104858,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2926,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 125.18500000000002
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 105.24800419807434,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3010,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 110.753
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 33.47199410200119,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3030,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 114.27100000000002
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 859.0719774365425,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3195,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 859.907
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 126.14399194717407,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3330,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 126.849
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 973.5679924488068,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3581,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 974.9139999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 130.20800054073334,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3734,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 131.969
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 300.3840073943138,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3863,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 299.84000000000003
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 100.19201040267944,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4003,
+    "positive_clocks": [
+      "gpu"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 99.968
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 138.08000087738037,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4138,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 139.361
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 121.24799937009811,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4407,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 121.21499999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 138.20799440145493,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4418,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 147.20100000000002
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 150.30400454998016,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4542,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 150.784
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 880.7360157370567,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4811,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 883.9069999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 155.87200224399567,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4946,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 158.304
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 1111.2640127539635,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4976,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1118.8519999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 100.22399574518204,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5065,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 101.44099999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 106.65599256753922,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5215,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 105.184
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 507.6160058379173,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5250,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 509.47299999999996
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 173.15200716257095,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5350,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 174.43199999999996
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 104.73600029945374,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5484,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 106.04800000000002
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 545.184001326561,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5526,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 580.769
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 114.46399986743927,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5619,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 114.43299999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 150.59199929237366,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5754,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 151.808
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 116.83200299739838,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6023,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 116.51300000000002
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -1181.120052933693,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 6071,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -1183.396
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 146.2719962000847,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6158,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 147.841
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 387.29599118232727,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6359,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 386.786
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 852.479986846447,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6427,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 854.7539999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 120.31999230384827,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6562,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 120.60699999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -190.88000059127808,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 6650,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -223.2
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 100.832000374794,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6831,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 101.121
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 111.35999858379364,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6966,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 110.721
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 153.28000485897064,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7213,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 157.05599999999998
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 122.079998254776,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7235,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 122.592
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 128.9920061826706,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7370,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 129.631
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -374.7839778661728,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 7495,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -376.961
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 125.05599856376648,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7639,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 124.801
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 118.40000003576279,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7774,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 118.81700000000001
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 137.6960054039955,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7788,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 148.928
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 849.6959879994392,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8043,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 849.283
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 118.30400675535202,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8178,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 120.03300000000002
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -1039.3279641866684,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 8349,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -1040.3220000000001
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 126.11200660467148,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8447,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 126.401
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 129.72799688577652,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8582,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 131.10399999999998
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 390.3359919786453,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8648,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 392.034
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 309.4079867005348,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8940,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 343.32899999999995
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 152.41599828004837,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8986,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 153.825
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 113.50399255752563,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9255,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 113.43900000000001
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 132.35200941562653,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9390,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 132.41699999999997
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 864.9280145764351,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9495,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 869.7950000000001
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 778.4319892525673,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9659,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 778.914
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 323.61600548028946,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9782,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 324.41700000000003
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 122.3360002040863,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9794,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 123.16799999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 267.16799288988113,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 54,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 297.85699999999997
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 140.0960087776184,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 63,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 149.505
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 118.75200271606445,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 198,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 119.36099999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 887.0719969272614,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 338,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 895.746
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 108.89599472284317,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 467,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 108.79899999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 114.78400230407715,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 602,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 113.66499999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 366.7199984192848,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 612,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 366.753
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 124.89600479602814,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 892,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 134.24
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 149.9199941754341,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1006,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 151.168
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 869.8879927396774,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1275,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 868.9949999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 124942.40313768387,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1410,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 124957.333
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 144.16001737117767,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1593,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 145.59999999999997
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 125.280000269413,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 1690,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 126.65700000000001
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 1802.7519956231117,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2075,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1805.254
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 120.54399400949478,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2077,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 122.209
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 821.1519718170166,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2623,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 822.69
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 120.44800817966461,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 2758,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 121.856
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 111.13600432872772,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3027,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 110.785
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 105.59999942779541,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3162,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 105.856
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 180.95999211072922,
+    "mode": "eager",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 3420,
+    "positive_clocks": [
+      "gpu"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": -1374.724
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 104.5759990811348,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3431,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 104.00100000000002
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 118.6240017414093,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3566,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 119.904
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 205.88800311088562,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3702,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 207.52100000000002
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 101.02399438619614,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3835,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 100.767
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -194.39999759197235,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 3963,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -225.408
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 135.71199029684067,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 3970,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 136.321
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 794.559970498085,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4239,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 795.683
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 994.7200119495392,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4240,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 997.122
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 125.98400563001633,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4374,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 127.77600000000001
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 20.736001431941986,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4514,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 244.13
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 101.72799974679947,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4643,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 101.66499999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 122.94400483369827,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4778,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 124.609
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 261.9519904255867,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 4791,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 295.202
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 124.95999783277512,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5006,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 126.49699999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 130.20800054073334,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5182,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 132.065
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 1189.2160177230835,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5327,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1190.788
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 120.7360029220581,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5586,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 120.99300000000001
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 328.8000002503395,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5606,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 329.53799999999995
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 799.9040111899376,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5855,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 800.162
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -204.22399044036865,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 5884,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -234.21
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 126.65600329637527,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 5990,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 127.809
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -141.63200557231903,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 6236,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -142.84900000000002
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 129.40800189971924,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6394,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 130.944
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -1068.8319504261017,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 6421,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -1071.076
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 102.81600058078766,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6663,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 101.921
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 357.6960042119026,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6702,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 359.23199999999997
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 129.7920048236847,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 6798,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 133.185
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 125.69599598646164,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7067,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 126.59200000000001
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 136.89599931240082,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7202,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 137.88800000000003
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 204.6400085091591,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7228,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 205.216
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 893.4399783611298,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7471,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 894.6270000000001
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -1103.5839542746544,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 7525,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -1106.532
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 107.744000852108,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 7606,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 107.615
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -277.0239934325218,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 7798,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -276.448
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 115.42399227619171,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8010,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 116.768
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 118.33600699901581,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8414,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 119.585
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -958.0480307340622,
+    "mode": "eager",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 8660,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -961.5079999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 116.86400324106216,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8683,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 116.513
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 125.98400563001633,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8818,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 121.24900000000001
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 241.37598276138306,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 8946,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 243.168
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 820.2879875898361,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9087,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 820.835
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 130.39999455213547,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9222,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 130.65699999999998
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 117.98400431871414,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9228,
+    "positive_clocks": [
+      "gpu"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": -60.06399999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 102.75200754404068,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9491,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 102.529
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 122.01600521802902,
+    "mode": "eager",
+    "negative_clocks": [],
+    "pair_id": 9626,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 123.20100000000001
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 5.695999599993229,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 121,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 112.223
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -326.62399858236313,
+    "mode": "graph",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 361,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -395.745
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -3.871999680995941,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 673,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 397.025
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 4.543999210000038,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 1308,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1087.4279999999999
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -7.999999448657036,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 1805,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -424.16
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 207.4240054935217,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 2309,
+    "positive_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 240.12899999999996
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 5.98399993032217,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 2329,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 915.683
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 8.544000796973705,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 3316,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 1061.507
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 6.6560013219714165,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 3842,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 391.00800000000004
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 5.98399993032217,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 3985,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 748.195
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -7.424000650644302,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 5394,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 791.459
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 6.240000016987324,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 5641,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 725.058
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 5.951999686658382,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 7297,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 787.075
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": -11.487999930977821,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 7435,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -118268.674
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 9.759999811649323,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 8760,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 2405.48
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 5.791999399662018,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 9071,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -801.4100000000001
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 6.3680000603199005,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 9095,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 159.10500000000002
+  },
+  {
+    "distribution": "hot",
+    "gpu_delta_us": 6.431999616324902,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 9260,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 321.34499999999997
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 1.0559987276792526,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 718,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -794.658
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 5.887999199330807,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 2374,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -857.763
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 4.031999036669731,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 2393,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 166.56
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 4.896000027656555,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 3094,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 318.144
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 5.856000818312168,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 3584,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -256.385
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -3.3279992640018463,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 3621,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 201.08800000000002
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 2.01600044965744,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 4030,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -713.347
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -6.239999085664749,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 4600,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -104.70400000000001
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 1.5999991446733475,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 5686,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -856.002
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -7.999999448657036,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 6575,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -1318.595
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 5.983998998999596,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 7342,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -693.5709999999999
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": -127.3920051753521,
+    "mode": "graph",
+    "negative_clocks": [
+      "gpu",
+      "wall"
+    ],
+    "pair_id": 8357,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -129.728
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 4.543999210000038,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 8585,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -1287.78
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 4.0000006556510925,
+    "mode": "graph",
+    "negative_clocks": [
+      "wall"
+    ],
+    "pair_id": 8998,
+    "positive_clocks": [],
+    "run": "normal-v1",
+    "wall_delta_us": -768.067
+  },
+  {
+    "distribution": "random",
+    "gpu_delta_us": 4.480000585317612,
+    "mode": "graph",
+    "negative_clocks": [],
+    "pair_id": 9083,
+    "positive_clocks": [
+      "wall"
+    ],
+    "run": "normal-v1",
+    "wall_delta_us": 324.865
+  }
+]

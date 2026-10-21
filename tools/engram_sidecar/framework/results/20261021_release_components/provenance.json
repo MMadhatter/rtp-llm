@@ -1,0 +1,148 @@
+[
+  {
+    "full_original_raw_preserved_privately": true,
+    "run": "screen-v1",
+    "source_archive_sha256": "d44ac77f8e03c8ddef5689ad335c33041d4f7477b4e413447c509302436df85a",
+    "source_file_sha256": {
+      "rtp_llm/models_py/modules/dsv41/_engram_triton.py": "d5b9f28087177e373a297da52d3c3aec08b7e30c4e8b027d8873bd0af2c7a36b",
+      "rtp_llm/models_py/modules/dsv41/engram.py": "a21351db8752211004721abd5be134b0271093a7e17e7e629a43054e822bffb0",
+      "rtp_llm/models_py/modules/dsv41/engram_bootstrap.py": "4d5fd31f1691f9e37569677bcc0e924319b7b74715932648bdc9c9f528c998cc",
+      "rtp_llm/models_py/modules/dsv41/engram_storage.py": "d38665e51fecf4808bc9a6e322d76571ea0fe34b66c99e6919be869bfa0fbf4f",
+      "tools/engram_sidecar/framework/checkpoint_latency.py": "0846ffa7424442263efb8e3bf99b3d1153d8855b4c33243925c70a9fb9072280",
+      "tools/engram_sidecar/framework/checkpoint_lookup.py": "c75237eaf1fddecec92eff440136eceb2ffe1206d5118cc3ac9847d0b0157a71",
+      "tools/engram_sidecar/latency/bench_consumer.py": "1b02ed07ee9ed009f76a68da70816c7abf9032cbd37ec9ea789468688578a69d"
+    },
+    "source_member_sha256": {
+      "baseline-alias-layer1.json": {
+        "bytes": 85,
+        "sha256": "9bc78dfc4b250fece74daa543477853c83381142f3e361b27e95f6de84ba868a"
+      },
+      "baseline-alias-layer14.json": {
+        "bytes": 85,
+        "sha256": "9bc78dfc4b250fece74daa543477853c83381142f3e361b27e95f6de84ba868a"
+      },
+      "complete.json": {
+        "bytes": 432,
+        "sha256": "678521d69caa640e7fcf0db33d42879096e4f6270ce1ec9ef0a4a3af8469c380"
+      },
+      "layers1-14-M1-eager/samples.jsonl": {
+        "bytes": 346937,
+        "sha256": "d863471d5cc84bde4cdfc954db19bd91dbaf3e391b62ba9c8bbead3df5ff36f7"
+      },
+      "layers1-14-M1-eager/summary.json": {
+        "bytes": 17877,
+        "sha256": "f07e579733366f00b39d1608963909231bf6076f9c031bd4ed39efb7dc818c05"
+      },
+      "layers1-14-M1-graph/samples.jsonl": {
+        "bytes": 346499,
+        "sha256": "a21e716ff6f2d8fc05fbe93b92a635668251f766ac0651dd1df6510d9e870418"
+      },
+      "layers1-14-M1-graph/summary.json": {
+        "bytes": 82353,
+        "sha256": "705f5ef6bc400bf374ddf06d6601fe1fc0c086f9fde60719398d52d6283f509a"
+      },
+      "memory-layer1-after.json": {
+        "bytes": 281,
+        "sha256": "789fa5406c3ef4e344857e56deb8cbcfe7970fd6d41f735034809387f269293b"
+      },
+      "memory-layer1-before.json": {
+        "bytes": 280,
+        "sha256": "d75e843b6f3aadb063839e2843299eaf5f3d033be65528ad56e6feb84aa850a0"
+      },
+      "memory-layer14-after.json": {
+        "bytes": 279,
+        "sha256": "8f5aeb1af3e311a66207ff338ac7ad7e58e41bd8248bac1f8da0eb354bff47ef"
+      },
+      "memory-layer14-before.json": {
+        "bytes": 281,
+        "sha256": "be711819afa293afabd38fc3006e20f4c6264386d8d315d634d784e7827e0023"
+      },
+      "run.json": {
+        "bytes": 2412,
+        "sha256": "70d928aae15e175a7611dc246ba520c3cec20361298502f963a5238966aa23f8"
+      },
+      "source-cache-layer1.json": {
+        "bytes": 2739,
+        "sha256": "14711789511a195c328f3e190eb825650d940384a38a9e9ed104e4c80fd52a46"
+      },
+      "source-cache-layer14.json": {
+        "bytes": 2738,
+        "sha256": "424aa8ef8fa783b498841dea1e2ff4f2a3b4d04e77941514e3dda80725ab04c5"
+      }
+    },
+    "trace_seed": 20261021
+  },
+  {
+    "full_original_raw_preserved_privately": true,
+    "run": "normal-v1",
+    "source_archive_sha256": "bf502f00520ca3c954ad1912ce1edcc60d4aafee674c6f30ac5fc94ae5668eb6",
+    "source_file_sha256": {
+      "rtp_llm/models_py/modules/dsv41/_engram_triton.py": "d5b9f28087177e373a297da52d3c3aec08b7e30c4e8b027d8873bd0af2c7a36b",
+      "rtp_llm/models_py/modules/dsv41/engram.py": "a21351db8752211004721abd5be134b0271093a7e17e7e629a43054e822bffb0",
+      "rtp_llm/models_py/modules/dsv41/engram_bootstrap.py": "4d5fd31f1691f9e37569677bcc0e924319b7b74715932648bdc9c9f528c998cc",
+      "rtp_llm/models_py/modules/dsv41/engram_storage.py": "d38665e51fecf4808bc9a6e322d76571ea0fe34b66c99e6919be869bfa0fbf4f",
+      "tools/engram_sidecar/framework/checkpoint_latency.py": "0846ffa7424442263efb8e3bf99b3d1153d8855b4c33243925c70a9fb9072280",
+      "tools/engram_sidecar/framework/checkpoint_lookup.py": "c75237eaf1fddecec92eff440136eceb2ffe1206d5118cc3ac9847d0b0157a71",
+      "tools/engram_sidecar/latency/bench_consumer.py": "1b02ed07ee9ed009f76a68da70816c7abf9032cbd37ec9ea789468688578a69d"
+    },
+    "source_member_sha256": {
+      "baseline-alias-layer1.json": {
+        "bytes": 85,
+        "sha256": "9bc78dfc4b250fece74daa543477853c83381142f3e361b27e95f6de84ba868a"
+      },
+      "baseline-alias-layer14.json": {
+        "bytes": 85,
+        "sha256": "9bc78dfc4b250fece74daa543477853c83381142f3e361b27e95f6de84ba868a"
+      },
+      "complete.json": {
+        "bytes": 432,
+        "sha256": "678521d69caa640e7fcf0db33d42879096e4f6270ce1ec9ef0a4a3af8469c380"
+      },
+      "layers1-14-M1-eager/samples.jsonl": {
+        "bytes": 34848116,
+        "sha256": "72c8e232740475f62934d73531d566d1719348827858765b23dcd25414ee7169"
+      },
+      "layers1-14-M1-eager/summary.json": {
+        "bytes": 17897,
+        "sha256": "ade4803da9f4278c88d333a7357fe73f5440b1985ecfe211f435a48872b0b92e"
+      },
+      "layers1-14-M1-graph/samples.jsonl": {
+        "bytes": 34814524,
+        "sha256": "e06bb606436811aa4f7e20ded653ef6dc2bf6b7c0035dbbc20c6d224a4be5410"
+      },
+      "layers1-14-M1-graph/summary.json": {
+        "bytes": 82402,
+        "sha256": "47150b38ebbd6a9fdbbb359503126d7a35a4165e2bfe3ef5eff0f2ec6d234003"
+      },
+      "memory-layer1-after.json": {
+        "bytes": 281,
+        "sha256": "6fc42f5fa57fe5a0095f201c2150aed1cfe988b6c1a6b4431921073ff3009f94"
+      },
+      "memory-layer1-before.json": {
+        "bytes": 280,
+        "sha256": "da549ac91bdc569879a6cf1038b443bf0f7750e6e1e860007ca7d0b87b265f51"
+      },
+      "memory-layer14-after.json": {
+        "bytes": 279,
+        "sha256": "90a0539183e7dff9567f7db9f3729ad6fa527c2418718fe63e25fa4e1df8a1bc"
+      },
+      "memory-layer14-before.json": {
+        "bytes": 281,
+        "sha256": "ead736fcd44145ec85786b041abfffb346617c4add5f7a7fad851b134128ae01"
+      },
+      "run.json": {
+        "bytes": 2414,
+        "sha256": "f2db23b6bd15b22621655ecc3eb3bed66ec3cacba40f8aa2b97e7c4a597b5da6"
+      },
+      "source-cache-layer1.json": {
+        "bytes": 2739,
+        "sha256": "3f16f83593a1fe2c790e5cbd2cb5ff04a795f2564a7b108dbaa88a3cc0e222d0"
+      },
+      "source-cache-layer14.json": {
+        "bytes": 2738,
+        "sha256": "5274cefb4b318c475d3be6418e4ed4ea182adba237db2e05512751750be3b004"
+      }
+    },
+    "trace_seed": 20261021
+  }
+]

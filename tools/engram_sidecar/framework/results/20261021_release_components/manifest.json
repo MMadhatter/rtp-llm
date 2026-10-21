@@ -1,0 +1,23 @@
+{
+  "files": {
+    "README.md": "a8325c9e3974e0c81a966abf0c338dd92dde4fa1d4b9070d61d3e3e4ad39623e",
+    "anomaly_neighborhoods.json": "a07bc6bf927a0ab8f8b4c1c764962b45f8c18b619888a63f75a54e73f585f91d",
+    "instrumentation.json": "b91f6e09277949136669b7865f67bdea4c42291aaec24fb7bec18d7a73015ee9",
+    "metrics.json": "667eb7c0641d3bea48e91dcc132af5768b5dfb1e16032913b7d990d7d0e04d27",
+    "metrics.tsv": "3ef8981e9ac716af43a7b452224fd59574bdb884b5d3f309b6663211d85f070b",
+    "outlier_ids.json": "5164994a14e43424a79aa49a903e486257a0fac8ecfe87c97ebad8565aa6c879",
+    "outliers.jsonl": "4f0c3024a100d0e3c37190f0a2797ce84c5ad70362b0d5d849206d8e20887d63",
+    "paired_samples.jsonl.gz": "3b9cc102c43f853be9c142470f3f8551261001a7bc5171671fd2a67084509c10",
+    "provenance.json": "f81c118c1fab5f55050670fcc83dff1723a036828e467b982a8f57b4e810f789",
+    "validation.json": "5fc48aecda17f8f15cbfd566f1a2c6a91b3c84ec3e56ff4ffcbb73fb51aec905"
+  },
+  "original_archives_retained_privately": true,
+  "public_projection_only": true,
+  "verification": {
+    "all_published_pairs_reaudited": 40400,
+    "links": "PASS",
+    "privacy_scan": "PASS",
+    "signed_outlier_pairs": 182,
+    "source_commit": "3ac1fbda79b3509b554b562775a46138d586afd3"
+  }
+}

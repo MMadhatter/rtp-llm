@@ -1,0 +1,112 @@
+[
+  {
+    "empty_graph_wall": {
+      "max_us": 4.736,
+      "mean_us": 3.74721,
+      "min_us": 3.296,
+      "n": 100,
+      "over_threshold_count": 0,
+      "over_threshold_fraction": 0.0,
+      "p50_us": 3.744,
+      "p95_us": 4.16,
+      "p99_9_us": 4.736,
+      "p99_us": 4.736,
+      "quantile_method": "nearest_rank",
+      "stdev_us": 0.2727752662907691,
+      "threshold_us": 100.0
+    },
+    "event_nodes_only": {
+      "cpu_submit_to_event_complete": {
+        "max_us": 25.184,
+        "mean_us": 15.88166,
+        "min_us": 14.624,
+        "n": 100,
+        "over_threshold_count": 0,
+        "over_threshold_fraction": 0.0,
+        "p50_us": 15.808,
+        "p95_us": 16.64,
+        "p99_9_us": 25.184,
+        "p99_us": 18.56,
+        "quantile_method": "nearest_rank",
+        "stdev_us": 1.1402288298407475,
+        "threshold_us": 100.0
+      },
+      "gpu_graph_event": {
+        "max_us": 3.3599999733269215,
+        "mean_us": 3.3398399665020406,
+        "min_us": 3.3279999624937773,
+        "n": 100,
+        "over_threshold_count": 0,
+        "over_threshold_fraction": 0.0,
+        "p50_us": 3.3279999624937773,
+        "p95_us": 3.3599999733269215,
+        "p99_9_us": 3.3599999733269215,
+        "p99_us": 3.3599999733269215,
+        "quantile_method": "nearest_rank",
+        "stdev_us": 0.015449743092142523,
+        "threshold_us": 100.0
+      },
+      "zero_gpu_timestamp_samples": 0
+    },
+    "expected_empty_graph_warning": true,
+    "run": "screen-v1",
+    "samples_per_control": 100,
+    "status": "MEASURED_DIAGNOSTIC_ONLY",
+    "subtracted": false
+  },
+  {
+    "empty_graph_wall": {
+      "max_us": 12.576,
+      "mean_us": 4.12993,
+      "min_us": 3.36,
+      "n": 100,
+      "over_threshold_count": 0,
+      "over_threshold_fraction": 0.0,
+      "p50_us": 3.968,
+      "p95_us": 4.8,
+      "p99_9_us": 12.576,
+      "p99_us": 5.024,
+      "quantile_method": "nearest_rank",
+      "stdev_us": 0.9081230561438247,
+      "threshold_us": 100.0
+    },
+    "event_nodes_only": {
+      "cpu_submit_to_event_complete": {
+        "max_us": 18.88,
+        "mean_us": 16.62502,
+        "min_us": 15.584,
+        "n": 100,
+        "over_threshold_count": 0,
+        "over_threshold_fraction": 0.0,
+        "p50_us": 16.544,
+        "p95_us": 17.472,
+        "p99_9_us": 18.88,
+        "p99_us": 18.113,
+        "quantile_method": "nearest_rank",
+        "stdev_us": 0.5012078008171862,
+        "threshold_us": 100.0
+      },
+      "gpu_graph_event": {
+        "max_us": 3.488000016659498,
+        "mean_us": 3.3996799867600203,
+        "min_us": 3.3919999841600657,
+        "n": 100,
+        "over_threshold_count": 0,
+        "over_threshold_fraction": 0.0,
+        "p50_us": 3.3919999841600657,
+        "p95_us": 3.42399999499321,
+        "p99_9_us": 3.488000016659498,
+        "p99_us": 3.42399999499321,
+        "quantile_method": "nearest_rank",
+        "stdev_us": 0.01575492837372148,
+        "threshold_us": 100.0
+      },
+      "zero_gpu_timestamp_samples": 0
+    },
+    "expected_empty_graph_warning": true,
+    "run": "normal-v1",
+    "samples_per_control": 100,
+    "status": "MEASURED_DIAGNOSTIC_ONLY",
+    "subtracted": false
+  }
+]
