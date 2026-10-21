@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+import ctypes
 import gc
 import hashlib
 import importlib
@@ -33,6 +34,7 @@ from tools.engram_sidecar.latency import bench_consumer as bench
 
 COMPARISONS = {"raw_remote_minus_raw_local": ("remote_raw", "local_raw")}
 _FAILED_RESOURCES = []
+SOURCE_TOUCH_BYTES = 8 << 20
 
 
 def emit(status, **values):
@@ -68,6 +70,11 @@ def check_options(args):
         raise ValueError("invalid seed, calibration count or threshold")
     if args.layer_mode not in ("single", "together") or args.memory_headroom_gib < 1:
         raise ValueError("valid layer mode and positive memory headroom required")
+    if args.source_cache_numa is not None:
+        if type(args.source_cache_numa) is not int or args.source_cache_numa < 0:
+            raise ValueError("source cache NUMA must be a nonnegative integer")
+        if not args.discard_private_source_cache:
+            raise ValueError("source cache NUMA requires explicit private-source cache advice")
     for name in ("checkpoint", "source_checkpoint", "bundle", "private_inputs", "output"):
         if not getattr(args, name).is_absolute():
             raise ValueError("all input/output paths must be absolute")
@@ -156,13 +163,43 @@ def read_cgroup_memory(current, mount, hierarchy_root):
     return groups
 
 
-def memory_snapshot(node):
+def memory_snapshot(node, source_node=None):
     current, mount, hierarchy_root = resolve_cgroup_directory(Path("/proc/self/cgroup").read_text(),
                                                              Path("/proc/self/mountinfo").read_text())
     groups = read_cgroup_memory(current, mount, hierarchy_root)
-    return dict(cgroups=groups, shm_free_bytes=shutil.disk_usage("/dev/shm").free,
+    result = dict(cgroups=groups, shm_free_bytes=shutil.disk_usage("/dev/shm").free,
                 host_available_bytes=parse_kib_field(Path("/proc/meminfo").read_text(), "MemAvailable"),
                 numa_free_bytes=parse_kib_field(Path(f"/sys/devices/system/node/node{node}/meminfo").read_text(), "MemFree"))
+    if source_node is not None:
+        result["source_numa_free_bytes"] = parse_kib_field(
+            Path(f"/sys/devices/system/node/node{source_node}/meminfo").read_text(), "MemFree")
+    return result
+
+
+def check_source_cache_budget(snapshot, *, table_bytes, source_bytes, headroom_bytes, phase):
+    """Count all source files together; only verified resident pages remove a future charge."""
+    if phase not in ("before_prefault", "prefaulted", "after_load"):
+        raise ValueError("invalid source cache admission phase")
+    if min(table_bytes, source_bytes) < 0 or headroom_bytes <= 0:
+        raise ValueError("nonnegative allocation sizes and positive headroom required")
+    table = table_bytes if phase != "after_load" else 0
+    source = source_bytes if phase == "before_prefault" else 0
+    margin = headroom_bytes + SOURCE_TOUCH_BYTES
+    required = table + source + margin
+    for group in snapshot["cgroups"]:
+        if group["max_bytes"] is not None and group["max_bytes"] - group["current_bytes"] < required:
+            raise RuntimeError("insufficient measured cgroup headroom for source NUMA staging")
+    if snapshot["host_available_bytes"] < required:
+        raise RuntimeError("insufficient host headroom for source NUMA staging")
+    if snapshot["numa_free_bytes"] < table + margin:
+        raise RuntimeError("insufficient GPU-local NUMA headroom for pinned baseline")
+    if snapshot["source_numa_free_bytes"] < source + margin:
+        raise RuntimeError("insufficient source NUMA headroom for complete source files")
+    if snapshot["shm_free_bytes"] < table:
+        raise RuntimeError("insufficient /dev/shm for complete pinned baseline")
+    return dict(phase=phase, future_table_bytes=table, future_source_bytes=source,
+                transient_touch_bytes=SOURCE_TOUCH_BYTES, reserved_headroom_bytes=headroom_bytes,
+                snapshot=snapshot)
 
 
 def check_memory_budget(snapshot, *, table_bytes, source_bytes, headroom_bytes, before):
@@ -221,6 +258,200 @@ def private_source_cache_advice(source, paths):
         finally:
             os.close(fd)
     return advised
+
+
+def rounded_mapping_bytes(size, page_size):
+    if type(size) is not int or size <= 0 or size > sys.maxsize:
+        raise ValueError("source mmap size must fit positive signed pointer size")
+    if type(page_size) is not int or page_size <= 0 or page_size & (page_size - 1):
+        raise ValueError("invalid host page size")
+    rounded = ((size + page_size - 1) // page_size) * page_size
+    if rounded > sys.maxsize:
+        raise ValueError("page-rounded source mmap size overflow")
+    return rounded
+
+
+def parse_complete_numa_pages(text, address, node, size, page_size, *, marker="file="):
+    """Require every page, including the partial final page, on exactly one node."""
+    matches = [line for line in text.splitlines() if line.split()
+               and int(line.split()[0], 16) == address and marker in line]
+    if len(matches) != 1:
+        raise RuntimeError("cannot uniquely identify complete source/pinned mapping")
+    pages = {int(n): int(count) for n, count in re.findall(r"\bN(\d+)=(\d+)\b", matches[0]) if int(count)}
+    sizes = re.findall(r"\bkernelpagesize_kB=(\d+)\b", matches[0])
+    expected = rounded_mapping_bytes(size, page_size) // page_size
+    if len(sizes) != 1 or int(sizes[0]) * 1024 != page_size:
+        raise RuntimeError("source/pinned mapping page-size accounting is unsupported")
+    if set(pages) != {node} or sum(pages.values()) != expected:
+        raise RuntimeError("source/pinned mapping is incomplete or has pages on another NUMA node")
+    return dict(node_pages={str(n): count for n, count in pages.items()}, expected_node=node,
+                expected_pages=expected, resident_pages=sum(pages.values()), page_bytes=page_size,
+                resident_bytes=expected * page_size)
+
+
+def cpu_on_node(node, allowed):
+    selected = set()
+    for part in Path(f"/sys/devices/system/node/node{node}/cpulist").read_text().strip().split(","):
+        low, _, high = part.partition("-")
+        selected.update(range(int(low), int(high or low) + 1))
+    choices = sorted(selected & set(allowed))
+    if not choices:
+        raise RuntimeError("source NUMA has no CPU in the original process affinity")
+    return choices[0]
+
+
+class ReadOnlySourceMapping:
+    """A private file's real PROT_READ/MAP_SHARED mapping; no Python buffer borrowing."""
+
+    def __init__(self, source, path):
+        from tools.engram_sidecar.framework.stage_checkpoint import _canonical, _snapshot
+        source = _canonical(source)
+        directory = source.stat()
+        if directory.st_uid != os.getuid() or stat.S_IMODE(directory.st_mode) != 0o700 or path.parent != source:
+            raise ValueError("source prefault requires a current-UID mode0700 private directory")
+        self.path, self.expected = path, _snapshot(path)
+        self.fd, self.address = None, None
+        self.page_size = os.sysconf("SC_PAGE_SIZE")
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        self.libc.mmap.restype = ctypes.c_void_p
+        self.libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        self.libc.munmap.restype = ctypes.c_int
+        try:
+            self.fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            info = os.fstat(self.fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o400
+                    or (info.st_dev, info.st_ino) != (self.expected["device"], self.expected["inode"])):
+                raise ValueError("source prefault requires private single-link immutable mode0400 files")
+            self.size = info.st_size
+            self.resident_bytes = rounded_mapping_bytes(self.size, self.page_size)
+            # Linux/Unix PROT_READ=1, MAP_SHARED=1. No MAP_POPULATE: first
+            # touches must happen only after binding the source-node CPU.
+            address = self.libc.mmap(None, self.size, 1, 1, self.fd, 0)
+            if address is None or address == ctypes.c_void_p(-1).value:
+                code = ctypes.get_errno()
+                raise OSError(code, "private read-only source mmap failed")
+            self.address = address
+        except BaseException:
+            self.close()
+            raise
+
+    def touch(self):
+        if self.address is None:
+            raise RuntimeError("source mapping is closed")
+        touched = 0
+        for offset in range(0, self.size, SOURCE_TOUCH_BYTES):
+            length = min(SOURCE_TOUCH_BYTES, self.size - offset)
+            block = ctypes.string_at(self.address + offset, length)
+            if len(block) != length:
+                raise RuntimeError("source prefault did not read complete chunk")
+            touched += len(block)
+            del block  # At most one 8MiB transient copy, including between iterations.
+        return touched
+
+    def verify(self, text, node):
+        from tools.engram_sidecar.framework.stage_checkpoint import _unchanged
+        _unchanged(self.path, self.expected)
+        evidence = parse_complete_numa_pages(text, self.address, node, self.size, self.page_size)
+        return dict(file=self.path.name, file_bytes=self.size, **evidence)
+
+    def close(self):
+        try:
+            if self.address is not None:
+                if self.libc.munmap(self.address, self.size):
+                    raise OSError(ctypes.get_errno(), "private read-only source munmap failed")
+                self.address = None
+        finally:
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
+
+
+class SourceCacheBatch:
+    """Keep every verified source mapping alive until main's copy has finished."""
+
+    def __init__(self, source, paths, node, allowed_cpus):
+        self.node, self.allowed_cpus, self.mappings = node, set(allowed_cpus), []
+        try:
+            for path in paths:
+                self.mappings.append(ReadOnlySourceMapping(source, path))
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def resident_bytes(self):
+        return sum(item.resident_bytes for item in self.mappings)
+
+    def prefault(self):
+        previous = os.sched_getaffinity(0)
+        cpu = cpu_on_node(self.node, self.allowed_cpus)
+        try:
+            os.sched_setaffinity(0, {cpu})
+            for item in self.mappings:
+                if item.touch() != item.size:
+                    raise RuntimeError("source prefault did not touch complete file")
+        finally:
+            os.sched_setaffinity(0, previous)
+        return cpu
+
+    def verify(self):
+        text = Path("/proc/self/numa_maps").read_text()
+        return [item.verify(text, self.node) for item in self.mappings]
+
+    def close(self):
+        errors = []
+        for item in reversed(self.mappings):
+            try:
+                item.close()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            retain_failed(self, *errors)
+            raise RuntimeError("private source mapping cleanup remains pending") from errors[0]
+
+
+def construct_with_source_cache(*, source, files, source_node, gpu_node, allowed_cpus,
+                                table_bytes, headroom_bytes, construct):
+    """Admission/setup only. The callback is unchanged main _PinnedSharedTable construction."""
+    if source_node == gpu_node:
+        raise ValueError("source-cache NUMA must differ from GPU-local HOST_NUMA")
+    cache, control, evidence = None, None, {}
+    try:
+        cache = SourceCacheBatch(source, files, source_node, allowed_cpus)
+        source_bytes = cache.resident_bytes
+        rounded_table = rounded_mapping_bytes(table_bytes, os.sysconf("SC_PAGE_SIZE"))
+        def budget(phase):
+            snapshot = memory_snapshot(gpu_node, source_node)
+            return check_source_cache_budget(snapshot, table_bytes=rounded_table, source_bytes=source_bytes,
+                                             headroom_bytes=headroom_bytes, phase=phase)
+        evidence["before_prefault"] = budget("before_prefault")
+        evidence["source_cpu"] = cache.prefault()
+        evidence["source_before_construct"] = cache.verify()
+        evidence["prefaulted"] = budget("prefaulted")
+        # Source mappings remain live; main still creates and registers its own
+        # complete tmpfs-backed table, on the restored GPU-local CPU affinity.
+        control = construct()
+        evidence["source_after_construct"] = cache.verify()
+        evidence["pinned_complete"] = parse_complete_numa_pages(
+            Path("/proc/self/numa_maps").read_text(), control.storage.data_ptr(), gpu_node,
+            table_bytes, os.sysconf("SC_PAGE_SIZE"), marker="rtp_llm_engram_")
+        evidence["after_load"] = budget("after_load")
+        evidence["eviction_prevented"] = False  # mmap is not mlock; verification is fail-closed.
+        return control, evidence
+    except BaseException:
+        if control is not None:
+            retain_failed(control)
+        raise
+    finally:
+        if cache is not None:
+            try:
+                cache.close()
+            except BaseException:
+                if control is not None:
+                    retain_failed(control)
+                raise
 
 
 def parse_numa_pages(text, address, node):
@@ -317,6 +548,27 @@ def make_local_table(source, index, layout, layer, device):
         retain_failed(control)
         raise RuntimeError("source changed while constructing baseline")
     return control
+
+
+def make_local_embedding(control, embedding_type, torch):
+    """Untimed proof that main's two CUDA tensor views alias the registered host table."""
+    before = int(torch.cuda.memory_allocated(control.device))
+    embedding = embedding_type(control.weight, control.scales, pinned=control)
+    delta = int(torch.cuda.memory_allocated(control.device)) - before
+    views = embedding._uva
+    if not isinstance(views, tuple) or len(views) != 2:
+        raise RuntimeError("baseline requires both registered host CUDA views")
+    aliases = []
+    with torch.cuda.device(control.device):
+        for tensor, view in zip((control.weight, control.scales), views):
+            status, pointer = control.runtime.cudaHostGetDevicePointer(tensor.data_ptr(), 0)
+            if int(status):
+                raise RuntimeError("baseline alias verification could not query registered host view")
+            aliases.append(view.data_ptr() == int(pointer))
+    if not all(aliases) or delta != 0:
+        raise RuntimeError("baseline view wrapping must alias both host tensors without CUDA allocation")
+    return embedding, dict(weight_alias=aliases[0], scale_alias=aliases[1],
+                           cuda_allocated_delta_bytes=delta)
 
 
 def retain_failed(*resources):
@@ -505,7 +757,10 @@ def run(args):
         raise RuntimeError("selected authorized CUDA device unavailable")
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
+    allowed_cpus = set(os.sched_getaffinity(0))
     node, cpu = bind_gpu_local_cpu(args.device, args.cpu_slot)
+    if args.source_cache_numa == node:
+        raise ValueError("source-cache NUMA must differ from GPU-local HOST_NUMA")
     torch.set_num_threads(1)
     from rtp_llm.models_py.modules.dsv41.engram import EngramLayout, NgramHashState, HostEngramEmbedding
     from rtp_llm.models_py.modules.dsv41.engram_bootstrap import attach_from_bundle, hash_state_digest
@@ -539,6 +794,7 @@ def run(args):
                    batches=args.batches, modes=args.modes, samples=args.samples, seed=args.seed,
                    memory_headroom_bytes=args.memory_headroom_gib << 30,
                    discard_private_source_cache=args.discard_private_source_cache,
+                   source_cache_numa=args.source_cache_numa,
                    source_sha256={str(path.relative_to(REPO)): hashlib.sha256(path.read_bytes()).hexdigest()
                                   for path in source_files},
                    local_gpu_host_numa=node, local_cpu=cpu,
@@ -565,11 +821,23 @@ def run(args):
                     emit("PRIVATE_SOURCE_CACHE_ADVICE", layer=layer, phase="before_load", files=advice)
                 snapshot = memory_snapshot(node)
                 write_new_json(args.output / f"memory-layer{layer}-before.json", snapshot)
-                check_memory_budget(snapshot, table_bytes=table_bytes, source_bytes=source_bytes,
-                                    headroom_bytes=args.memory_headroom_gib << 30, before=True)
+                if args.source_cache_numa is None:
+                    check_memory_budget(snapshot, table_bytes=table_bytes, source_bytes=source_bytes,
+                                        headroom_bytes=args.memory_headroom_gib << 30, before=True)
                 emit("BASELINE_LOADING", layer=layer, logical_bytes=table_bytes, source_file_bytes=source_bytes)
-                control = make_local_table(args.source_checkpoint, index, layout, layer, device)
+                if args.source_cache_numa is None:
+                    control = make_local_table(args.source_checkpoint, index, layout, layer, device)
+                else:
+                    control, source_cache = construct_with_source_cache(
+                        source=args.source_checkpoint, files=files, source_node=args.source_cache_numa,
+                        gpu_node=node, allowed_cpus=allowed_cpus, table_bytes=table_bytes,
+                        headroom_bytes=args.memory_headroom_gib << 30,
+                        construct=lambda: make_local_table(args.source_checkpoint, index, layout, layer, device))
                 controls[layer] = control
+                if args.source_cache_numa is not None:
+                    write_new_json(args.output / f"source-cache-layer{layer}.json", source_cache)
+                    emit("SOURCE_CACHE_NUMA_VERIFIED", layer=layer, source_node=args.source_cache_numa,
+                         gpu_host_numa=node, complete_source_verified=True, eviction_prevented=False)
                 if args.discard_private_source_cache:
                     advice = private_source_cache_advice(args.source_checkpoint, files)
                     emit("PRIVATE_SOURCE_CACHE_ADVICE", layer=layer, phase="after_load", files=advice)
@@ -578,7 +846,8 @@ def run(args):
                 check_memory_budget(snapshot, table_bytes=table_bytes, source_bytes=source_bytes,
                                     headroom_bytes=args.memory_headroom_gib << 30, before=False)
                 numa_by_layer[layer] = parse_numa_pages(Path("/proc/self/numa_maps").read_text(), control.storage.data_ptr(), node)
-                local[layer] = HostEngramEmbedding(control.weight, control.scales, pinned=control)
+                local[layer], aliases = make_local_embedding(control, HostEngramEmbedding, torch)
+                write_new_json(args.output / f"baseline-alias-layer{layer}.json", aliases)
                 remote[layer] = HostEngramEmbedding.from_storage(storage, layer)
                 emit("BASELINE_READY", layer=layer, numa=numa_by_layer[layer])
             for batch in args.batches:
@@ -675,6 +944,7 @@ def main(argv=None):
     parser.add_argument("--layer-mode", choices=("single", "together"), default="single")
     parser.add_argument("--memory-headroom-gib", type=int, default=16)
     parser.add_argument("--discard-private-source-cache", action="store_true")
+    parser.add_argument("--source-cache-numa", type=int, default=None)
     parser.add_argument("--modes", default="eager,graph")
     parser.add_argument("--distributions", default="hot,random")
     parser.add_argument("--samples", type=int, default=100)

@@ -90,6 +90,55 @@ advice is not counted as reclaimed memory: the measured budget still must pass.
 The harness records each before/after memory snapshot and advice result. These
 snapshots are sequential observations, not atomic reservation against other jobs.
 
+When a second CPU NUMA node has enough free memory for the source file cache,
+the explicit `--source-cache-numa 1 --discard-private-source-cache` option can
+place source pages there while keeping the measured pinned baseline on the
+GPU's local `HOST_NUMA_ID`. Choose an allowed CPU NUMA node different from the
+GPU-local one; `1` is an example, not a portable topology assumption. The default
+single/together paths and their conservative admission remain unchanged when
+this option is absent.
+
+This option changes **untimed baseline preparation only**:
+
+1. Validate the same private directory/files above, open each complete selected
+   source shard read-only, and create `PROT_READ/MAP_SHARED` mappings. No source
+   contents or permissions are changed.
+2. Before faulting pages, check measured host and every visible memcg headroom
+   for the complete next table plus **all source files together**, headroom and
+   an 8 MiB transient read buffer. GPU-local NUMA must fit the table plus margin;
+   the source NUMA must fit the complete source files plus margin. Existing
+   tables and cached pages are already represented in measured usage/free space.
+3. Bind the current thread to an allowed CPU on the source node, read every
+   source byte in at most 8 MiB chunks, then restore its GPU-local affinity in
+   `finally`. `/proc/self/numa_maps` must show exactly the expected number of
+   resident pages, including the rounded final page, all on the chosen source
+   node. Missing pages, mixed nodes, or unsupported page-size accounting fail.
+4. Take fresh memory counters, no longer charge the verified source as a future
+   allocation, and call main's unchanged `_PinnedSharedTable` constructor. The
+   source mappings remain alive through this copy. Verify source placement
+   again and require every pinned-table page on the GPU-local node. Check actual
+   remaining headroom before releasing the read-only source mappings.
+
+There is no `mlock`, migration promise or global cache operation. A mapped source
+can still be evicted or migrated; successful prefault is a checked observation,
+not a reservation. If post-copy placement or cleanup fails, measurement does not
+start and the registered control remains retained until orderly cleanup/process
+exit. Only independent source mappings are closed; this path never unmaps the
+pinned table or Graph backing. No observed failure is turned into a smaller or
+remote-NUMA baseline. `source-cache-layer*.json` records admission phases and
+complete resident-page evidence without virtual addresses. This optional path
+requires its own real-machine validation; CPU tests alone do not establish NUMA
+placement or large-table admission.
+
+All baseline modes also record an untimed `baseline-alias-layer*.json` check:
+both actual `HostEngramEmbedding._uva` tensor addresses must equal the respective
+`cudaHostGetDevicePointer` results for the registered weight and scale tensors.
+Wrapping must change `torch.cuda.memory_allocated` by zero bytes. This is the
+PyTorch allocator's allocated-byte delta, not a measurement of all driver/NVML
+HBM usage; the independent pointer-alias checks establish that these two views
+use the registered host backing. Only booleans and the byte delta are recorded,
+never the virtual addresses. A mismatch fails before any timed lookup.
+
 Repeat selected cases with `--l2-disturb`. Scratch is twice runtime L2 and is
 finished before each path. This is a controlled disturbance, **not proof of
 cold Grace memory, remote caches, fabric, page tables or TLBs**. Random IDs are
