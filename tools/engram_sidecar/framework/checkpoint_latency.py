@@ -59,11 +59,24 @@ def choice_list(value, allowed):
     return result
 
 
+def diagnostic_declaration(args):
+    if not getattr(args, "diagnostic_nvtx", False):
+        return {}
+    return dict(measurement_status="PROFILE_ONLY",
+                diagnostic_options=dict(nvtx=True, cuda_profiler_api=bool(getattr(args, "diagnostic_cuda_profiler", False))))
+
+
 def check_options(args):
     args.batches = integer_list(args.batches, allowed=(1, 2, 4, 8, 16, 32, 64))
     args.layers = None if args.layers == "first" else integer_list(args.layers)
     args.modes = choice_list(args.modes, ("eager", "graph"))
     args.distributions = choice_list(args.distributions, ("hot", "random"))
+    if getattr(args, "diagnostic_cuda_profiler", False):
+        if not getattr(args, "diagnostic_nvtx", False):
+            raise ValueError("CUDA profiler capture requires diagnostic NVTX markers")
+        groups = 1 if args.layer_mode == "together" or args.layers is None else len(args.layers)
+        if groups != 1 or len(args.batches) != 1 or len(args.modes) != 1 or len(args.distributions) != 1:
+            raise ValueError("CUDA profiler capture requires exactly one case and one distribution")
     if not 1 <= args.samples <= 1_000_000 or args.warmup < 1 or args.device < 0 or args.cpu_slot < 0:
         raise ValueError("invalid samples, warmup, device or CPU slot")
     if args.seed < 0 or args.calibration_samples < 0 or not math.isfinite(args.threshold_us) or args.threshold_us <= 0:
@@ -620,6 +633,108 @@ def make_records(*, mode, distribution, pair_id, path, order, begin_ns,
             dict(base, clock="cpu_submit_to_event_complete", duration_us=(complete_ns - begin_ns) / 1000.0)]
 
 
+def diagnostic_marker(metadata, distribution, pair_id, path, order_index):
+    """Allowlisted geometry only: never interpolate paths, handles, pointers or IDs."""
+    layers = metadata["layer_ids_measured"]
+    if (not layers or any(type(layer) is not int or layer < 0 for layer in layers)
+            or type(metadata["batch"]) is not int or metadata["batch"] not in (1, 2, 4, 8, 16, 32, 64)
+            or metadata["mode"] not in ("eager", "graph") or distribution not in ("hot", "random")
+            or type(pair_id) is not int or pair_id < 0 or path not in ("local_raw", "remote_raw")
+            or type(order_index) is not int or order_index not in (0, 1)):
+        raise ValueError("invalid diagnostic marker geometry")
+    return ("engram_lookup.layers=" + ",".join(map(str, layers))
+            + f".M={metadata['batch']}.mode={metadata['mode']}.ids={distribution}"
+            + f".pair={pair_id}.path={path}.order={order_index}")
+
+
+class DiagnosticTrace:
+    """Opt-in API bookkeeping outside both clocks; no ownership of CUDA resources."""
+    def __init__(self, nvtx, runtime=None):
+        self.nvtx, self.runtime = nvtx, runtime
+        self.marker_active = False
+        self.pushes = self.pops = 0
+        self.start_attempted = self.stop_attempted = False
+        self.start_status = self.stop_status = "NOT_REQUESTED"
+        self.cleanup_errors = []
+
+    def _profiler_call(self, name):
+        try:
+            result = getattr(self.runtime, name)()
+            if not isinstance(result, tuple) or len(result) != 1 or int(result[0]) != 0:
+                raise RuntimeError("nonzero or invalid profiler API status")
+        except Exception:
+            raise RuntimeError("diagnostic profiler API failed: " + name) from None
+
+    def start(self):
+        if self.runtime is not None:
+            if self.start_attempted:
+                raise RuntimeError("diagnostic capture already attempted")
+            self.start_attempted = True
+            self.start_status = "FAILED"
+            self._profiler_call("cudaProfilerStart")
+            self.start_status = "SUCCESS"
+
+    def push(self, label):
+        if self.marker_active:
+            raise RuntimeError("nested diagnostic sample markers are forbidden")
+        self.nvtx.range_push(label)
+        self.marker_active = True
+        self.pushes += 1
+
+    def pop(self, primary=None):
+        if not self.marker_active:
+            return
+        self.marker_active = False
+        try:
+            self.nvtx.range_pop()
+            self.pops += 1
+        except BaseException:
+            self.cleanup_errors.append("NVTX_POP_FAILED")
+            if primary is None:
+                raise RuntimeError("diagnostic NVTX pop failed") from None
+
+    def stop(self, primary=None):
+        if not self.start_attempted or self.stop_attempted:
+            return
+        self.stop_attempted = True
+        self.stop_status = "FAILED"
+        try:
+            self._profiler_call("cudaProfilerStop")
+            self.stop_status = "SUCCESS"
+        except BaseException:
+            self.cleanup_errors.append("PROFILER_STOP_FAILED")
+            if primary is None:
+                raise
+
+    def close(self, primary=None):
+        # A failed pop must not prevent Stop, and cleanup must preserve a primary
+        # CUDA/oracle/I/O exception. Normal cleanup failures remain fatal.
+        failure = primary
+        try:
+            self.pop(primary)
+        except BaseException as error:
+            failure = error
+        self.stop(failure)
+        if primary is None and failure is not None:
+            raise failure
+
+    def evidence(self):
+        return dict(nvtx_pushes=self.pushes, nvtx_pops=self.pops,
+                    profiler_start=self.start_status, profiler_stop=self.stop_status,
+                    cleanup_errors=list(self.cleanup_errors),
+                    trace_collection="EXTERNAL_NSYS_ARTIFACT_REQUIRED",
+                    clock_alignment="NVTX label and CUDA launch correlation; no assumed shared clock origin")
+
+
+def create_diagnostic_trace(args, torch):
+    if not getattr(args, "diagnostic_nvtx", False):
+        return None
+    runtime = None
+    if getattr(args, "diagnostic_cuda_profiler", False):
+        from cuda.bindings import runtime
+    return DiagnosticTrace(torch.cuda.nvtx, runtime)
+
+
 def benchmark_case(*, paths, storage, update, verify, args, metadata, output):
     """One mode/case. Inputs, verification and calibration are outside timing.
 
@@ -638,10 +753,12 @@ def benchmark_case(*, paths, storage, update, verify, args, metadata, output):
     if args.l2_disturb and (l2 is None or 2 * l2 > 1 << 30):
         raise RuntimeError("runtime L2 size unavailable or scratch exceeds 1GiB")
     checks = []
+    diagnostic = None
     raw = output / "samples.jsonl"
     try:
         with raw.open("x") as logfile, torch.inference_mode(), torch.cuda.stream(stream):
             os.chmod(raw, 0o600)
+            diagnostic = create_diagnostic_trace(args, torch)
             scratch = torch.zeros(2 * l2, dtype=torch.uint8, device=args.device) if args.l2_disturb else None
             for name in paths:
                 events[name] = (torch.cuda.Event(enable_timing=True, external=mode == "graph"),
@@ -681,37 +798,57 @@ def benchmark_case(*, paths, storage, update, verify, args, metadata, output):
                     events[name][1].synchronize()
                 verify(index, "random", outputs)
                 checks.append(dict(phase="before_measurement", trace_index=index, mode=mode))
+            if diagnostic is not None:
+                diagnostic.start()
             for distribution in args.distributions:
                 for pair_id in range(args.samples):
                     update(pair_id, distribution)
                     order = bench.balanced_order(paths, pair_id, args.seed)
                     for name in order:
+                        label = diagnostic_marker(metadata, distribution, pair_id, name, order.index(name)) if diagnostic is not None else None
                         if scratch is not None:
                             scratch.add_(1)
                         stream.synchronize()
-                        before = reader() if reader else None
-                        begin_ns = time.perf_counter_ns()
-                        outputs[name] = invoke(name)
-                        submit_ns = time.perf_counter_ns()
-                        events[name][1].synchronize()
-                        complete_ns = time.perf_counter_ns()
-                        after = reader() if reader else None
+                        if diagnostic is not None:
+                            diagnostic.push(label)
+                        try:
+                            before = reader() if reader else None
+                            begin_ns = time.perf_counter_ns()
+                            outputs[name] = invoke(name)
+                            submit_ns = time.perf_counter_ns()
+                            events[name][1].synchronize()
+                            complete_ns = time.perf_counter_ns()
+                            after = reader() if reader else None
+                        except BaseException as error:
+                            if diagnostic is not None:
+                                diagnostic.pop(error)
+                            raise
+                        else:
+                            if diagnostic is not None:
+                                diagnostic.pop()
                         rows = make_records(mode=mode, distribution=distribution, pair_id=pair_id,
                                             path=name, order=order, begin_ns=begin_ns, submit_ns=submit_ns,
                                             complete_ns=complete_ns,
                                             gpu_us=events[name][0].elapsed_time(events[name][1]) * 1000,
                                             before_switches=before, after_switches=after)
+                        if diagnostic is not None:
+                            for row in rows:
+                                row.update(measurement_status="PROFILE_ONLY", diagnostic_nvtx_range=label)
                         records.extend(rows)
                         for row in rows:
                             logfile.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
                     if (pair_id + 1) % 128 == 0:
                         logfile.flush()
                         os.fsync(logfile.fileno())
+                if diagnostic is not None:
+                    diagnostic.stop()
                 verify(args.samples - 1, distribution, outputs)
                 checks.append(dict(phase="after_distribution", distribution=distribution,
                                    trace_index=0 if distribution == "hot" else args.samples - 1, mode=mode))
                 logfile.flush()
                 os.fsync(logfile.fileno())
+            if diagnostic is not None:
+                diagnostic.close()
             del invoke
         stream.synchronize()
         for graph in graphs.values():
@@ -720,6 +857,8 @@ def benchmark_case(*, paths, storage, update, verify, args, metadata, output):
         outputs.clear()
         events.clear()
     except BaseException as error:
+        if diagnostic is not None:
+            diagnostic.close(error)
         # A failed close/capture may still have Graph references in traceback.
         # Preserve the entire chain; outer run also retains its pinned baseline.
         retain_failed(graphs, outputs, paths, storage, error)
@@ -738,6 +877,10 @@ def benchmark_case(*, paths, storage, update, verify, args, metadata, output):
                                  wall_partition="submit call + completion synchronization; sync is not exclusive GPU wait",
                                  context_switch_scope="current thread; correlation is not causal attribution",
                                  screening=args.samples < 10000))
+    if diagnostic is not None:
+        summary.update(measurement_status="PROFILE_ONLY", diagnostics=diagnostic.evidence())
+        for comparison in summary["paired_deltas"]:
+            comparison["threshold_observation"] = "PROFILE_ONLY"
     summary["instrumentation_control"] = (bench.calibrate_timing(args.calibration_samples)
         if args.calibration_samples and mode == "graph" else {"status": "NOT_RUN", "reason": "Graph-only control or disabled"})
     write_new_json(output / "summary.json", summary)
@@ -799,7 +942,8 @@ def run(args):
                                   for path in source_files},
                    local_gpu_host_numa=node, local_cpu=cpu,
                    baseline="independent source mmap -> complete _PinnedSharedTable; extra copy is experiment control",
-                   scope="lookup components only; serial independent layers; excludes hash/WKV/gate/model/HTTP"))
+                   scope="lookup components only; serial independent layers; excludes hash/WKV/gate/model/HTTP",
+                   **diagnostic_declaration(args)))
     storage, control = None, None
     local, remote, controls = {}, {}, {}
     paths = {}
@@ -903,11 +1047,13 @@ def run(args):
                                 torch=torch.__version__, cuda=torch.version.cuda,
                                 gpu_name=torch.cuda.get_device_properties(device).name,
                                 capability=list(torch.cuda.get_device_capability(device)), identity=identity)
-                    emit("CASE_START", layers=list(group), batch=batch, mode=mode, samples=args.samples)
+                    emit("CASE_START", layers=list(group), batch=batch, mode=mode, samples=args.samples,
+                         **diagnostic_declaration(args))
                     result = benchmark_case(paths=paths, storage=storage, update=update, verify=verify,
                                             args=args, metadata=case, output=output)
                     completed.append(output.name)
-                    emit("CASE_COMPLETE", case=output.name, paired_deltas=result["paired_deltas"])
+                    emit("CASE_COMPLETE", case=output.name, paired_deltas=result["paired_deltas"],
+                         **diagnostic_declaration(args))
                 paths.clear()
                 del ids_by_layer, traces, update, verify
             torch.cuda.synchronize(device)
@@ -927,8 +1073,9 @@ def run(args):
             raise RuntimeError("native resources remain after ordered cleanup")
         write_new_json(args.output / "complete.json", dict(cases=completed, counters=counters,
                        decode_step_slo="NOT_MEASURED", layer_mode=args.layer_mode,
-                       scope="selected-layer serial lookup component; no inter-layer model computation"))
-        emit("CLOSED", cases=completed, counters=counters)
+                       scope="selected-layer serial lookup component; no inter-layer model computation",
+                       **diagnostic_declaration(args)))
+        emit("CLOSED", cases=completed, counters=counters, **diagnostic_declaration(args))
     except BaseException as error:
         retain_failed(control, *controls.values(), local, remote, storage, paths, error)
         emit("FAILED_RETAINED_UNTIL_PROCESS_EXIT", error_type=type(error).__name__, completed=completed)
@@ -955,6 +1102,8 @@ def main(argv=None):
     parser.add_argument("--l2-disturb", action="store_true")
     parser.add_argument("--threshold-us", type=float, default=100.0)
     parser.add_argument("--calibration-samples", type=int, default=100)
+    parser.add_argument("--diagnostic-nvtx", action="store_true")
+    parser.add_argument("--diagnostic-cuda-profiler", action="store_true")
     try:
         args = check_options(parser.parse_args(argv))
         run(args)
