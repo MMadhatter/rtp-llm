@@ -1,7 +1,8 @@
 """CPU contracts for the real-table latency harness; no fabricated GPU pass."""
 import copy
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -162,6 +163,24 @@ class LatencyContractTest(unittest.TestCase):
         self.assertFalse(resource._lease_finalizer.atexit)
         self.assertIs(h._FAILED_RESOURCES[-1][0], resource)
         del h._FAILED_RESOURCES[count:]
+
+    def test_top_level_failure_never_prints_sensitive_exception_arguments(self):
+        secret = "PRIVATE_FABRIC_CAPABILITY_DO_NOT_LOG"
+        error = TypeError("incompatible function arguments; Invoked with: b'" + secret + "'")
+        error.code = secret
+        argv = []
+        for name in ("checkpoint", "source-checkpoint", "bundle", "private-inputs", "output"):
+            argv += ["--" + name, "/private/example/" + name]
+        output = io.StringIO()
+        with patch.object(h, "check_options", return_value=object()), patch.object(h, "run", side_effect=error), redirect_stdout(output):
+            self.assertEqual(h.main(argv), 1)
+        record = json.loads(output.getvalue())
+        self.assertEqual(record["status"], "FAILED")
+        self.assertEqual(record["error_type"], "TypeError")
+        self.assertNotIn(secret, output.getvalue())
+        self.assertNotIn("Invoked with", output.getvalue())
+        self.assertNotIn("message", record)
+        self.assertNotIn("code", record)
 
     def local_cleanup(self, status=0, drain_fail=False):
         calls = []
