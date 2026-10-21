@@ -175,6 +175,32 @@ class FullModelPreflightTest(unittest.TestCase):
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1,2,3")
         self.assertNotIn("MODEL_SERVICE_CONFIG", env)
 
+    def test_decode_graph_opt_in_clears_prefill_and_bounds_capture_to_batch_one(self):
+        args = SimpleNamespace(checkpoint=self.root, bundle=self.root / "bundle.json", port=18630,
+                               max_allocation_bytes=128 << 30, budget_bytes=256 << 30, cuda_graph=True)
+        env = launch_environment(args, {"GENERATION_PREFILL_CAPTURE_CONFIG": "64,128",
+                                       "GENERATION_PREFILL_CUDA_GRAPH_MAX_REQUESTS": "8",
+                                       "DECODE_CAPTURE_CONFIG": "1,16,1024", "PREFILL_CAPTURE_CONFIG": "1024:1",
+                                       "ENABLE_NATIVE_CUDA_GRAPH": "1", "SP_TYPE": "eagle"})
+        self.assertEqual(env["ENABLE_CUDA_GRAPH"], "1")
+        self.assertEqual(env["RTP_ENGRAM_GRAPH_MODE"], "process_lifetime")
+        self.assertEqual(env["DECODE_CAPTURE_CONFIG"], "1")
+        self.assertEqual(env["ENABLE_NATIVE_CUDA_GRAPH"], "0")
+        self.assertEqual(env["SP_TYPE"], "")
+        self.assertEqual(env["CONCURRENCY_LIMIT"], "1")
+        for key in ("GENERATION_PREFILL_CAPTURE_CONFIG", "GENERATION_PREFILL_CUDA_GRAPH_MAX_REQUESTS", "PREFILL_CAPTURE_CONFIG"):
+            self.assertNotIn(key, env)
+
+    def test_graph_mode_defaults_to_eager_despite_inherited_opt_in(self):
+        args = SimpleNamespace(checkpoint=self.root, bundle=self.root / "bundle.json", port=18630,
+                               max_allocation_bytes=128 << 30, budget_bytes=256 << 30)
+        env = launch_environment(args, {"RTP_ENGRAM_GRAPH_MODE": "process_lifetime", "ENABLE_CUDA_GRAPH": "1"})
+        self.assertEqual(env["ENABLE_CUDA_GRAPH"], "0")
+        self.assertEqual(env["RTP_ENGRAM_GRAPH_MODE"], "eager")
+        args.cuda_graph = "1"
+        with self.assertRaisesRegex(ValueError, "explicit boolean"):
+            launch_environment(args, {})
+
     def test_local_pdfusion_clears_external_routing_residue(self):
         args = SimpleNamespace(checkpoint=self.root, bundle=self.root / "bundle.json", port=18630,
                                max_allocation_bytes=128 << 30, budget_bytes=256 << 30)

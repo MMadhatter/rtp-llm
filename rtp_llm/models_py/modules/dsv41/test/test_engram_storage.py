@@ -19,6 +19,7 @@ package.__path__ = [str(Path(__file__).resolve().parents[1])]
 sys.modules[PACKAGE] = package
 m = importlib.import_module(PACKAGE + ".engram_manifest")
 s = importlib.import_module(PACKAGE + ".engram_storage")
+a = importlib.import_module(PACKAGE + ".engram_model_attach")
 
 
 def uid(n):
@@ -172,6 +173,50 @@ class StorageTest(unittest.TestCase):
         storage.close()
         with self.assertRaises(RuntimeError):
             storage._unpin_graph()
+
+    def test_ready_model_process_pin_blocks_actual_storage_close_and_survives_model_gc(self):
+        native = Native()
+        storage = self.attach(native)
+        retained = []
+        model = types.SimpleNamespace(
+            _v4_args=types.SimpleNamespace(v41_config={"checkpoint_path": "/local/consumer"}),
+            v4=types.SimpleNamespace(embed=types.SimpleNamespace(weight=types.SimpleNamespace(device="cuda:0")),
+                                     layers=[types.SimpleNamespace(engram=None) for _ in range(3)]),
+            py_hw_kernel_config=types.SimpleNamespace(enable_cuda_graph=True),
+        )
+        class LayerViews:
+            def __init__(self, layer_id):
+                self.views = storage.table_views(layer_id)
+            def release_external_views(self):
+                self.views = None
+        attachment = a.initialize_model_engram(
+            model, layout_factory=lambda config: types.SimpleNamespace(layer_ids=(1, 2)),
+            hash_factory=lambda *args, **kwargs: object(),
+            layer_factory=lambda config, layer_id, *args, **kwargs: LayerViews(layer_id),
+            attach_factory=lambda *args, **kwargs: storage,
+            retain=retained.append,
+            environ={a.EXTERNAL_BUNDLE_ENV: "/private/bundle.json", a.EXTERNAL_GRAPH_MODE_ENV: a.PROCESS_LIFETIME_GRAPH},
+        )
+        self.assertEqual(attachment.phase, "READY")
+        a.require_engram_runtime(model, is_cuda_graph=True)
+        before = storage.info()
+        self.assertEqual(before["graph_pins"], 1)
+        # Even an explicit model-side view release cannot authorize unmapping
+        # while the engine may hold/replay a captured raw pointer.
+        for _, _, module in attachment.layers:
+            module.release_external_views()
+        with self.assertRaises(s.StorageBusyError):
+            storage.close()
+        self.assertEqual(storage.info(), before)
+        self.assertEqual(native.closed, [])
+        weak_storage = weakref.ref(storage)
+        del model, attachment, storage
+        gc.collect()
+        self.assertIs(weak_storage(), retained[0])
+        with self.assertRaises(s.StorageBusyError):
+            retained[0].close()
+        self.assertEqual(native.closed, [])
+        self.assertEqual(retained[0].info()["graph_pins"], 1)
 
     def test_unknown_layer_and_use_after_close_fail(self):
         storage = self.attach()

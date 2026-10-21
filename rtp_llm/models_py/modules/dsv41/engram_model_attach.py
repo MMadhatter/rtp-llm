@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Transactional model binding for experimental, eager-only external Engram.
+"""Transactional model binding for experimental external Engram.
 
 This module imports neither CUDA nor the native RTP engine at import time.
 Factory injection is for control-flow unit tests; the defaults use the actual
 Engram implementation. Successful external mappings live until worker exit.
+Decode Graph is opt-in and holds a permanent storage pin until worker exit.
 There is deliberately no live detach, reload, discovery or service protocol.
 """
 from __future__ import annotations
@@ -15,6 +16,8 @@ from typing import Any
 
 
 EXTERNAL_BUNDLE_ENV = "RTP_ENGRAM_EXTERNAL_BUNDLE"
+EXTERNAL_GRAPH_MODE_ENV = "RTP_ENGRAM_GRAPH_MODE"
+PROCESS_LIFETIME_GRAPH = "process_lifetime"
 
 
 class EngramModelInitializationError(RuntimeError):
@@ -28,6 +31,9 @@ class EngramModelInitializationError(RuntimeError):
 class EngramModelAttachment:
     phase: str = "INITIALIZING"
     external: bool = False
+    graph_mode: str = "eager"
+    graph_pin_held: bool = False
+    process_retained: bool = False
     storage: Any = field(default=None, repr=False)
     hash_state: Any = field(default=None, repr=False)
     layers: tuple = field(default=(), repr=False)
@@ -40,17 +46,40 @@ def _retain_default(storage):
     retain_for_process(storage)
 
 
-def require_eager_engram(model, *, is_cuda_graph=False, capture_check=None):
-    """Reject unmanaged graph use before submitting any external lookup work."""
+def require_engram_runtime(
+    model, *, is_cuda_graph=False, capture_check=None, is_prefill=False, is_target_verify=False
+):
+    """Keep eager default; admit opted-in decode graphs with a permanent pin.
+
+    Replay bypasses Python. The pin, not this per-forward check, prevents close
+    from invalidating captured pointers. No successful binding can be detached
+    or rebound in-process; even model/graph destruction retains its mapping.
+    """
     attachment = getattr(model, "_engram_attachment", None)
     if attachment is None or not attachment.external:
         return
     if attachment.phase != "READY":
         raise EngramModelInitializationError("EXTERNAL_ENGRAM_NOT_READY")
-    if is_cuda_graph:
+    if (getattr(model, "_engram_storage", None) is not attachment.storage
+            or getattr(model, "_engram_hash_state", None) is not attachment.hash_state
+            or getattr(model, "_engram_layers", None) != tuple((lid, index) for lid, index, _ in attachment.layers)
+            or any(model.v4.layers[lid].engram is not module for lid, _, module in attachment.layers)):
+        raise EngramModelInitializationError("EXTERNAL_ENGRAM_BINDING_CHANGED")
+    if attachment.graph_mode == PROCESS_LIFETIME_GRAPH:
+        if not attachment.graph_pin_held or not attachment.process_retained:
+            raise EngramModelInitializationError("EXTERNAL_ENGRAM_GRAPH_LIFETIME_UNPINNED")
+        # Ordinary prefill remains eager; target verify/speculation is outside
+        # this slice. Decode replay never re-enters this Python guard.
+        if is_prefill or is_target_verify:
+            if is_cuda_graph or (capture_check is not None and capture_check()):
+                raise EngramModelInitializationError("EXTERNAL_ENGRAM_DECODE_GRAPH_ONLY")
+        return
+    if is_cuda_graph or (capture_check is not None and capture_check()):
         raise EngramModelInitializationError("EXTERNAL_ENGRAM_GRAPH_UNSUPPORTED")
-    if capture_check is not None and capture_check():
-        raise EngramModelInitializationError("EXTERNAL_ENGRAM_GRAPH_UNSUPPORTED")
+
+
+# Preserve the previous experimental helper import; its default is still eager.
+require_eager_engram = require_engram_runtime
 
 
 def initialize_model_engram(
@@ -77,6 +106,7 @@ def initialize_model_engram(
     previous = getattr(model, "_engram_attachment", None)
     if previous is not None:
         if previous.phase in ("READY", "EMPTY"):
+            require_engram_runtime(model)
             return previous
         raise EngramModelInitializationError("ENGRAM_INITIALIZATION_NOT_RETRYABLE")
 
@@ -104,8 +134,12 @@ def initialize_model_engram(
         if attachment.external:
             if not isinstance(bundle_path, str) or not bundle_path or not Path(bundle_path).is_absolute():
                 raise EngramModelInitializationError("INVALID_EXTERNAL_ENGRAM_BUNDLE_PATH")
+            attachment.graph_mode = env.get(EXTERNAL_GRAPH_MODE_ENV, "eager")
+            if attachment.graph_mode not in ("eager", PROCESS_LIFETIME_GRAPH):
+                raise EngramModelInitializationError("INVALID_EXTERNAL_ENGRAM_GRAPH_MODE")
             hw = getattr(model, "py_hw_kernel_config", None)
-            if hw is not None and bool(getattr(hw, "enable_cuda_graph", False)):
+            if (hw is not None and bool(getattr(hw, "enable_cuda_graph", False))
+                    and attachment.graph_mode != PROCESS_LIFETIME_GRAPH):
                 raise EngramModelInitializationError("EXTERNAL_ENGRAM_GRAPH_UNSUPPORTED")
 
         if hash_factory is None:
@@ -138,6 +172,13 @@ def initialize_model_engram(
             module = layer_factory(config, layer_id, checkpoint_path, device, **kwargs)
             constructed.append((layer_id, hash_index, module))
 
+        if attachment.external and attachment.graph_mode == PROCESS_LIFETIME_GRAPH:
+            # Pin before any layer is published or the engine can capture. This
+            # pin is deliberately never removed after READY: worker exit owns
+            # cleanup, including capture/drain failure and model destruction.
+            storage._pin_graph()
+            attachment.graph_pin_held = True
+
         # No layer can become visible while another layer is still being loaded.
         for layer_id, _, module in constructed:
             layer = model.v4.layers[layer_id]
@@ -146,6 +187,7 @@ def initialize_model_engram(
             layer.engram = module
         if attachment.external:
             retain(storage)
+            attachment.process_retained = True
         attachment.hash_state = hash_state
         attachment.layers = tuple(constructed)
         model._engram_storage = storage
@@ -162,6 +204,14 @@ def initialize_model_engram(
             except BaseException as error:
                 cleanup_errors.append(error)
         if attachment.external:
+            # READY was never published, so no forward/capture was admitted.
+            # Only this pre-READY rollback may remove the lifetime pin.
+            if attachment.graph_pin_held:
+                try:
+                    storage._unpin_graph()
+                    attachment.graph_pin_held = False
+                except BaseException as error:
+                    cleanup_errors.append(error)
             for _, _, module in reversed(constructed):
                 try:
                     module.release_external_views()
@@ -187,8 +237,11 @@ def initialize_model_engram(
 
 __all__ = [
     "EXTERNAL_BUNDLE_ENV",
+    "EXTERNAL_GRAPH_MODE_ENV",
+    "PROCESS_LIFETIME_GRAPH",
     "EngramModelAttachment",
     "EngramModelInitializationError",
     "initialize_model_engram",
     "require_eager_engram",
+    "require_engram_runtime",
 ]
