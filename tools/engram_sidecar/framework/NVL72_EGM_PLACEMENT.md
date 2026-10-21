@@ -89,6 +89,8 @@ CUDA 13.0 已给出 HOST_NUMA + FABRIC 的跨节点流程，并明确：**“For
 
 M=1 优先，先 100 paired screen，再对有价值 case 做 10,000 pairs。更换 GPU 后应比较各自 **remote−local** 的分布；跨时间、跨 GPU 的两个独立运行不能伪称同一次配对实验。EP 并发干扰作为独立阶段测量，不混入“独占”结果。当前没有证明整个 NVL72 无其他主机负载。
 
+其中“跨节点 GPU0”的功能格已由 2026-10-21 的独立 path-v2 诊断验证（见第 8 节）；其余格仍未执行，功能通过不代表延迟或带宽结论。
+
 ## 5. Embedding 放在哪里
 
 | 方案 | 完整权重物理量 | 取舍与适用条件 |
@@ -118,3 +120,11 @@ M=1 优先，先 100 paired screen，再对有价值 case 做 10,000 pairs。更
 - 图内 GPU event 区间不是 kernel duration 之和；eager 区间还可能包含 CPU 提交造成的空隙。HTTP request-average TPOT 不是逐 decode step P99。
 - 完整表分配不等于完整工作集覆盖；hot/random 分开。L2 scratch 只能称扰动，不能保证真正冷缓存。大 EGM allocation 的 TLB 行为必须单独关注。[CUDA EGM](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/egm.html)
 - 现有跨节点功能证据有效；历史超限仍然有效。新位置实验、C2C 零错误状态或某次 profiler 未复现，都不能覆盖旧异常或宣布完整 decode SLO 已通过。
+
+## 8. 2026-10-21 跨机 C2C 路径实测
+
+独立 path-v2 诊断在 consumer GPU 上通过既有 `HOST_NUMA` + `FABRIC` 映射直接读取 owner 的两张完整表。N=4（252 launches，2,179,457,280 逻辑 B）与 2N=8（504 launches，4,358,914,560 B）均完成并通过 BF16 oracle；owner 对应 C2C PMU 记录到 **2,377,687,040 B** 与 **4,755,375,104 B**，2N/N = **2.0000004**。两轮计数/逻辑均为 **1.0909537**，与 264 B 行按 32 B sector 计 `288/264 = 12/11` 一致（差约 0.004%）。诊断 `exact_bf16=true`、native counters 全 0、`CLOSED` 6.596 s。
+
+consumer 本地 C2C 在 55 s 内没有 GB 级 bulk 流量，支持“读取经 GPU NVLink fabric 到 owner Grace 内存”的路径判断。但这是 system-wide socket PMU、单次运行、55 s reader，且 N 轮含冷启动；**不构成带宽、延迟或 ≤100 μs 结论**。PMU 本身不计 C2C latency，`physical-link scope` 仍未独立核验。历史 207.424 μs 长尾仍未解释或修复。
+
+本次只把 N0（owner HOST_NUMA0 → consumer GPU0）的**功能格**标记为已通过；N1/N2/F2 与 L0/L1/C0/C1/C2 仍未执行。完整去标识数据与边界见 [跨机 C2C 路径诊断](results/20261021_c2c_path/README.md)。

@@ -1,0 +1,62 @@
+{
+  "run": "path-v2",
+  "date": "2026-10-21",
+  "scope": "PATH_DIAGNOSTIC_ONLY_NOT_PERFORMANCE",
+  "status": "DIAGNOSTIC_COMPLETE",
+  "exact_bf16": true,
+  "closed_seconds": 6.596036531962454,
+  "source_commit": "3ac1fbda79b3509b554b562775a46138d586afd3",
+  "geometry": {
+    "tables": 2,
+    "chunks": 63,
+    "measured_layer": 1,
+    "pool_rows": 2063880,
+    "row_bytes": 264,
+    "rows_per_launch": 32760,
+    "cycles_n": 4,
+    "cycles_2n": 8
+  },
+  "n": {
+    "completed_lookup_launches": 252,
+    "completed_logical_read_bytes": 2179457280,
+    "completed_output_bytes": 4226826240
+  },
+  "two_n": {
+    "completed_lookup_launches": 504,
+    "completed_logical_read_bytes": 4358914560,
+    "completed_output_bytes": 8453652480
+  },
+  "owner_pmu": {
+    "pmu": "nvidia_nvlink_c2c0_pmu_0",
+    "n_bytes": 2377687040,
+    "two_n_bytes": 4755375104,
+    "two_n_over_n": 2.0000004306706405,
+    "n_over_logical": 1.090953725874361,
+    "two_n_over_logical": 1.0909539607952305,
+    "sector_accounting_overhead": 1.0909090909090908
+  },
+  "consumer_local_c2c_bytes": {
+    "c2c0_pmu_1": 7176192,
+    "c2c1_pmu_0": 29557248,
+    "c2c1_pmu_1": 1708032
+  },
+  "native_counters": {
+    "cleanup_failures": 0,
+    "contexts": 0,
+    "deferred_cleanups": 0,
+    "imports": 0,
+    "mappings": 0,
+    "owner_allocations": 0,
+    "reservations": 0,
+    "view_storages": 0
+  },
+  "limitations": [
+    "system-wide socket PMU, not per-process",
+    "single run; reader duration 55 s",
+    "N includes cold-start effects; wall times are not bandwidth",
+    "PMU does not measure C2C latency",
+    "physical-link scope unverified",
+    "one owner and one consumer GPU only",
+    "does not change or explain the existing 207.424 us Graph outlier"
+  ]
+}
