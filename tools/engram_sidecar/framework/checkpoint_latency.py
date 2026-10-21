@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired, single-layer real-checkpoint lookup latency; never a decode-step SLO.
+"""Paired real-checkpoint lookup latency; never a complete decode-step SLO.
 
 Both paths call HostEngramEmbedding on the same GPU/IDs. The local control is
 main's complete _PinnedSharedTable, populated from independent source shards;
@@ -20,6 +20,8 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
+import stat
 import sys
 import time
 from uuid import uuid4
@@ -34,7 +36,7 @@ _FAILED_RESOURCES = []
 
 
 def emit(status, **values):
-    print(json.dumps(dict(status=status, scope="real_single_layer_lookup_only",
+    print(json.dumps(dict(status=status, scope="real_checkpoint_lookup_component",
                           decode_step_slo="NOT_MEASURED", **values),
                      sort_keys=True, allow_nan=False), flush=True)
 
@@ -64,12 +66,161 @@ def check_options(args):
         raise ValueError("invalid samples, warmup, device or CPU slot")
     if args.seed < 0 or args.calibration_samples < 0 or not math.isfinite(args.threshold_us) or args.threshold_us <= 0:
         raise ValueError("invalid seed, calibration count or threshold")
+    if args.layer_mode not in ("single", "together") or args.memory_headroom_gib < 1:
+        raise ValueError("valid layer mode and positive memory headroom required")
     for name in ("checkpoint", "source_checkpoint", "bundle", "private_inputs", "output"):
         if not getattr(args, name).is_absolute():
             raise ValueError("all input/output paths must be absolute")
     if args.output.exists() or args.output.is_symlink():
         raise FileExistsError("use a new output directory; prior samples must not be overwritten")
     return args
+
+
+def layer_groups(available, selected, mode):
+    """Single preserves first-layer default; together defaults to all real layers."""
+    if mode not in ("single", "together") or not available:
+        raise ValueError("valid mode and model layers required")
+    selected = list(selected) if selected is not None else list(available if mode == "together" else available[:1])
+    if not selected or len(set(selected)) != len(selected) or not set(selected) <= set(available):
+        raise ValueError("selected layer absent or duplicated")
+    if mode == "together":
+        if len(selected) < 2:
+            raise ValueError("together requires at least two real layers")
+        # Preserve actual model order even when the CLI lists IDs out of order.
+        return [tuple(layer for layer in available if layer in selected)]
+    return [(layer,) for layer in selected]
+
+
+def invoke_lookup_chain(embeddings, layers, ids_by_layer, device):
+    """Same-stream serial submissions, independent inputs; no inter-layer model work."""
+    if len(layers) == 1:
+        return embeddings[layers[0]](ids_by_layer[layers[0]], device)
+    return tuple(embeddings[layer](ids_by_layer[layer], device) for layer in layers)
+
+
+def split_layer_outputs(outputs, layers):
+    if len(layers) == 1:
+        return {layers[0]: dict(outputs)}
+    if any(not isinstance(value, tuple) or len(value) != len(layers) for value in outputs.values()):
+        raise AssertionError("joint replay must return exactly one actual output per selected layer")
+    return {layer: {name: values[position] for name, values in outputs.items()}
+            for position, layer in enumerate(layers)}
+
+
+def resolve_cgroup_directory(cgroup_text, mountinfo_text):
+    members = [line.split("::", 1)[1] for line in cgroup_text.splitlines() if line.startswith("0::")]
+    if len(members) != 1:
+        raise RuntimeError("a unique cgroup-v2 membership is required")
+    member = Path(members[0])
+    candidates = []
+    for line in mountinfo_text.splitlines():
+        left, separator, right = line.partition(" - ")
+        if not separator or right.split()[0] != "cgroup2":
+            continue
+        fields = left.split()
+        if len(fields) < 5 or "\\" in fields[3] or "\\" in fields[4]:
+            raise RuntimeError("unsupported escaped cgroup mount path")
+        root, target = Path(fields[3]), Path(fields[4])
+        try:
+            suffix = member.relative_to(root)
+        except ValueError:
+            continue
+        candidates.append((target / suffix, target, root == Path("/")))
+    if len(candidates) != 1:
+        raise RuntimeError("cannot uniquely resolve this process cgroup-v2 mount")
+    return candidates[0]
+
+
+def parse_kib_field(text, field):
+    pattern = re.compile(r"(?:Node\s+\d+\s+)?" + re.escape(field) + r":\s+(\d+)\s+kB")
+    matches = [match.group(1) for line in text.splitlines() if (match := pattern.fullmatch(line.strip()))]
+    if len(matches) != 1:
+        raise RuntimeError("required memory counter unavailable")
+    return int(matches[0]) * 1024
+
+
+def read_cgroup_memory(current, mount, hierarchy_root):
+    groups = []
+    while True:
+        limit_path = current / "memory.max"
+        # Only the actual hierarchy-root mount may omit its limit interface.
+        # Missing counters or limits at any non-root ancestor remain fatal.
+        root_without_limit = current == mount and hierarchy_root and not limit_path.exists()
+        limit = "max" if root_without_limit else limit_path.read_text().strip()
+        groups.append(dict(path=str(current), current_bytes=int((current / "memory.current").read_text()),
+                           max_bytes=None if limit == "max" else int(limit),
+                           limit_source="root_no_limit_interface" if root_without_limit else "memory.max"))
+        if current == mount:
+            break
+        current = current.parent
+    return groups
+
+
+def memory_snapshot(node):
+    current, mount, hierarchy_root = resolve_cgroup_directory(Path("/proc/self/cgroup").read_text(),
+                                                             Path("/proc/self/mountinfo").read_text())
+    groups = read_cgroup_memory(current, mount, hierarchy_root)
+    return dict(cgroups=groups, shm_free_bytes=shutil.disk_usage("/dev/shm").free,
+                host_available_bytes=parse_kib_field(Path("/proc/meminfo").read_text(), "MemAvailable"),
+                numa_free_bytes=parse_kib_field(Path(f"/sys/devices/system/node/node{node}/meminfo").read_text(), "MemFree"))
+
+
+def check_memory_budget(snapshot, *, table_bytes, source_bytes, headroom_bytes, before):
+    """Conservative marginal budget; fadvise does not count as guaranteed reclaim."""
+    if min(table_bytes, source_bytes, headroom_bytes) < 0 or headroom_bytes == 0:
+        raise ValueError("nonnegative sizes and positive headroom required")
+    additional = table_bytes + source_bytes if before else 0
+    required = additional + headroom_bytes
+    for group in snapshot["cgroups"]:
+        if group["max_bytes"] is not None and group["max_bytes"] - group["current_bytes"] < required:
+            raise RuntimeError("insufficient measured cgroup memory headroom for complete-table baseline")
+    if snapshot["host_available_bytes"] < required or snapshot["numa_free_bytes"] < required:
+        raise RuntimeError("insufficient host or GPU-local NUMA headroom")
+    if snapshot["shm_free_bytes"] < (table_bytes if before else 0):
+        raise RuntimeError("insufficient /dev/shm for complete pinned table")
+    return dict(required_marginal_bytes=additional, reserved_headroom_bytes=headroom_bytes,
+                phase="before_load" if before else "after_load", snapshot=snapshot)
+
+
+def source_paths(source, index, layer):
+    from tools.engram_sidecar.framework.stage_checkpoint import _basename
+    return sorted({source / _basename(index[f"layers.{layer}.engram.embed.{role}"])
+                   for role in ("weight", "scale")})
+
+
+def private_source_cache_advice(source, paths):
+    """Best-effort file-cache advice on an explicitly opted-in private source copy.
+
+    Files must be current-UID, single-link, owner-readable and non-writable;
+    source root must be mode0700. This cannot prove no same-UID process holds an
+    open mapping. The operator promises immutable, task-owned copies. No global
+    cache controls or writes to checkpoint bytes are used.
+    """
+    from tools.engram_sidecar.framework.stage_checkpoint import _canonical, _snapshot, _unchanged
+    source = _canonical(source)
+    directory = source.stat()
+    if directory.st_uid != os.getuid() or stat.S_IMODE(directory.st_mode) != 0o700:
+        raise ValueError("cache advice requires a current-UID mode0700 task-private source directory")
+    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        raise RuntimeError("per-file POSIX_FADV_DONTNEED unavailable")
+    advised = []
+    for path in paths:
+        if path.parent != source:
+            raise ValueError("cache advice path must be a direct private-source child")
+        expected = _snapshot(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o400
+                    or (info.st_dev, info.st_ino) != (expected["device"], expected["inode"])):
+                raise ValueError("cache advice requires private single-link immutable mode0400 source files")
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            _unchanged(path, expected)
+            advised.append(dict(file=path.name, bytes=info.st_size, advice="DONTNEED", reclaimed_bytes="NOT_ASSUMED"))
+        finally:
+            os.close(fd)
+    return advised
 
 
 def parse_numa_pages(text, address, node):
@@ -368,10 +519,9 @@ def run(args):
                                     token_count=len(state.token_map))
     lookup.verify_bundle_samples(parsed, bundle, layout)
     headers = source_sample_check(args.source_checkpoint, index, layout, parsed)
-    layers = args.layers if args.layers is not None else [layout.layer_ids[0]]
-    if not set(layers) <= set(layout.layer_ids):
-        raise ValueError("selected layer absent from real checkpoint")
-    if (args.samples + args.warmup + 2) * max(args.batches) * layout.n_hash_cols * 8 > 512 << 20:
+    groups = layer_groups(layout.layer_ids, args.layers, args.layer_mode)
+    layers = [layer for group in groups for layer in group]
+    if (args.samples + args.warmup + 2) * max(args.batches) * layout.n_hash_cols * 8 * max(map(len, groups)) > 512 << 20:
         raise ValueError("preallocated trace exceeds 512MiB")
     spec = importlib.util.find_spec("engram_native_dev_492ecf45")
     if spec is None or not isinstance(spec.loader, importlib.machinery.ExtensionFileLoader):
@@ -385,65 +535,121 @@ def run(args):
                      for name in ("engram.py", "_engram_triton.py", "engram_storage.py", "engram_bootstrap.py")]
     write_new_json(args.output / "run.json", dict(schema_version=1, identity=identity,
                    source_headers=headers, checkpoint_metadata=metadata, layers=layers,
+                   layer_mode=args.layer_mode, layer_groups=groups,
                    batches=args.batches, modes=args.modes, samples=args.samples, seed=args.seed,
+                   memory_headroom_bytes=args.memory_headroom_gib << 30,
+                   discard_private_source_cache=args.discard_private_source_cache,
                    source_sha256={str(path.relative_to(REPO)): hashlib.sha256(path.read_bytes()).hexdigest()
                                   for path in source_files},
                    local_gpu_host_numa=node, local_cpu=cpu,
                    baseline="independent source mmap -> complete _PinnedSharedTable; extra copy is experiment control",
-                   scope="single-layer lookup only; excludes hash, WKV, gate, model and HTTP"))
-    storage, local, remote, control = None, None, None, None
+                   scope="lookup components only; serial independent layers; excludes hash/WKV/gate/model/HTTP"))
+    storage, control = None, None
+    local, remote, controls = {}, {}, {}
     paths = {}
     completed = []
     try:
         storage = attach_from_bundle(args.bundle, layout=layout, hash_state=state, device=device)
-        for layer in layers:
-            rows = dict(zip(layout.layer_ids, layout.num_embeddings))[layer]
-            emit("BASELINE_LOADING", layer=layer, logical_bytes=rows * (layout.head_dim + layout.head_dim // 32))
-            control = make_local_table(args.source_checkpoint, index, layout, layer, device)
-            numa = parse_numa_pages(Path("/proc/self/numa_maps").read_text(), control.storage.data_ptr(), node)
-            local = HostEngramEmbedding(control.weight, control.scales, pinned=control)
-            remote = HostEngramEmbedding.from_storage(storage, layer)
-            emit("BASELINE_READY", layer=layer, numa=numa)
+        rows_by_layer = dict(zip(layout.layer_ids, layout.num_embeddings))
+        for group in groups:
+            numa_by_layer = {}
+            planned_bytes = sum(rows_by_layer[layer] * (layout.head_dim + layout.head_dim // 32) for layer in group)
+            if shutil.disk_usage("/dev/shm").free < planned_bytes:
+                raise RuntimeError("insufficient /dev/shm for all selected layers together")
+            for layer in group:
+                table_bytes = rows_by_layer[layer] * (layout.head_dim + layout.head_dim // 32)
+                files = source_paths(args.source_checkpoint, index, layer)
+                source_bytes = sum(path.stat().st_size for path in files)
+                if args.discard_private_source_cache:
+                    advice = private_source_cache_advice(args.source_checkpoint, files)
+                    emit("PRIVATE_SOURCE_CACHE_ADVICE", layer=layer, phase="before_load", files=advice)
+                snapshot = memory_snapshot(node)
+                write_new_json(args.output / f"memory-layer{layer}-before.json", snapshot)
+                check_memory_budget(snapshot, table_bytes=table_bytes, source_bytes=source_bytes,
+                                    headroom_bytes=args.memory_headroom_gib << 30, before=True)
+                emit("BASELINE_LOADING", layer=layer, logical_bytes=table_bytes, source_file_bytes=source_bytes)
+                control = make_local_table(args.source_checkpoint, index, layout, layer, device)
+                controls[layer] = control
+                if args.discard_private_source_cache:
+                    advice = private_source_cache_advice(args.source_checkpoint, files)
+                    emit("PRIVATE_SOURCE_CACHE_ADVICE", layer=layer, phase="after_load", files=advice)
+                snapshot = memory_snapshot(node)
+                write_new_json(args.output / f"memory-layer{layer}-after.json", snapshot)
+                check_memory_budget(snapshot, table_bytes=table_bytes, source_bytes=source_bytes,
+                                    headroom_bytes=args.memory_headroom_gib << 30, before=False)
+                numa_by_layer[layer] = parse_numa_pages(Path("/proc/self/numa_maps").read_text(), control.storage.data_ptr(), node)
+                local[layer] = HostEngramEmbedding(control.weight, control.scales, pinned=control)
+                remote[layer] = HostEngramEmbedding.from_storage(storage, layer)
+                emit("BASELINE_READY", layer=layer, numa=numa_by_layer[layer])
             for batch in args.batches:
-                ids = torch.empty((batch, layout.n_hash_cols), dtype=torch.int64, device=device)
-                generator = torch.Generator().manual_seed(args.seed + layer * 100 + batch)
-                trace = torch.randint(rows, (args.samples + args.warmup + 2, batch, layout.n_hash_cols),
-                                      dtype=torch.int64, generator=generator).pin_memory()
-                paths = {"local_raw": lambda: local(ids, device), "remote_raw": lambda: remote(ids, device)}
+                ids_by_layer, traces = {}, {}
+                for layer in group:
+                    ids_by_layer[layer] = torch.empty((batch, layout.n_hash_cols), dtype=torch.int64, device=device)
+                    generator = torch.Generator().manual_seed(args.seed + layer * 100 + batch)
+                    traces[layer] = torch.randint(rows_by_layer[layer], (args.samples + args.warmup + 2, batch, layout.n_hash_cols),
+                                                 dtype=torch.int64, generator=generator).pin_memory()
+                if len(group) == 1:
+                    # Preserve single-layer's direct call; no tuple/chain wrapper
+                    # is added to its measured eager dispatch.
+                    paths = {"local_raw": lambda embedding=local[group[0]], ids=ids_by_layer[group[0]]: embedding(ids, device),
+                             "remote_raw": lambda embedding=remote[group[0]], ids=ids_by_layer[group[0]]: embedding(ids, device)}
+                else:
+                    paths = {"local_raw": lambda: invoke_lookup_chain(local, group, ids_by_layer, device),
+                             "remote_raw": lambda: invoke_lookup_chain(remote, group, ids_by_layer, device)}
                 def update(sample, distribution):
-                    ids.copy_(trace[0 if distribution == "hot" else sample % len(trace)], non_blocking=True)
+                    for layer in group:
+                        trace = traces[layer]
+                        ids_by_layer[layer].copy_(trace[0 if distribution == "hot" else sample % len(trace)], non_blocking=True)
                 def verify(sample, distribution, outputs):
-                    matrix = trace[0 if distribution == "hot" else sample % len(trace)].tolist()
-                    expected = torch.tensor(source_rows(args.source_checkpoint, index, layout, layer, matrix),
-                                            dtype=torch.float32).to(torch.bfloat16)
-                    for name, value in outputs.items():
-                        actual = value.cpu()
-                        if actual.dtype != torch.bfloat16 or not torch.equal(actual.view(torch.int16), expected.view(torch.int16)):
-                            raise AssertionError(f"{name} actual measured output differs from independent source BF16 oracle")
+                    per_layer = split_layer_outputs(outputs, group)
+                    for layer in group:
+                        trace = traces[layer]
+                        matrix = trace[0 if distribution == "hot" else sample % len(trace)].tolist()
+                        expected = torch.tensor(source_rows(args.source_checkpoint, index, layout, layer, matrix),
+                                                dtype=torch.float32).to(torch.bfloat16)
+                        for name, value in per_layer[layer].items():
+                            actual = value.cpu()
+                            if actual.dtype != torch.bfloat16 or not torch.equal(actual.view(torch.int16), expected.view(torch.int16)):
+                                raise AssertionError(f"{name} measured layer output differs from independent source BF16 oracle")
                 for mode in args.modes:
-                    output = args.output / f"layer{layer}-M{batch}-{mode}"
+                    label = f"layer{group[0]}" if len(group) == 1 else "layers" + "-".join(map(str, group))
+                    output = args.output / f"{label}-M{batch}-{mode}"
                     output.mkdir(mode=0o700)
-                    case = dict(layer_id=layer, actual_model_engram_layers=list(layout.layer_ids), layer_count_measured=1,
-                                batch=batch, heads=layout.n_hash_cols, dim=layout.head_dim, table_rows=rows,
-                                table_bytes=rows * (layout.head_dim + layout.head_dim // 32), mode=mode,
+                    case = dict(layer_id=group[0] if len(group) == 1 else None,
+                                layer_ids_measured=list(group), layer_mode=args.layer_mode,
+                                actual_model_engram_layers=list(layout.layer_ids), layer_count_measured=len(group),
+                                covers_all_model_engram_layers=set(group) == set(layout.layer_ids),
+                                layer_dependency="independent inputs, same-stream serial lookup; no intervening model computation",
+                                batch=batch, heads=layout.n_hash_cols, dim=layout.head_dim,
+                                table_rows=rows_by_layer[group[0]] if len(group) == 1 else {str(layer): rows_by_layer[layer] for layer in group},
+                                table_bytes=planned_bytes, mode=mode,
                                 distribution="uniform rows over complete actual table; not a production token distribution",
-                                trace_seed=args.seed + layer * 100 + batch,
-                                trace_sha256=hashlib.sha256(memoryview(trace.numpy())).hexdigest(),
-                                scope="IDs ready -> lookup BF16 ready; no hash/WKV/gate/model/HTTP",
-                                baseline_numa=numa, torch=torch.__version__, cuda=torch.version.cuda,
+                                trace_seed=args.seed + group[0] * 100 + batch if len(group) == 1 else
+                                    {str(layer): args.seed + layer * 100 + batch for layer in group},
+                                trace_sha256=hashlib.sha256(memoryview(traces[group[0]].numpy())).hexdigest() if len(group) == 1 else
+                                    {str(layer): hashlib.sha256(memoryview(traces[layer].numpy())).hexdigest() for layer in group},
+                                scope="IDs ready -> all selected lookup BF16 outputs ready; no hash/WKV/gate/model/HTTP",
+                                baseline_numa=numa_by_layer[group[0]] if len(group) == 1 else
+                                    {str(layer): numa_by_layer[layer] for layer in group},
+                                torch=torch.__version__, cuda=torch.version.cuda,
                                 gpu_name=torch.cuda.get_device_properties(device).name,
                                 capability=list(torch.cuda.get_device_capability(device)), identity=identity)
-                    emit("CASE_START", layer=layer, batch=batch, mode=mode, samples=args.samples)
+                    emit("CASE_START", layers=list(group), batch=batch, mode=mode, samples=args.samples)
                     result = benchmark_case(paths=paths, storage=storage, update=update, verify=verify,
                                             args=args, metadata=case, output=output)
                     completed.append(output.name)
                     emit("CASE_COMPLETE", case=output.name, paired_deltas=result["paired_deltas"])
                 paths.clear()
-                del ids, trace, update, verify
-            remote.release_external_views()
-            remote = local = None
+                del ids_by_layer, traces, update, verify
+            torch.cuda.synchronize(device)
+            for embedding in remote.values():
+                embedding.release_external_views()
+            remote.clear()
+            local.clear()
             gc.collect()
-            close_local(control, torch)
+            for control in controls.values():
+                close_local(control, torch)
+            controls.clear()
             control = None
             gc.collect()
         storage.close()
@@ -451,10 +657,11 @@ def run(args):
         if any(counters.values()):
             raise RuntimeError("native resources remain after ordered cleanup")
         write_new_json(args.output / "complete.json", dict(cases=completed, counters=counters,
-                       decode_step_slo="NOT_MEASURED", scope="single-layer lookup component"))
+                       decode_step_slo="NOT_MEASURED", layer_mode=args.layer_mode,
+                       scope="selected-layer serial lookup component; no inter-layer model computation"))
         emit("CLOSED", cases=completed, counters=counters)
     except BaseException as error:
-        retain_failed(control, local, remote, storage, paths, error)
+        retain_failed(control, *controls.values(), local, remote, storage, paths, error)
         emit("FAILED_RETAINED_UNTIL_PROCESS_EXIT", error_type=type(error).__name__, completed=completed)
         raise
 
@@ -465,6 +672,9 @@ def main(argv=None):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--batches", default="1")
     parser.add_argument("--layers", default="first")
+    parser.add_argument("--layer-mode", choices=("single", "together"), default="single")
+    parser.add_argument("--memory-headroom-gib", type=int, default=16)
+    parser.add_argument("--discard-private-source-cache", action="store_true")
     parser.add_argument("--modes", default="eager,graph")
     parser.add_argument("--distributions", default="hot,random")
     parser.add_argument("--samples", type=int, default=100)
