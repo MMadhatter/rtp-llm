@@ -142,3 +142,18 @@ consumer 本地 C2C 在 55 s 内没有 GB 级 bulk 流量，支持“读取经 G
 - g0 支撑 GPU0/NUMA0 的本地 pinned 基线；g2 支撑 GPU2/NUMA1 的本地 pinned 基线（source 在 NUMA0），说明跨 Grace 组的本地 pinned 路径可完整驻留并运行。
 - g2 **不是** N1。N1（owner 远端 backing → consumer GPU2）仍未执行；不能把 g2 的本地时延当作远端 C2C 时延。
 - N1、N2、F2、EP、C1 仍未执行；历史 207.424 μs 长尾仍独立保留。
+
+## 10. N1：owner 远端 backing → consumer GPU2
+
+在 N0（consumer GPU0）之后，用同一 owner backing 和 consumer 的另一 Grace 组（host GPU2，local NUMA1）完成两次远端读取诊断。GPU2 通过既有 `HOST_NUMA` + `FABRIC` 映射直接读 owner 的两张完整表，consumer 不分配 202 GB 本地表。
+
+| run | N logical B | 2N logical B | owner c2c0_pmu_0 N | owner c2c0_pmu_0 2N | N/logical | 2N/logical |
+|---|---:|---:|---:|---:|---:|---:|
+| v1 | 2,179,457,280 | 4,358,914,560 | 2,377,687,552 | 4,755,374,592 | 1.09095396 | 1.09095384 |
+| v2 | 2,179,457,280 | 4,358,914,560 | 2,377,687,040 | 4,755,377,664 | 1.09095373 | 1.09095455 |
+
+两轮 `exact_bf16=true`、native counters 全 0、CLOSED 6.391 s / 6.923 s；2N/N = 1.99999978 / 2.00000151。v2 consumer 本地 C2C 只有 `c2c0_pmu_0=0`，其余三个 PMU 10.7/23.4/10.7 MB，相对 4.76 GB 远端读取没有 GB 级本地 bulk。
+
+**边界：** owner PMU 是 system-wide、55 s 窗口；v2 另一 C2C PMU 的 121 GB 总计数与本轮采样区间不对应，按背景流量保留，不归因给本次读取。该实验只证明 **N1 功能路径**（内容、计数口径、consumer 本地无 bulk），不证明带宽、延迟或逐 step ≤100 μs。GPU2 的本地 pinned 基线是另一项组件 screen，不能与 N1 的远端时延混用。
+
+**矩阵状态：** N0（GPU0）与 N1（GPU2）功能格已实测通过；N2、F2、EP、C1 仍未执行。consumer Grace 组变化没有破坏远端读取路径，但尚不能回答跨组延迟差异。
