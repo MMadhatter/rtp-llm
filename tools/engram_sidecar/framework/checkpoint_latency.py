@@ -482,7 +482,9 @@ def main(argv=None):
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
-        emit("FAILED", error_type=type(error).__name__, message=str(error))
+        # pybind overload errors can include argument reprs, including opaque
+        # Fabric capabilities. Never publish arbitrary exception text or codes.
+        emit("FAILED", error_type=type(error).__name__)
         return 1
 
 
