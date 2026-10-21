@@ -3,8 +3,10 @@
 
 Imports do not initialize CUDA. The caller supplies a native backend and trusted
 ExpectedLayout. Checkpoint inputs must remain read-only throughout inspection
-and loading; stat tokens detect ordinary replacement/truncation, not adversarial
-in-place modification. The budget covers padded native backing, NOT total RSS:
+and loading; stat tokens detect ordinary replacement/truncation, not all
+in-place modification. A same-tick write can preserve ctime; restoring mtime
+then leaves the token unchanged. These tokens do not prove content immutability.
+The budget covers padded native backing, NOT total RSS:
 file page-cache residency and Python/header overhead are separate. Optional
 cache advice is exclusively for operator-confirmed private immutable copies;
 it never establishes that the OS actually reclaimed memory.

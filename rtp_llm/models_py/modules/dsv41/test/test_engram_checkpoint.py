@@ -11,6 +11,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -503,18 +504,30 @@ class CheckpointTest(unittest.TestCase):
         self.assert_code("CHECKPOINT_OR_GRANULARITY_CHANGED", self.load, native, plan)
         self.assertEqual(native.owners, [])
 
-    def test_same_size_payload_write_with_restored_mtime_is_rejected(self):
+    def test_same_size_payload_write_with_restored_mtime_and_changed_ctime_is_rejected(self):
         plan = self.inspect()
         path = self.root / "weights.safetensors"
         original = path.stat()
-        with path.open("r+b") as source:
-            source.seek(-1, 2)
-            value = source.read(1)
-            source.seek(-1, 2)
-            source.write(bytes((value[0] ^ 1,)))
-            source.flush()
-            os.fsync(source.fileno())
-        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+        value = path.read_bytes()[-1:]
+        # Linux filesystems can assign identical ctime to consecutive writes
+        # within one clock tick, even when stat exposes a nanosecond field.
+        # Exercise a real ctime-only identity change, not a timing assumption.
+        deadline = time.monotonic() + 2
+        while True:
+            with path.open("r+b") as source:
+                source.seek(-1, 2)
+                source.write(bytes((value[0] ^ 1,)))
+                source.flush()
+                os.fsync(source.fileno())
+            os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+            changed = path.stat()
+            if changed.st_ctime_ns != original.st_ctime_ns:
+                break
+            self.assertLess(time.monotonic(), deadline, "filesystem did not expose a ctime change")
+            time.sleep(0.01)
+        for name in ("st_dev", "st_ino", "st_size", "st_mtime_ns"):
+            self.assertEqual(getattr(changed, name), getattr(original, name))
+        self.assertNotEqual(path.read_bytes()[-1:], value)
         native = FakeNative()
         self.assert_code("CHECKPOINT_OR_GRANULARITY_CHANGED", self.load, native, plan)
         self.assertEqual(native.owners, [])
