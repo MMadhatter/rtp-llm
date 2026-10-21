@@ -1,15 +1,18 @@
 """CPU contracts for the real-table latency harness; no fabricated GPU pass."""
 import copy
 from contextlib import nullcontext, redirect_stdout
+import ctypes
+import errno
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SPEC = importlib.util.spec_from_file_location("checkpoint_latency_under_test", Path(__file__).with_name("checkpoint_latency.py"))
@@ -26,6 +29,7 @@ class LatencyContractTest(unittest.TestCase):
                                warmup=20, device=0, cpu_slot=0, seed=7,
                                layer_mode="single", memory_headroom_gib=16,
                                discard_private_source_cache=False,
+                               source_cache_numa=None,
                                calibration_samples=100, threshold_us=100.0)
 
     def test_default_screen_and_all_supported_decode_batches(self):
@@ -43,6 +47,18 @@ class LatencyContractTest(unittest.TestCase):
         for selected in ([1], [2, 14], [1, 1], []):
             with self.assertRaises(ValueError):
                 h.layer_groups((1, 14), selected, "together")
+
+    def test_source_numa_is_explicit_and_requires_private_cache_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = self.options(Path(directory))
+            self.assertIsNone(h.check_options(copy.copy(base)).source_cache_numa)
+            for node, advice in ((1, False), (-1, True), (True, True), (1.5, True)):
+                args = copy.copy(base)
+                args.source_cache_numa, args.discard_private_source_cache = node, advice
+                with self.subTest(node=node, advice=advice), self.assertRaises(ValueError):
+                    h.check_options(args)
+            base.source_cache_numa, base.discard_private_source_cache = 1, True
+            self.assertEqual(h.check_options(base).source_cache_numa, 1)
 
     def test_together_invokes_each_layer_once_with_its_own_ids_and_returns_both(self):
         calls, ids, results = [], {1: object(), 14: object()}, {1: object(), 14: object()}
@@ -349,6 +365,348 @@ class LatencyContractTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Unregister failed"):
             h.close_local(control, torch)
         self.assertEqual(calls, ["drain", "unregister"])
+
+    def alias_inputs(self, *, pointers=(111, 222), delta=0, status=0):
+        def tensor(pointer):
+            return SimpleNamespace(data_ptr=lambda: pointer)
+        runtime = SimpleNamespace(cudaHostGetDevicePointer=Mock(side_effect=[(status, 111), (0, 222)]))
+        control = SimpleNamespace(weight=tensor(11), scales=tensor(22), device=0, runtime=runtime)
+        embedding = SimpleNamespace(_uva=tuple(tensor(pointer) for pointer in pointers))
+        wrapper = Mock(return_value=embedding)
+        torch = SimpleNamespace(cuda=SimpleNamespace(device=lambda _: nullcontext(),
+                                memory_allocated=Mock(side_effect=[10, 10 + delta])))
+        return control, wrapper, torch, embedding
+
+    def test_baseline_views_must_alias_both_registered_host_addresses_without_allocation(self):
+        control, wrapper, torch, expected = self.alias_inputs()
+        embedding, evidence = h.make_local_embedding(control, wrapper, torch)
+        self.assertIs(embedding, expected)
+        self.assertEqual(evidence, dict(weight_alias=True, scale_alias=True, cuda_allocated_delta_bytes=0))
+        wrapper.assert_called_once_with(control.weight, control.scales, pinned=control)
+        self.assertEqual(control.runtime.cudaHostGetDevicePointer.call_args_list[0].args, (11, 0))
+        self.assertEqual(control.runtime.cudaHostGetDevicePointer.call_args_list[1].args, (22, 0))
+        with tempfile.TemporaryDirectory() as directory:
+            h.write_new_json(Path(directory) / "alias.json", evidence)
+
+    def test_baseline_alias_or_allocation_failure_is_fatal(self):
+        for options in (dict(pointers=(111, 223)), dict(pointers=(112, 222)), dict(delta=1), dict(delta=-1), dict(status=1)):
+            with self.subTest(options=options), self.assertRaises(RuntimeError):
+                h.make_local_embedding(*self.alias_inputs(**options)[:3])
+
+
+class SourceCacheContractTest(unittest.TestCase):
+    def setUp(self):
+        self.retained = len(h._FAILED_RESOURCES)
+
+    def tearDown(self):
+        del h._FAILED_RESOURCES[self.retained:]
+
+    def snapshot(self):
+        gib = 1 << 30
+        return dict(cgroups=[dict(path="current", current_bytes=100*gib, max_bytes=384*gib)],
+                    host_available_bytes=300*gib, numa_free_bytes=120*gib,
+                    source_numa_free_bytes=120*gib, shm_free_bytes=120*gib)
+
+    def budget_args(self, phase="before_prefault"):
+        gib = 1 << 30
+        return dict(table_bytes=95*gib, source_bytes=95*gib, headroom_bytes=16*gib, phase=phase)
+
+    def test_split_admission_requires_full_global_charge_but_each_numa_only_its_allocation(self):
+        result = h.check_source_cache_budget(self.snapshot(), **self.budget_args())
+        self.assertEqual(result["future_table_bytes"], 95 << 30)
+        self.assertEqual(result["future_source_bytes"], 95 << 30)
+        self.assertEqual(result["transient_touch_bytes"], 8 << 20)
+        # 120 GiB per NUMA can admit 95 GiB each; 190 GiB on one NUMA cannot.
+        with self.assertRaises(RuntimeError):
+            h.check_memory_budget(self.snapshot(), **{k: v for k, v in self.budget_args().items() if k != "phase"}, before=True)
+        for field in ("host_available_bytes", "numa_free_bytes", "source_numa_free_bytes", "shm_free_bytes"):
+            snapshot = self.snapshot(); snapshot[field] = 0
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                h.check_source_cache_budget(snapshot, **self.budget_args())
+        snapshot = self.snapshot()
+        snapshot["cgroups"].append(dict(path="ancestor", current_bytes=200 << 30, max_bytes=384 << 30))
+        with self.assertRaisesRegex(RuntimeError, "cgroup"):
+            h.check_source_cache_budget(snapshot, **self.budget_args())
+
+    def test_transient_margin_is_real_and_all_sources_are_charged_together(self):
+        snapshot = self.snapshot()
+        required = (95 + 95 + 16) * (1 << 30) + h.SOURCE_TOUCH_BYTES
+        snapshot["host_available_bytes"] = required - 1
+        with self.assertRaisesRegex(RuntimeError, "host"):
+            h.check_source_cache_budget(snapshot, **self.budget_args())
+        snapshot["host_available_bytes"] += 1
+        h.check_source_cache_budget(snapshot, **self.budget_args())
+        args = self.budget_args(); args["source_bytes"] *= 2
+        with self.assertRaises(RuntimeError):
+            h.check_source_cache_budget(self.snapshot(), **args)
+
+    def test_resident_source_is_not_charged_again_but_actual_remaining_memory_still_checked(self):
+        snapshot = self.snapshot()
+        snapshot["cgroups"][0]["current_bytes"] = 220 << 30
+        snapshot["source_numa_free_bytes"] = 20 << 30
+        evidence = h.check_source_cache_budget(snapshot, **self.budget_args("prefaulted"))
+        self.assertEqual(evidence["future_source_bytes"], 0)
+        self.assertEqual(evidence["future_table_bytes"], 95 << 30)
+        snapshot["cgroups"][0]["current_bytes"] = 370 << 30
+        with self.assertRaises(RuntimeError):
+            h.check_source_cache_budget(snapshot, **self.budget_args("after_load"))
+        snapshot["cgroups"][0]["current_bytes"] = 350 << 30
+        snapshot["numa_free_bytes"] = 20 << 30
+        result = h.check_source_cache_budget(snapshot, **self.budget_args("after_load"))
+        self.assertEqual((result["future_table_bytes"], result["future_source_bytes"]), (0, 0))
+
+    def test_complete_mapping_counts_partial_tail_and_greater_than_4gib_without_truncation(self):
+        self.assertEqual(h.rounded_mapping_bytes((1 << 32) + 1, 65536), (1 << 32) + 65536)
+        text = "1000 default file=/source/shard N1=65537 kernelpagesize_kB=64\n"
+        result = h.parse_complete_numa_pages(text, 0x1000, 1, (1 << 32) + 1, 65536)
+        self.assertEqual(result["resident_pages"], 65537)
+        self.assertEqual(result["node_pages"], {"1": 65537})
+        for size, page in ((0, 4096), (-1, 4096), (True, 4096), (1, 0), (1, 3), (sys.maxsize, 4096), (sys.maxsize + 1, 4096)):
+            with self.subTest(size=size, page=page), self.assertRaises(ValueError):
+                h.rounded_mapping_bytes(size, page)
+
+    def test_complete_mapping_refuses_missing_tail_mixed_nodes_or_incompatible_page_size(self):
+        text = "1000 default file=/source/shard N1=3 kernelpagesize_kB=4\n"
+        h.parse_complete_numa_pages(text, 0x1000, 1, 8193, 4096)
+        for bad in (text.replace("N1=3", "N1=2"), text.replace("N1=3", "N1=4"),
+                    text.replace("N1=3", "N1=2 N0=1"), text.replace("N1=3", "N0=3"),
+                    text.replace("N1=3", ""), text.replace("kB=4", "kB=64"),
+                    text.replace("1000", "2000"), text + text, text.replace("file=", "anon=")):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                h.parse_complete_numa_pages(bad, 0x1000, 1, 8193, 4096)
+
+    def private_file(self, directory, name="shard", size=8193):
+        root = Path(directory).resolve(); root.chmod(0o700)
+        path = root / name
+        path.write_bytes(b"a" * (size - 1) + b"z"); path.chmod(0o400)
+        return root, path
+
+    def test_real_readonly_mmap_reads_every_chunk_and_releases_fd_and_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.private_file(directory, size=h.SOURCE_TOUCH_BYTES + 129)
+            mapping = h.ReadOnlySourceMapping(root, path)
+            fd = mapping.fd
+            try:
+                self.assertEqual(mapping.touch(), path.stat().st_size)
+                self.assertEqual(ctypes.string_at(mapping.address + mapping.size - 1, 1), b"z")
+                self.assertEqual(mapping.libc.mmap.restype, ctypes.c_void_p)
+                self.assertGreaterEqual(mapping.resident_bytes, mapping.size)
+            finally:
+                mapping.close()
+            self.assertIsNone(mapping.address)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+            mapping.close()
+            with self.assertRaises(RuntimeError):
+                mapping.touch()
+
+    def test_private_mmap_rejects_writable_shared_symlink_and_nonprivate_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.private_file(directory)
+            for mode in (0o600, 0o444):
+                path.chmod(mode)
+                with self.assertRaises(ValueError):
+                    h.ReadOnlySourceMapping(root, path)
+            path.chmod(0o400)
+            os.link(path, root / "hardlink")
+            with self.assertRaises(ValueError):
+                h.ReadOnlySourceMapping(root, path)
+            (root / "hardlink").unlink()
+            (root / "symlink").symlink_to(path)
+            with self.assertRaises(RuntimeError):
+                h.ReadOnlySourceMapping(root, root / "symlink")
+            root.chmod(0o755)
+            with self.assertRaises(ValueError):
+                h.ReadOnlySourceMapping(root, path)
+
+    def test_mmap_failed_uses_errno_and_closes_fd_without_unmapping_sentinel(self):
+        libc = SimpleNamespace(mmap=Mock(return_value=ctypes.c_void_p(-1).value), munmap=Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.private_file(directory)
+            with patch.object(ctypes, "CDLL", return_value=libc), patch.object(ctypes, "get_errno", return_value=errno.ENOMEM):
+                with self.assertRaises(OSError) as caught:
+                    h.ReadOnlySourceMapping(root, path)
+            self.assertEqual(caught.exception.errno, errno.ENOMEM)
+            fd = libc.mmap.call_args.args[4]
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+            libc.munmap.assert_not_called()
+
+    def test_failed_munmap_keeps_address_for_retry_and_closes_fd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.private_file(directory)
+            mapping = h.ReadOnlySourceMapping(root, path)
+            original, address, fd = mapping.libc, mapping.address, mapping.fd
+            mapping.libc = SimpleNamespace(munmap=Mock(return_value=-1))
+            with patch.object(ctypes, "get_errno", return_value=errno.EINVAL), self.assertRaises(OSError):
+                mapping.close()
+            self.assertEqual(mapping.address, address)
+            self.assertIsNone(mapping.fd)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+            mapping.libc = original
+            mapping.close()
+
+    def test_cpu_selection_uses_original_affinity_intersection(self):
+        with patch.object(Path, "read_text", return_value="64-67,70\n"):
+            self.assertEqual(h.cpu_on_node(1, {0, 66, 70}), 66)
+            with self.assertRaises(RuntimeError):
+                h.cpu_on_node(1, {0})
+
+    def fake_batch(self):
+        batch = object.__new__(h.SourceCacheBatch)
+        batch.node, batch.allowed_cpus = 1, {0, 64}
+        batch.mappings = [SimpleNamespace(size=4097, resident_bytes=8192, touch=Mock(return_value=4097), close=Mock()),
+                          SimpleNamespace(size=8193, resident_bytes=12288, touch=Mock(return_value=8193), close=Mock())]
+        return batch
+
+    def test_batch_accumulates_all_sources_and_restores_local_cpu_after_complete_prefault(self):
+        batch = self.fake_batch()
+        self.assertEqual(batch.resident_bytes, 20480)
+        with patch.object(os, "sched_getaffinity", return_value={0}, create=True), \
+             patch.object(os, "sched_setaffinity", create=True) as bind, \
+             patch.object(h, "cpu_on_node", return_value=64) as select:
+            self.assertEqual(batch.prefault(), 64)
+            self.assertEqual([call.args for call in bind.call_args_list], [(0, {64}), (0, {0})])
+            select.assert_called_once_with(1, {0, 64})
+        for mapping in batch.mappings:
+            mapping.touch.assert_called_once_with()
+
+    def test_partial_touch_and_read_exception_both_restore_prior_affinity(self):
+        for failure in (None, OSError("read failed")):
+            batch = self.fake_batch()
+            if failure is None:
+                batch.mappings[0].touch.return_value = 1
+            else:
+                batch.mappings[0].touch.side_effect = failure
+            with patch.object(os, "sched_getaffinity", return_value={0}, create=True), \
+                 patch.object(os, "sched_setaffinity", create=True) as bind, \
+                 patch.object(h, "cpu_on_node", return_value=64), self.assertRaises((RuntimeError, OSError)):
+                batch.prefault()
+            self.assertEqual(bind.call_args.args, (0, {0}))
+            batch.mappings[1].touch.assert_not_called()
+
+    def test_failed_affinity_restore_is_fatal_and_never_returns_a_successful_prefault(self):
+        batch = self.fake_batch()
+        with patch.object(os, "sched_getaffinity", return_value={0}, create=True), \
+             patch.object(os, "sched_setaffinity", side_effect=[None, OSError("restore failed")], create=True) as bind, \
+             patch.object(h, "cpu_on_node", return_value=64), self.assertRaisesRegex(OSError, "restore failed"):
+            batch.prefault()
+        self.assertEqual(bind.call_args.args, (0, {0}))
+
+    def construction(self, *, failure=None):
+        events = []
+        control = SimpleNamespace(storage=SimpleNamespace(data_ptr=lambda: 0x2000),
+                    _registration_finalizer=SimpleNamespace(atexit=True),
+                    _lease_finalizer=SimpleNamespace(atexit=True))
+        cache = SimpleNamespace(resident_bytes=20480)
+        cache.prefault = lambda: events.append("prefault") or 64
+        def verify():
+            events.append("verify")
+            if failure == "verify_before":
+                raise RuntimeError("source placement incomplete")
+            if failure == "verify_after" and events.count("verify") == 2:
+                raise RuntimeError("post-copy source moved")
+            return [dict(node_pages={"1": 5})]
+        def close():
+            events.append("close_source")
+            if failure == "close":
+                raise RuntimeError("source close failed")
+        def construct():
+            events.append("main_construct")
+            self.assertNotIn("close_source", events)
+            if failure == "construct":
+                raise RuntimeError("main construction failed")
+            return control
+        cache.verify, cache.close = verify, close
+        if failure == "affinity_restore":
+            cache.prefault = Mock(side_effect=OSError("restore failed"))
+        def budget(snapshot, **kwargs):
+            events.append(kwargs["phase"])
+            self.assertEqual(kwargs["source_bytes"], 20480)
+            return {"phase": kwargs["phase"]}
+        context = dict(source=Path("/private/source"), files=[Path("/private/source/shard")], source_node=1,
+                       gpu_node=0, allowed_cpus={0, 64}, table_bytes=4097, headroom_bytes=16 << 30, construct=construct)
+        return control, cache, budget, events, context
+
+    def execute_construction(self, values):
+        control, cache, budget, events, context = values
+        with patch.object(h, "SourceCacheBatch", return_value=cache), \
+             patch.object(h, "memory_snapshot", return_value=self.snapshot()), \
+             patch.object(h, "check_source_cache_budget", side_effect=budget), \
+             patch.object(h, "parse_complete_numa_pages", return_value={"node_pages": {"0": 2}}), \
+             patch.object(Path, "read_text", return_value="unused"):
+            return h.construct_with_source_cache(**context)
+
+    def test_source_maps_survive_main_construction_with_complete_before_and_after_checks(self):
+        values = self.construction()
+        control, evidence = self.execute_construction(values)
+        self.assertIs(control, values[0])
+        self.assertEqual(values[3], ["before_prefault", "prefault", "verify", "prefaulted", "main_construct",
+                                     "verify", "after_load", "close_source"])
+        self.assertFalse(evidence["eviction_prevented"])
+        with tempfile.TemporaryDirectory() as directory:
+            h.write_new_json(Path(directory) / "source-cache.json", evidence)
+
+    def test_postconstruction_verification_or_cleanup_failure_retains_registered_control(self):
+        for failure in ("verify_after", "close"):
+            values = self.construction(failure=failure)
+            with self.subTest(failure=failure), self.assertRaises(RuntimeError):
+                self.execute_construction(values)
+            self.assertEqual(values[3][-1], "close_source")
+            self.assertFalse(values[0]._registration_finalizer.atexit)
+            self.assertTrue(any(values[0] is item for group in h._FAILED_RESOURCES for item in group))
+
+    def test_construct_failure_closes_only_source_maps_and_same_node_is_rejected_before_mapping(self):
+        values = self.construction(failure="construct")
+        with self.assertRaises(RuntimeError):
+            self.execute_construction(values)
+        self.assertEqual(values[3][-1], "close_source")
+        self.assertTrue(values[0]._registration_finalizer.atexit)
+        values[-1]["source_node"] = 0
+        with patch.object(h, "SourceCacheBatch") as mapping, self.assertRaises(ValueError):
+            h.construct_with_source_cache(**values[-1])
+        mapping.assert_not_called()
+
+    def test_failed_prefault_or_source_validation_never_calls_main_constructor(self):
+        for failure in ("affinity_restore", "verify_before"):
+            values = self.construction(failure=failure)
+            with self.subTest(failure=failure), self.assertRaises((RuntimeError, OSError)):
+                self.execute_construction(values)
+            self.assertNotIn("main_construct", values[3])
+            self.assertEqual(values[3][-1], "close_source")
+
+    def test_mapping_identity_is_rechecked_after_read_and_changed_source_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, path = self.private_file(directory)
+            mapping = h.ReadOnlySourceMapping(root, path)
+            try:
+                mapping.touch()
+                page_kib = mapping.page_size // 1024
+                text = (f"{mapping.address:x} default file=/source/shard N1={mapping.resident_bytes // mapping.page_size} "
+                        f"kernelpagesize_kB={page_kib}\n")
+                self.assertEqual(mapping.verify(text, 1)["file_bytes"], 8193)
+                path.chmod(0o600)  # Even unchanged bytes are no longer the admitted immutable source.
+                with self.assertRaises(RuntimeError):
+                    mapping.verify(text, 1)
+            finally:
+                mapping.close()
+
+    def test_partial_batch_creation_failure_closes_previous_maps(self):
+        previous = SimpleNamespace(close=Mock())
+        with patch.object(h, "ReadOnlySourceMapping", side_effect=[previous, OSError("second open failed")]), \
+             self.assertRaisesRegex(OSError, "second open failed"):
+            h.SourceCacheBatch(Path("/private/source"), [Path("first"), Path("second")], 1, {0, 64})
+        previous.close.assert_called_once_with()
+
+    def test_source_batch_cleanup_attempts_all_mappings_and_retains_failed_mapping(self):
+        batch = self.fake_batch()
+        batch.mappings[1].close.side_effect = OSError("munmap failed")
+        with self.assertRaises(RuntimeError):
+            batch.close()
+        for mapping in batch.mappings:
+            mapping.close.assert_called_once_with()
+        self.assertIs(h._FAILED_RESOURCES[-1][0], batch)
 
 
 if __name__ == "__main__":
