@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "run_label": "B1-v1",
+  "scope": "STANDALONE_CROSS_HOST_FULL_MODEL_HTTP_READINESS_NOT_ABBA",
+  "status": "CROSS_HOST_EXTERNAL_HTTP_PASS",
+  "runtime_source_commit": "3ac1fbda79b3509b554b562775a46138d586afd3",
+  "release_base": "cb42b084a8a6350daa70897555f18d5f1b47f58e",
+  "storage": {
+    "mode": "external-egm",
+    "owner_consumer_separate_hosts_and_containers": true,
+    "engram_layers": [
+      1,
+      14
+    ],
+    "owner_allocation_count": 2,
+    "owner_physical_bytes": 202758946816,
+    "consumer_rank_count": 4,
+    "full_consumer_engram_table_copy": false,
+    "evidence_boundary": "External attachment uses the existing Owner publication. This readiness check is not a new independent system-wide memory census."
+  },
+  "live_worker_validation": {
+    "ranks": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "external_attach_logged_for_both_layers": true,
+    "attach_to_ready_process_identity_match": true,
+    "fresh_artifacts_per_worker": 5,
+    "one_backing_per_artifact_verified": true,
+    "method": "Verified artifact digests plus live mapping size/device/inode identity; the same four worker identities later reached READY.",
+    "artifact_sha256": {
+      "librtp_compute_ops.so": "6d0efb140cfd39effdb8c2e532cb42ce1d1a75ea4e72650701d0bc60ff79d39f",
+      "libth_grammar_tokenizer_info.so": "0005d29292605d22eed27fd8cf68c03d6752668810fb99df126064612a27d8df",
+      "libth_transformer.so": "39c2f63f194529153042bcd267beada54390af2dae4450c43599e2d2f5aeb808",
+      "libth_transformer_config.so": "ce0e186ab39a7d784ea0b086a06cd2251e9fa05b9146d488d0fccd1a8d19f096",
+      "consumer_sharing_bridge": "679b0c495ae42fc4351e3c8b780efb40b08b98a2d7f8e5c7e12d1ea432ac0438"
+    }
+  },
+  "health": {
+    "status": "BACKEND_HEALTH_OK",
+    "separate_prefill_warmup_health_gate": "NOT_APPLICABLE_TO_DEEPSEEK_V41_PDFUSION"
+  },
+  "http": {
+    "status": "CHAT_OK",
+    "readable_chinese_output": true,
+    "content": "你好！我是DeepSeek，由深度求索公司创造的AI助手，随时准备用热情和知识帮你解答问题、提供建议！😊",
+    "finish_reason": "length",
+    "usage": {
+      "completion_tokens": 32,
+      "prompt_tokens": 12,
+      "total_tokens": 44
+    },
+    "performance_request": false
+  },
+  "startup_graph": {
+    "status": "FOUR_RANK_CAPTURE_AND_FIRST_REPLAY_SYNC",
+    "batch": 1,
+    "ranks": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "capture_then_end_marker_order_verified": true,
+    "actual_http_request_graph_execution": "NOT_PROVEN"
+  },
+  "request_graph_diagnostic": {
+    "label": "graph-v1",
+    "status": "PRECONDITION_REJECTED_BEFORE_DIAGNOSTIC_HTTP",
+    "error_type": "PhaseError",
+    "error_code": "diagnostic_or_async_environment_changed",
+    "diagnostic_http_requests": 0,
+    "profiler_armed": false,
+    "observation": "Expected environment entries were missing from the recorded process-environment observation for all four ranks. Effective runtime values are not established by that absence.",
+    "interpretation": "No observed GPU or Graph execution failure; no request trace was collected by this attempt.",
+    "followup_cpu_reproduction": {
+      "status": "REPRODUCED_ENVIRONMENT_OBSERVABILITY_GAP",
+      "setproctitle_version": "1.3.7",
+      "cases": 2,
+      "default_after_title_proc_entries_visible": false,
+      "default_after_title_python_eight_flags_still_zero": true,
+      "SPT_NOENV_1_preserves_proc_flags": true,
+      "both_children_exited": true,
+      "torch_or_gpu_used": false,
+      "limit": "A separate small CPU process reproduced the observation failure. It does not retroactively provide the stopped model workers' effective environment or actual request Graph trace."
+    }
+  },
+  "formal_validation": {
+    "local_pinned_A": "NOT_COMPLETED",
+    "abba_cycle": "NOT_RUN",
+    "formal_256_token_requests": 0,
+    "full_model_request_mean_latency_increment": "NOT_MEASURED",
+    "per_decode_step_tail_latency": "NOT_MEASURED",
+    "latency_100us_acceptance": "NOT_PASSED_COMPONENT_EXCEEDANCES_RETAINED",
+    "consumer_shutdown": "CLOSED_OWNED_PROCESS_AND_GPU_PROCESS_CHECKS_PASS",
+    "owner_shutdown": "NOT_PERFORMED_OWNER_REMAINS_SEPARATE_LIVE_SERVICE"
+  },
+  "provenance": {
+    "readiness_archive": {
+      "sha256": "3c18f888c157926f1f3c83535a22be57a7d2adf75ecf23027a45ab4e000f8059",
+      "bytes": 194860,
+      "verified_members": 18,
+      "archive_published": false
+    },
+    "readiness_archive_receipt_sha256": "923f97c6b919dc3917007641d8cf0c71ffef38c90d79a3736d72b72ba291b844",
+    "readiness_member_sha256": {
+      "ready.json": "1a5858301edf67fe27f119b34676cac0cb97834c5afd7ee4ab9bcb3cbc77ca2b",
+      "http-probe.json": "f3399325e5ecf8d8307042339b4ecc1504f213a7000d771bf9ad7a945e64d868",
+      "http-health.json": "26be003ec7aaba35d1e69f2dab08cb6b40426eba4c99b2aee83538b733659e29",
+      "graph-warmup.json": "21cacca297348ba41181fae2d4140bac73b96d1f2bf8f5273fb55993f6c97534"
+    },
+    "progress_snapshot_sha256": "a03e394eec075e32563ad1e4efe0d38da7f496e9658de3dd603f7b5cb16707bf",
+    "startup_identity_diagnosis_sha256": "43f13197bbdff98643296056b5d2eed7d09684f41b9e82c71c20343695f6ad2b",
+    "owner_ready_observation_sha256": "fffb819ccb4132477a2b08bd01d7a8a94466880bcfc0ffe99fde981e516c7e05",
+    "diagnostic_preflight_sha256": "453ee47494d70746197139a6a7024786d347e806080de5773956943f470df867",
+    "diagnostic_client_status_sha256": "f2adb03fcda8347ecd12aaa4a877e36725fb336ec2b7ed00dcf41aeee02894c1",
+    "diagnostic_environment_observation_sha256": "05a1a274b94e77f4316debae08a90a3cfcaeef739dc34db4f0e5c6ce812d9b1b",
+    "consumer_close_proof_sha256": "e66a331089bd84c118cd28210494a3c5b4d0a15defc1cdbd7832a492f03ff481",
+    "setproctitle_cpu_reproduction_sha256": "8154e300fce0b0b97bad5aff7cccfe2fb430a2d0ed39c9663456b2b5768cfd00"
+  },
+  "privacy": "Only selected statuses, output, counts and digests are published. Original operational archives remain private; no process or machine identifiers, addresses, private paths, publication generation or sharing capabilities are included.",
+  "consumer_cleanup": {
+    "status": "PASS",
+    "supervisor_status": "CLOSED",
+    "cleanup_complete": true,
+    "remaining_owned_processes": 0,
+    "independent_original_identity_survivors": 0,
+    "nvml_query_returncode": 0,
+    "consumer_gpu_compute_processes": 0,
+    "eight_native_resource_counters_measured": false,
+    "scope": "Exact owned process exit plus consumer GPU-process check; this is not an eight-counter native resource audit or Owner shutdown."
+  }
+}

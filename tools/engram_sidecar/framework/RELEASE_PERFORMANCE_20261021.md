@@ -3,9 +3,10 @@
 **The fresh Owner and consumer native runtime are READY. The unprofiled
 two-layer component screen and normal run are complete, with observed
 increments above 100 microseconds; the target has not passed on this release.**
-Full-model validation remains IN_PROGRESS: startup, serving, performance and
-actual request-Graph results are not established by the component run. This is
-a stage report, not a claim that historical tails have been fixed.
+Full-model external-EGM B has now passed standalone cross-host startup and
+HTTP chat readiness. Local-pinned A, formal A/B performance and actual request
+Graph execution remain unverified; the B model consumer has exited with
+owned-process and GPU-process cleanup checks passed. This is a stage report, not a claim that historical tails have been fixed.
 
 The actual deployed/tested source remains
 `3ac1fbda79b3509b554b562775a46138d586afd3`, based on release
@@ -35,6 +36,10 @@ rebase validation, including its retained initial failures and targeted fixes.
 | Actual two-table consumer lookup and Graph correctness | PASS for screen and normal run; both full raw FP8/E8M0 tables, actual eager/Graph BF16 outputs checked against CPU references | Batch-1 lookup components only; independent inputs, serial layers, no intervening model computation or HTTP. |
 | Component resource cleanup | PASS; all eight native counters zero after each run | Measured consumer cleanup, not the still-READY Owner's shutdown. |
 | Component additional latency | **FAIL_OBSERVED**; normal run has 40,000 pairs, including 20,000 Graph pairs; Graph GPU maximum increment **207.424 µs**, with 1 positive GPU and 18 positive wall exceedances | Separate clocks; eager also has exceedances. All raw-derived pairs and signed outliers are retained. Causes remain unresolved. |
+| Cross-host full-model B HTTP readiness | **PASS**; four external ranks, five fresh mapped artifacts each, 12 prompt / 32 completion tokens, readable Chinese response | Standalone external-EGM readiness only; local-pinned A and formal A/B requests are not complete. |
+| Full-model B startup Graph | PASS; all four ranks reached batch-1 capture and first-replay synchronization, then capture completion | These are startup markers, not proof of actual HTTP request Graph dispatch. |
+| Full-model B request Graph diagnostic | PRECONDITION_REJECTED; environment observation failed its guard before diagnostic HTTP/profiler start | Zero diagnostic requests, profiler not armed; a separate CPU reproduction identified a process-title/environment-observation limitation. No GPU/Graph failure or request trace is established. |
+| Full-model B consumer shutdown | PASS; CLOSED, no remaining owned process by independent exact-identity check, no consumer GPU compute process | Process-level cleanup only; no full-model eight-counter native audit. Owner remains a separate live service. |
 
 The Owner uses a standalone torch environment and a newly built bridge from
 the recorded source. It does not load the old RTP engine libraries. It is not
@@ -75,8 +80,9 @@ the new build root and its separately verified output happened to be identical.
 
 ## Still pending
 
-1. Complete real full-model startup and chat correctness for both storage
-   modes. The successful CPU/native runtime gate does not replace this gate.
+1. Complete local-pinned A full-model startup and chat correctness. Cross-host
+   external-EGM B has passed its standalone readiness check; it is not a
+   completed formal A/B phase.
 2. Prove actual request Graph execution independently for both storage modes.
    Startup capture logs alone are insufficient. The diagnostic must bind four
    known rank processes to nested decode/Graph/replay scopes, an actual Graph
@@ -87,6 +93,12 @@ the new build root and its separately verified output happened to be identical.
    cleanup before closing that run.
 4. Investigate the retained component tails with correlated evidence when
    useful; a later repeat must not replace this run's unfavorable samples.
+
+The [cross-host full-model HTTP report](results/20261021_crosshost_http/README.md)
+records B readiness, four-rank identity continuity, startup Graph evidence and
+the separate request-diagnostic precondition rejection, its CPU reproduction,
+and the B consumer's process-level cleanup. No full-model latency result is
+published, and Owner shutdown is not claimed.
 
 The completed [release component report](results/20261021_release_components/README.md)
 contains the screen and normal results, all 40,400 sanitized raw-derived pairs,
