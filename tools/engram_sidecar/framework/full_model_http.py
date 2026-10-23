@@ -239,6 +239,7 @@ def launch_environment(args, inherited=None):
         "FRONTEND_SERVER_COUNT": "1", "START_PORT": str(args.port), "WARM_UP": "1", "MODEL_WARM_UP": "1",
         "PYTHONPATH": str(REPO) + os.pathsep + env.get("PYTHONPATH", ""),
     })
+    env["RTP_ENGRAM_MODE"] = "shared" if storage_mode == "external-egm" else "local"
     if storage_mode == "external-egm":
         env.update({"RTP_ENGRAM_EXTERNAL_BUNDLE": str(args.bundle),
                     "RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(args.max_allocation_bytes),

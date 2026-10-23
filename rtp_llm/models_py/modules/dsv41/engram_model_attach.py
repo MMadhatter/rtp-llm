@@ -10,6 +10,7 @@ There is deliberately no live detach, reload, discovery or service protocol.
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,8 @@ class EngramModelInitializationError(RuntimeError):
 class EngramModelAttachment:
     phase: str = "INITIALIZING"
     external: bool = False
+    storage_mode: str = "local"
+    selection_reason: str = ""
     graph_mode: str = "eager"
     graph_pin_held: bool = False
     process_retained: bool = False
@@ -130,7 +133,12 @@ def initialize_model_engram(
 
         env = os.environ if environ is None else environ
         bundle_path = env.get(EXTERNAL_BUNDLE_ENV)
-        attachment.external = bundle_path is not None
+        from .engram_mode import resolve_mode
+
+        attachment.storage_mode, attachment.selection_reason = resolve_mode(env)
+        attachment.external = attachment.storage_mode == "shared"
+        logging.info("ENGRAM_STORAGE_SELECTION selected=%s reason=%s",
+                     attachment.storage_mode, attachment.selection_reason)
         if attachment.external:
             if not isinstance(bundle_path, str) or not bundle_path or not Path(bundle_path).is_absolute():
                 raise EngramModelInitializationError("INVALID_EXTERNAL_ENGRAM_BUNDLE_PATH")

@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+import tempfile
+from unittest.mock import patch
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "engram_model_attach.py"
@@ -12,6 +14,13 @@ SPEC = importlib.util.spec_from_file_location("engram_model_attach_under_test", 
 attach = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = attach
 SPEC.loader.exec_module(attach)
+mode_spec = importlib.util.spec_from_file_location("engram_mode", SOURCE.with_name("engram_mode.py"))
+mode_module = importlib.util.module_from_spec(mode_spec)
+mode_spec.loader.exec_module(mode_module)
+# Match the standalone module's relative import without loading the RTP engine.
+attach.__package__ = "engram_model_attach_test_package"
+attach.__spec__.name = attach.__package__ + ".engram_model_attach"
+sys.modules[attach.__package__ + ".engram_mode"] = mode_module
 
 
 class Storage:
@@ -134,6 +143,72 @@ class ModelAttachTest(unittest.TestCase):
         self.assertIsNone(state.storage)
         self.assertNotIn("attach", self.trace)
         self.assertEqual(self.retained, [])
+
+    def local_layer(self, config, layer_id, path, device, **kwargs):
+        self.assertEqual(kwargs, {})
+        return Layer(layer_id, self.trace)
+
+    def test_explicit_local_ignores_bundle_and_external_graph_settings(self):
+        env = {**self.env, "RTP_ENGRAM_MODE": "local", attach.EXTERNAL_GRAPH_MODE_ENV: "invalid"}
+        state = self.run_init(environ=env, layer_factory=self.local_layer)
+        self.assertFalse(state.external)
+        self.assertEqual(state.selection_reason, "explicit_local")
+        self.assertNotIn("attach", self.trace)
+
+    def test_auto_without_delivered_bundle_uses_real_local_loader_contract(self):
+        with tempfile.TemporaryDirectory() as folder:
+            env = {"RTP_ENGRAM_MODE": "auto", attach.EXTERNAL_BUNDLE_ENV: folder + "/absent.json"}
+            state = self.run_init(environ=env, layer_factory=self.local_layer)
+        self.assertFalse(state.external)
+        self.assertEqual(state.selection_reason, "bundle_not_delivered")
+        self.assertNotIn("attach", self.trace)
+
+    def test_auto_existing_but_invalid_bundle_never_falls_back(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bundle.json"
+            path.write_text("invalid")
+            def bad_attach(*args, **kwargs):
+                raise ValueError("INVALID_JSON")
+            with self.assertRaisesRegex(ValueError, "INVALID_JSON"):
+                self.run_init(environ={"RTP_ENGRAM_MODE": "auto", attach.EXTERNAL_BUNDLE_ENV: str(path)},
+                              attach_factory=bad_attach, layer_factory=self.local_layer)
+        self.assertEqual(self.model._engram_attachment.phase, "FAILED")
+        self.assertFalse(any(isinstance(x, tuple) for x in self.trace))
+
+    def test_mode_selector_rejects_misconfiguration_and_permission_errors(self):
+        for env in ({"RTP_ENGRAM_MODE": "off"}, {"RTP_ENGRAM_MODE": "shared"},
+                    {"RTP_ENGRAM_MODE": "auto", attach.EXTERNAL_BUNDLE_ENV: ""},
+                    {"RTP_ENGRAM_MODE": "auto", attach.EXTERNAL_BUNDLE_ENV: "relative"}):
+            with self.subTest(env=env), self.assertRaises(ValueError):
+                mode_module.resolve_mode(env)
+        with patch.object(Path, "lstat", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                mode_module.resolve_mode({**self.env, "RTP_ENGRAM_MODE": "auto"})
+
+    def test_auto_symlink_is_not_treated_as_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bundle.json"
+            path.symlink_to(Path(folder) / "absent")
+            self.assertEqual(mode_module.resolve_mode({"RTP_ENGRAM_MODE": "auto",
+                              attach.EXTERNAL_BUNDLE_ENV: str(path)}), ("shared", "bundle_present"))
+
+    def test_launcher_freezes_auto_before_spawn(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bundle.json"
+            env = {"RTP_ENGRAM_MODE": "auto", attach.EXTERNAL_BUNDLE_ENV: str(path)}
+            mode_module.freeze_auto_mode(env)
+            path.write_text("arrived-too-late")
+            self.assertEqual(mode_module.resolve_mode(env), ("local", "explicit_local"))
+            env["RTP_ENGRAM_MODE"] = "auto"
+            mode_module.freeze_auto_mode(env)
+            path.unlink()
+            self.assertEqual(mode_module.resolve_mode(env), ("shared", "explicit_shared"))
+
+    def test_auto_without_path_and_shared_with_missing_path(self):
+        self.assertEqual(mode_module.resolve_mode({"RTP_ENGRAM_MODE": "auto"}),
+                         ("local", "bundle_not_configured"))
+        self.assertEqual(mode_module.resolve_mode({**self.env, "RTP_ENGRAM_MODE": "shared"}),
+                         ("shared", "explicit_shared"))
 
     def test_no_layer_model_skips_bundle_graph_and_hash(self):
         self.layout.layer_ids = ()

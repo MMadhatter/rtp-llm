@@ -98,10 +98,15 @@ class FullModelPreflightTest(unittest.TestCase):
                                max_allocation_bytes=128 << 30, budget_bytes=256 << 30, cuda_graph=True)
         external = launch_environment(args, {})
         args.storage_mode = "local-pinned"
-        local = launch_environment(args, dict.fromkeys(EXTERNAL_ENV, "stale-sensitive-value"))
+        local = launch_environment(args, {**dict.fromkeys(EXTERNAL_ENV, "stale-sensitive-value"),
+                                          "RTP_ENGRAM_MODE": "shared"})
         for name in EXTERNAL_ENV:
             self.assertNotIn(name, local)
-        self.assertEqual({k: v for k, v in external.items() if k not in EXTERNAL_ENV}, local)
+        self.assertEqual(external["RTP_ENGRAM_MODE"], "shared")
+        self.assertEqual(local["RTP_ENGRAM_MODE"], "local")
+        excluded = (*EXTERNAL_ENV, "RTP_ENGRAM_MODE")
+        self.assertEqual({k: v for k, v in external.items() if k not in excluded},
+                         {k: v for k, v in local.items() if k not in excluded})
 
     def test_metadata_screen_counts_geometry_without_weight_loading(self):
         report = checkpoint_preflight(self.root)
