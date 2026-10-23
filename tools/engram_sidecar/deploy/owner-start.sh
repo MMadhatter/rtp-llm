@@ -29,6 +29,7 @@ pouch run -d --name "$NAME" --net=host \
   --user "$CONTAINER_UID:$CONTAINER_GID" --memory "$MEMORY_LIMIT" \
   --nvidia-visible-devs="$GPU_UUID" --nvidia-capabilities=all \
   --device=/dev/nvidia-caps-imex-channels/channel0 \
+  -e USER=rtp-engram -e LOGNAME=rtp-engram -e HOME=/tmp/rtp-engram \
   -e PYTHONUNBUFFERED=1 -e CUDA_VISIBLE_DEVICES=0 \
   -v "$CHECKPOINT:/checkpoint:ro" -v "$STATE_DIR:/run/engram:rw" \
   -v "$TLS_DIR:/run/engram-tls:ro" "${extra[@]}" \

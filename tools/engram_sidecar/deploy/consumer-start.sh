@@ -10,7 +10,8 @@ CONTAINER_GID=${CONTAINER_GID:-$(id -g)}
 [[ $CONTAINER_UID != 0 ]] || exit 2
 [[ -f $MODEL_ENV && -f $CHECKPOINT/config.json ]]
 if pouch inspect "$NAME" >/dev/null 2>&1; then echo 'Container name exists' >&2; exit 2; fi
-args=(--net=host --user "$CONTAINER_UID:$CONTAINER_GID" --memory "$MEMORY_LIMIT"
+args=(-e USER=rtp-engram -e LOGNAME=rtp-engram -e HOME=/tmp/rtp-engram
+      --net=host --user "$CONTAINER_UID:$CONTAINER_GID" --memory "$MEMORY_LIMIT"
       --shm-size "$SHM_SIZE" --nvidia-visible-devs="$GPU_UUIDS" --nvidia-capabilities=all
       --env-file "$MODEL_ENV" -e "RTP_ENGRAM_MODE=$mode" -v "$CHECKPOINT:/checkpoint:ro")
 if [[ $mode != local && -n ${OWNER_ENDPOINT:-} ]]; then
