@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 from uuid import UUID
 
 SERVICE = "rtp.engram.v1.Owner"
@@ -93,6 +94,9 @@ class Client:
             raise ControlError("RPC_ENDPOINT_REQUIRED")
         if not 0 < int(endpoint.rsplit(":", 1)[1]) <= 65535:
             raise ControlError("RPC_ENDPOINT_REQUIRED")
+        from .engram_assignment import configured_assignment
+
+        self.assignment = configured_assignment(self.env)
         self.identity = configured_identity(self.env)
         self.timeout = float(self.env.get("RTP_ENGRAM_RPC_TIMEOUT_S", "10"))
         if not 0 < self.timeout <= 120:
@@ -107,18 +111,25 @@ class Client:
     def close(self):
         self.channel.close()
 
-    def call(self, method, **fields):
+    def call(self, method, *, timeout=None, **fields):
         request = {"schema_version": 1, "identity": self.identity, **fields}
+        if self.assignment is not None:
+            request.update(
+                assignment=self.assignment,
+                instance_id=self.env["RTP_ENGRAM_INSTANCE_ID"],
+            )
         response = self.channel.unary_unary(
             "/" + SERVICE + "/" + method,
             request_serializer=encode,
             response_deserializer=decode,
-        )(request, timeout=self.timeout)
+        )(request, timeout=self.timeout if timeout is None else timeout)
         if (
             response.get("schema_version") != 1
             or response.get("identity") != self.identity
         ):
             raise ControlError("RPC_RESPONSE_IDENTITY_MISMATCH")
+        if response.get("assignment") != self.assignment:
+            raise ControlError("RPC_ASSIGNMENT_MISMATCH")
         generation = response.get("generation")
         try:
             if str(UUID(generation)) != generation:
@@ -127,8 +138,8 @@ class Client:
             raise ControlError("RPC_GENERATION_INVALID") from None
         return response
 
-    def describe(self):
-        return self.call("Describe")
+    def describe(self, *, timeout=None):
+        return self.call("Describe", timeout=timeout)
 
     def acquire(self, generation):
         response = self.call("Acquire", generation=generation)
@@ -142,7 +153,37 @@ def pin_generation(environ=None):
     env = os.environ if environ is None else environ
     client = Client(env)
     try:
-        response = client.describe()
+        # Only startup readiness is retried. Identity/authentication errors are fatal.
+        wait = float(
+            env.get("RTP_ENGRAM_STARTUP_TIMEOUT_S", "300" if client.assignment else "0")
+        )
+        if not 0 <= wait <= 3600:
+            raise ControlError("RPC_STARTUP_TIMEOUT_INVALID")
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                response = client.describe(
+                    timeout=(
+                        min(client.timeout, max(0.001, deadline - time.monotonic()))
+                        if wait
+                        else client.timeout
+                    )
+                )
+                break
+            except Exception as error:
+                import grpc
+
+                retry = isinstance(error, grpc.RpcError) and (
+                    error.code()
+                    in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+                    or (
+                        error.code() == grpc.StatusCode.FAILED_PRECONDITION
+                        and error.details() == "OWNER_NOT_READY"
+                    )
+                )
+                if not retry or time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(1, max(0, deadline - time.monotonic())))
         previous = env.get("RTP_ENGRAM_RPC_GENERATION")
         if previous and previous != response["generation"]:
             raise ControlError("RPC_GENERATION_CHANGED")
@@ -154,7 +195,14 @@ def pin_generation(environ=None):
 class OwnerControl:
     """One immutable generation. RPC loss never releases published backing."""
 
-    def __init__(self, service_id, allowed_client_names, *, admission=None):
+    def __init__(
+        self, service_id, allowed_client_names, *, admission=None, assignment=None
+    ):
+        from .engram_assignment import validate_assignment
+
+        self.assignment = (
+            validate_assignment(assignment) if assignment is not None else None
+        )
         self.admission = admission
         self.service_id = service_id
         self.allowed = {name.encode() for name in allowed_client_names}
@@ -181,6 +229,8 @@ class OwnerControl:
             manifest=manifest_bytes.decode("utf-8"),
             capabilities=capabilities,
         )
+        if self.assignment is not None:
+            payload["assignment"] = self.assignment
         # Freeze a deep copy and enforce wire budget before becoming visible.
         raw = encode(payload)
         with self._lock:
@@ -201,12 +251,26 @@ class OwnerControl:
             if acquire
             else {"schema_version", "identity"}
         )
+        if self.assignment is not None:
+            fields |= {"assignment", "instance_id"}
         if (
             request.keys() != fields
             or type(request.get("schema_version")) is not int
             or request["schema_version"] != 1
         ):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "INVALID_REQUEST")
+        if self.assignment is not None:
+            if request.get("assignment") != self.assignment:
+                context.abort(
+                    grpc.StatusCode.PERMISSION_DENIED, "PLATFORM_ASSIGNMENT_MISMATCH"
+                )
+            instance = request.get("instance_id")
+            if not isinstance(
+                instance, str
+            ) or instance.encode() not in names.intersection(self.allowed):
+                context.abort(
+                    grpc.StatusCode.PERMISSION_DENIED, "INSTANCE_PRINCIPAL_MISMATCH"
+                )
         try:
             identity = validate_identity(request["identity"])
         except ControlError:
@@ -225,10 +289,10 @@ class OwnerControl:
                     )
                 self.acquisitions += 1
                 return payload
-            return {
-                key: payload[key]
-                for key in ("schema_version", "identity", "generation")
-            }
+            keys = ["schema_version", "identity", "generation"]
+            if self.assignment is not None:
+                keys.append("assignment")
+            return {key: payload[key] for key in keys}
 
     def start(self, address, *, ca, cert, key):
         import grpc

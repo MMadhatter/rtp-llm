@@ -2,7 +2,13 @@
 set -euo pipefail
 config=${1:?usage: sidecar-start.sh SIDECAR_CONFIG.sh}
 source "$config"
-: "${REGISTRY_ENDPOINT:?}" "${SIDECAR_ROLE:?}"
+source "$(dirname "$0")/platform-env.sh"
+: "${SIDECAR_ROLE:?}"
+if [[ ${DISCOVERY:-} == platform ]]; then
+  [[ $SIDECAR_ROLE == producer || $SIDECAR_ROLE == consumer ]] || exit 2
+else
+  : "${REGISTRY_ENDPOINT:?}"
+fi
 if [[ $SIDECAR_ROLE == producer || $SIDECAR_ROLE == auto ]]; then
   # Platform-authorized candidates need the Owner's pre-reserved resources.
   exec bash "$(dirname "$0")/owner-start.sh" "$config"
@@ -15,7 +21,10 @@ CONTAINER_GID=${CONTAINER_GID:-$(id -g)}
 [[ $CONTAINER_UID != 0 ]] || exit 2
 if pouch inspect "$NAME" >/dev/null 2>&1; then echo 'Container name exists' >&2; exit 2; fi
 for f in ca.crt consumer.crt consumer.key; do test -f "$TLS_DIR/$f"; done
-extra=()
+extra=("${platform_env[@]}" -e "RTP_ENGRAM_SIDECAR_ROLE=$SIDECAR_ROLE")
+if [[ ${DISCOVERY:-} != platform ]]; then
+  extra+=(-e "RTP_ENGRAM_REGISTRY_ENDPOINT=$REGISTRY_ENDPOINT")
+fi
 if [[ -n ${CODE_PATCH_DIR:-} ]]; then
   while IFS= read -r -d '' file; do
     relative=${file#"$CODE_PATCH_DIR/"}
@@ -32,7 +41,6 @@ pouch run -d --name "$NAME" --net=host --user "$CONTAINER_UID:$CONTAINER_GID" \
   --memory "${MEMORY_LIMIT:-1g}" \
   -e USER=rtp-engram -e LOGNAME=rtp-engram -e HOME=/tmp/rtp-engram -e PYTHONUNBUFFERED=1 \
   -v "$TLS_DIR:/run/engram-tls:ro" \
-  -e "RTP_ENGRAM_REGISTRY_ENDPOINT=$REGISTRY_ENDPOINT" \
   -e "RTP_ENGRAM_FABRIC_DOMAIN=$FABRIC_DOMAIN" -e "RTP_ENGRAM_AUTHORIZATION_GROUP=$AUTHORIZATION_GROUP" \
   -e "RTP_ENGRAM_INSTANCE_ID=$INSTANCE_ID" -e "RTP_ENGRAM_SERVICE_ID=$SERVICE_ID" \
   -e "RTP_ENGRAM_MODEL_REVISION=$MODEL_REVISION" -e "RTP_ENGRAM_DATASET_ID=$DATASET_ID" \

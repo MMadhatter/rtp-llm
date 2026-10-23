@@ -184,7 +184,8 @@ def main(argv=None, *, producer_session=None):
                     or source.model_revision != producer_session.client.identity["model_revision"]):
                 parser.error("Owner endpoint/model/service must match platform grant")
         control = OwnerControl(args.service_id, args.allowed_client,
-                               admission=producer_session.live if producer_session else None)
+                               admission=producer_session.live if producer_session else None,
+                               assignment=getattr(producer_session, "assignment", None))
         control.start(args.rpc_listen, ca=args.tls_ca, cert=args.tls_cert, key=args.tls_key)
     checkpoint = source.checkpoint
     published, failed, generation, native = False, False, None, None
@@ -213,6 +214,9 @@ def main(argv=None, *, producer_session=None):
         from rtp_llm.models_py.modules.dsv41.engram_checkpoint import inspect_checkpoint, load_checkpoint
         from rtp_llm.models_py.modules.dsv41.engram_manifest import ExpectedLayout
 
+        if getattr(producer_session, "assignment", None) is not None:
+            from rtp_llm.models_py.modules.dsv41.engram_assignment import validate_imex_device
+            validate_imex_device(os.environ)
         torch.cuda.set_device(args.device)
         native = _load_native()
         layout = EngramLayout(source.config)

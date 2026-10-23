@@ -5,6 +5,9 @@ mode=${2:?mode required}
 [[ $mode == local || $mode == shared || $mode == auto ]] || exit 2
 : "${IMAGE:?}" "${NAME:?}" "${CHECKPOINT:?}" "${MODEL_ENV:?}"
 : "${GPU_UUIDS:?}" "${MEMORY_LIMIT:?}" "${SHM_SIZE:?}"
+platform_env=()
+IMEX_CHANNEL_DEVICE=/dev/nvidia-caps-imex-channels/channel0
+if [[ $mode != local ]]; then source "$(dirname "$0")/platform-env.sh"; fi
 CONTAINER_UID=${CONTAINER_UID:-$(id -u)}
 CONTAINER_GID=${CONTAINER_GID:-$(id -g)}
 [[ $CONTAINER_UID != 0 ]] || exit 2
@@ -19,7 +22,8 @@ if [[ -n ${REGISTRY_ENDPOINT:-} && -n ${OWNER_ENDPOINT:-} ]]; then
 fi
 if [[ $mode != local && -n ${OWNER_ENDPOINT:-}${REGISTRY_ENDPOINT:-} ]]; then
   : "${TLS_DIR:?}" "${SERVICE_ID:?}" "${MODEL_REVISION:?}" "${DATASET_ID:?}"
-  args+=(--device=/dev/nvidia-caps-imex-channels/channel0 -v "$TLS_DIR:/run/engram-tls:ro"
+  for f in ca.crt consumer.crt consumer.key; do test -f "$TLS_DIR/$f"; done
+  args+=("${platform_env[@]}" --device="$IMEX_CHANNEL_DEVICE" -v "$TLS_DIR:/run/engram-tls:ro"
     -e "RTP_ENGRAM_SERVICE_ID=$SERVICE_ID"
     -e "RTP_ENGRAM_MODEL_REVISION=$MODEL_REVISION" -e "RTP_ENGRAM_DATASET_ID=$DATASET_ID"
     -e RTP_ENGRAM_TLS_CA=/run/engram-tls/ca.crt

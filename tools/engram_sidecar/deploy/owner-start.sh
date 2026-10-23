@@ -4,6 +4,14 @@ source "${1:?usage: owner-start.sh OWNER_CONFIG.sh}"
 : "${IMAGE:?}" "${NAME:?}" "${CHECKPOINT:?}" "${STATE_DIR:?}" "${TLS_DIR:?}"
 : "${OWNER_IP:?}" "${OWNER_PORT:?}" "${GPU_UUID:?}" "${NUMA:?}"
 : "${MODEL_REVISION:?}" "${SERVICE_ID:?}" "${MEMORY_LIMIT:?}"
+source "$(dirname "$0")/platform-env.sh"
+if [[ ${DISCOVERY:-} == platform ]]; then
+  [[ ${SIDECAR_ROLE:-} == producer && $INSTANCE_ID == "$OWNER_INSTANCE_ID" ]] || exit 2
+  [[ $OWNER_ENDPOINT == "$OWNER_IP:$OWNER_PORT" ]] || exit 2
+  : "${RESERVATION_ID:?}" "${RESERVED_MEMORY_BYTES:?}" "${REQUIRED_MEMORY_BYTES:?}" "${ALLOWED_CLIENT_NAMES:?}"
+  [[ " $ALLOWED_CLIENT_NAMES " == *" $OWNER_INSTANCE_ID "* ]] || { echo "Allow the producer instance as an RTP consumer" >&2; exit 2; }
+  for f in consumer.crt consumer.key; do test -f "$TLS_DIR/$f"; done
+fi
 CONTAINER_UID=${CONTAINER_UID:-$(id -u)}
 CONTAINER_GID=${CONTAINER_GID:-$(id -g)}
 [[ $CONTAINER_UID != 0 ]] || { echo 'Use a non-root container UID' >&2; exit 2; }
@@ -17,7 +25,7 @@ if nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | grep -Fxq "$
 fi
 umask 077
 mkdir -m 700 "$STATE_DIR"
-extra=()
+extra=("${platform_env[@]}")
 if [[ -n ${CODE_PATCH_DIR:-} ]]; then
   # Development overlay only; omit when using a CI image built from this revision.
   while IFS= read -r -d '' file; do
@@ -35,7 +43,15 @@ for principal in ${ALLOWED_CLIENT_NAMES:-engram-consumer}; do
   allowed+=(--allowed-client "$principal")
 done
 command=(owner)
-if [[ -n ${REGISTRY_ENDPOINT:-} ]]; then
+if [[ ${DISCOVERY:-} == platform ]]; then
+  extra+=(-e RTP_ENGRAM_SIDECAR_ROLE=producer
+    -e "RTP_ENGRAM_RESERVATION_ID=$RESERVATION_ID"
+    -e "RTP_ENGRAM_RESERVED_MEMORY_BYTES=$RESERVED_MEMORY_BYTES"
+    -e RTP_ENGRAM_TLS_CA=/run/engram-tls/ca.crt
+    -e RTP_ENGRAM_TLS_CERT=/run/engram-tls/consumer.crt
+    -e RTP_ENGRAM_TLS_KEY=/run/engram-tls/consumer.key)
+  command=(sidecar --role producer --required-memory-bytes "$REQUIRED_MEMORY_BYTES" --)
+elif [[ -n ${REGISTRY_ENDPOINT:-} ]]; then
   : "${FABRIC_DOMAIN:?}" "${AUTHORIZATION_GROUP:?}" "${INSTANCE_ID:?}" "${DATASET_ID:?}" "${REQUIRED_MEMORY_BYTES:?}"
   for f in producer.crt producer.key; do test -f "$TLS_DIR/$f"; done
   extra+=(-e "RTP_ENGRAM_REGISTRY_ENDPOINT=$REGISTRY_ENDPOINT"
@@ -49,7 +65,7 @@ fi
 pouch run -d --name "$NAME" --net=host \
   --user "$CONTAINER_UID:$CONTAINER_GID" --memory "$MEMORY_LIMIT" \
   --nvidia-visible-devs="$GPU_UUID" --nvidia-capabilities=all \
-  --device=/dev/nvidia-caps-imex-channels/channel0 \
+  --device="$IMEX_CHANNEL_DEVICE" \
   -e USER=rtp-engram -e LOGNAME=rtp-engram -e HOME=/tmp/rtp-engram \
   -e PYTHONUNBUFFERED=1 -e CUDA_VISIBLE_DEVICES=0 \
   -v "$CHECKPOINT:/checkpoint:ro" -v "$STATE_DIR:/run/engram:rw" \

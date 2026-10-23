@@ -25,6 +25,6 @@ case "$command" in
   python) exec python "$@" ;;
   shell) exec /bin/bash "$@" ;;
   help) printf '%s
-' 'Engram experimental image: sidecar [role args] -- [owner args] | registry [dev coordinator args] | owner [checkpoint_owner args] | serve [start_server args] | check | python ... | shell' 'RTP_ENGRAM_MODE=local|shared|auto; shared uses RTP_ENGRAM_REGISTRY_ENDPOINT or RTP_ENGRAM_OWNER_ENDPOINT; legacy file bootstrap remains supported.' 'Owner must outlive all consumers. Local/auto fallback requires complete checkpoint weights.' ;;
+' 'Engram experimental image: sidecar [role args] -- [owner args] | registry [dev coordinator args] | owner [checkpoint_owner args] | serve [start_server args] | check | python ... | shell' 'RTP_ENGRAM_MODE=local|shared|auto; shared uses RTP_ENGRAM_REGISTRY_ENDPOINT or RTP_ENGRAM_OWNER_ENDPOINT; legacy file bootstrap remains supported.' 'RTP_ENGRAM_DISCOVERY=platform uses a platform-assigned Owner endpoint/epoch and explicit producer|consumer sidecar role; no Registry or election.' 'Owner must outlive all consumers. Local/auto fallback requires complete checkpoint weights.' ;;
   *) printf 'Unknown command: %s\n' "$command" >&2; exit 2 ;;
 esac

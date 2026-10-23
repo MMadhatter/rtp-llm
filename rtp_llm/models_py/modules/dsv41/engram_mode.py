@@ -21,6 +21,9 @@ def resolve_mode(environ=None):
     endpoint = env.get(ENDPOINT_ENV)
     if mode == "local":
         return "local", "explicit_local"
+    if "RTP_ENGRAM_DISCOVERY" in env:
+        from .engram_assignment import configured_assignment
+        configured_assignment(env)
     if REGISTRY_ENV in env:
         if not env[REGISTRY_ENV] or ENDPOINT_ENV in env or BUNDLE_ENV in env:
             raise ValueError("AMBIGUOUS_ENGRAM_SOURCE")
@@ -72,6 +75,9 @@ def prepare_engram_startup(environ=None):
     env = os.environ if environ is None else environ
     mode, reason = resolve_mode(env)
     if mode == "shared" and reason in ("rpc_owner", "rpc_registry"):
+        if env.get("RTP_ENGRAM_DISCOVERY") == "platform":
+            from .engram_assignment import validate_imex_device
+            validate_imex_device(env)
         if reason == "rpc_registry":
             from .engram_registry import resolve_for_launcher
             resolve_for_launcher(env)
