@@ -313,7 +313,7 @@ py_library(
 py_library(
     name = "engram_model_attach_cpu",
     testonly = True,
-    srcs = ["modules/dsv41/engram_model_attach.py"],
+    srcs = ["modules/dsv41/engram_model_attach.py", "modules/dsv41/engram_mode.py"],
     visibility = ["//visibility:public"],
 )
 

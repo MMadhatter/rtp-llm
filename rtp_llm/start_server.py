@@ -642,9 +642,9 @@ def main():
 
 def start_server(py_env_configs: PyEnvConfigs):
     # Freeze optional file-based discovery before ranks can observe different states.
-    from rtp_llm.models_py.modules.dsv41.engram_mode import freeze_auto_mode
+    from rtp_llm.models_py.modules.dsv41.engram_mode import prepare_engram_startup
 
-    freeze_auto_mode()
+    prepare_engram_startup()
     logging.info(f"[PROCESS_START]Start server")
     configure_warmup(
         py_env_configs.runtime_config.warm_up,

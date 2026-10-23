@@ -128,6 +128,12 @@ def parser_for_owner():
     parser.add_argument("--discard-private-checkpoint-cache", action="store_true",
                         help="Advise release of source file cache during loading; only for an operator-owned private immutable checkpoint copy")
     parser.add_argument("--report-timeout", type=float, default=1800)
+    parser.add_argument("--rpc-listen")
+    parser.add_argument("--service-id")
+    parser.add_argument("--tls-ca", type=Path)
+    parser.add_argument("--tls-cert", type=Path)
+    parser.add_argument("--tls-key", type=Path)
+    parser.add_argument("--allowed-client", action="append", default=[])
     return parser
 
 
@@ -167,6 +173,13 @@ def main(argv=None):
     except (ValueError, OSError, KeyError) as error:
         parser.error(str(error))
     args.publication.mkdir(mode=0o700, parents=True, exist_ok=False)
+    control = None
+    if args.rpc_listen:
+        from rtp_llm.models_py.modules.dsv41.engram_rpc import OwnerControl
+        if not all((args.service_id, args.tls_ca, args.tls_cert, args.tls_key, args.allowed_client)):
+            parser.error("RPC requires service-id, TLS CA/cert/key and allowed-client")
+        control = OwnerControl(args.service_id, args.allowed_client)
+        control.start(args.rpc_listen, ca=args.tls_ca, cert=args.tls_cert, key=args.tls_key)
     checkpoint = source.checkpoint
     published, failed, generation, native = False, False, None, None
 
@@ -226,9 +239,13 @@ def main(argv=None):
                         for key, value in generation.private_handles.items()}
         # Once any export may be visible, cleanup requires confirmed consumer exit.
         published = True
-        private_write(args.publication / "capabilities.json", json.dumps(capabilities).encode())
+        if control is not None:
+            control.publish(bundle, generation.manifest_bytes, capabilities)
+        else:
+            private_write(args.publication / "capabilities.json", json.dumps(capabilities).encode())
         private_write(args.publication / "manifest.json", generation.manifest_bytes)
-        private_write(args.publication / "bundle.json", json.dumps(bundle, sort_keys=True).encode())
+        if control is None:
+            private_write(args.publication / "bundle.json", json.dumps(bundle, sort_keys=True).encode())
         del capabilities
         emit("READY", dataset_id=manifest.dataset_id, generation=manifest.generation,
              physical_bytes=generation.physical_bytes, allocation_count=len(generation.private_handles),
@@ -242,6 +259,8 @@ def main(argv=None):
     finally:
         if published and not (args.publication / "STOP").is_file():
             hold_until_stop()
+        if control is not None:
+            control.stop()
         if generation is not None:
             try:
                 generation.close()

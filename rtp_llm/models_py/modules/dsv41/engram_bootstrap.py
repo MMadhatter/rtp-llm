@@ -143,6 +143,23 @@ def _read_bundle(path, layout, actual_hash_abi, *, limits=None):
     bundle = _json(_private_read(path, 2 << 20))
     if type(bundle) is not dict or bundle.keys() != _BUNDLE_FIELDS:
         raise BootstrapError("INVALID_BUNDLE_FIELDS")
+    if bundle["hash_abi"] != actual_hash_abi:
+        raise BootstrapError("HASH_ABI_MISMATCH")
+    for key in ("manifest", "capabilities"):
+        if type(bundle[key]) is not str or not _FILENAME.fullmatch(bundle[key]):
+            raise BootstrapError("INVALID_BUNDLE_FILENAME")
+    if len({path.name, bundle["manifest"], bundle["capabilities"]}) != 3:
+        raise BootstrapError("BOOTSTRAP_FILES_MUST_DIFFER")
+    raw = _private_read(path.parent / bundle["manifest"], limits.max_manifest_bytes)
+    capabilities = _json(_private_read(path.parent / bundle["capabilities"], 256 << 10))
+    return _validate_payload(bundle, raw, capabilities, layout, actual_hash_abi, limits)
+
+
+def _validate_payload(bundle, raw, capabilities, layout, actual_hash_abi, limits):
+    if len(raw) > limits.max_manifest_bytes:
+        raise BootstrapError("MANIFEST_TOO_LARGE")
+    if type(bundle) is not dict or bundle.keys() != _BUNDLE_FIELDS:
+        raise BootstrapError("INVALID_BUNDLE_FIELDS")
     if type(bundle["schema_version"]) is not int or bundle["schema_version"] != 1:
         raise BootstrapError("UNSUPPORTED_BUNDLE_VERSION")
     for key in ("manifest_sha256", "dataset_id", "hash_abi"):
@@ -158,12 +175,9 @@ def _read_bundle(path, layout, actual_hash_abi, *, limits=None):
     for key in ("manifest", "capabilities"):
         if type(bundle[key]) is not str or not _FILENAME.fullmatch(bundle[key]):
             raise BootstrapError("INVALID_BUNDLE_FILENAME")
-    if len({path.name, bundle["manifest"], bundle["capabilities"]}) != 3:
-        raise BootstrapError("BOOTSTRAP_FILES_MUST_DIFFER")
     expected = ExpectedLayout(layers=tuple(zip(layout.layer_ids, layout.num_embeddings)),
                               head_dim=layout.head_dim, model_revision=bundle["model_revision"],
                               hash_abi=actual_hash_abi)
-    raw = _private_read(path.parent / bundle["manifest"], limits.max_manifest_bytes)
     if _digest(raw) != bundle["manifest_sha256"]:
         raise BootstrapError("MANIFEST_DIGEST_MISMATCH")
     validated = validate_for_attach(parse_manifest(raw, limits), expected,
@@ -181,7 +195,6 @@ def _read_bundle(path, layout, actual_hash_abi, *, limits=None):
                 or sample["row_ids"] != required_rows
                 or type(sample["sha256"]) is not str or not _DIGEST.fullmatch(sample["sha256"])):
             raise BootstrapError("INVALID_READ_SAMPLE")
-    capabilities = _json(_private_read(path.parent / bundle["capabilities"], 256 << 10))
     allocation_ids = {tensor.shards[0].allocation_id for tensor in validated.manifest.tensors}
     if type(capabilities) is not dict or capabilities.keys() != allocation_ids:
         raise BootstrapError("CAPABILITY_SET_MISMATCH")
@@ -228,6 +241,38 @@ def attach_from_bundle(bundle_path, *, layout, hash_state, device, environ=None)
     limits = _configured_limits(environ)
     bundle, raw, expected, handles = _read_bundle(
         bundle_path, layout, hash_state_digest(hash_state), limits=limits)
+    return _attach_validated(bundle, raw, expected, handles, target, limits)
+
+
+def attach_from_rpc(*, layout, hash_state, device, environ=None):
+    import torch
+    from .engram_rpc import Client, ControlError
+    env = os.environ if environ is None else environ
+    target = torch.device(device)
+    if target.type != "cuda":
+        raise BootstrapError("CUDA_DEVICE_REQUIRED")
+    generation = env.get("RTP_ENGRAM_RPC_GENERATION")
+    if not generation:
+        raise ControlError("RPC_GENERATION_NOT_PINNED")
+    client = Client(env)
+    try:
+        payload = client.acquire(generation)
+        bundle = payload["bundle"]
+        if (bundle["dataset_id"] != client.identity["dataset_id"]
+                or bundle["model_revision"] != client.identity["model_revision"]
+                or bundle["generation"] != generation):
+            raise ControlError("RPC_PAYLOAD_IDENTITY_MISMATCH")
+        limits = _configured_limits(env)
+        validated = _validate_payload(bundle, payload["manifest"].encode("utf-8"),
+                                      payload["capabilities"], layout,
+                                      hash_state_digest(hash_state), limits)
+    finally:
+        client.close()
+    return _attach_validated(*validated, target, limits)
+
+
+def _attach_validated(bundle, raw, expected, handles, target, limits):
+    import torch
     ordinal = target.index if target.index is not None else torch.cuda.current_device()
     native = _load_native()
     # Reject an older/smaller bridge before importing even the first allocation.

@@ -6,6 +6,7 @@ from pathlib import Path
 
 MODE_ENV = "RTP_ENGRAM_MODE"
 BUNDLE_ENV = "RTP_ENGRAM_EXTERNAL_BUNDLE"
+ENDPOINT_ENV = "RTP_ENGRAM_OWNER_ENDPOINT"
 
 
 def resolve_mode(environ=None):
@@ -16,6 +17,15 @@ def resolve_mode(environ=None):
     """
     env = os.environ if environ is None else environ
     mode = env.get(MODE_ENV)
+    endpoint = env.get(ENDPOINT_ENV)
+    if mode == "local":
+        return "local", "explicit_local"
+    if endpoint is not None:
+        if not endpoint or BUNDLE_ENV in env:
+            raise ValueError("AMBIGUOUS_ENGRAM_SOURCE")
+        if mode not in (None, "shared", "auto"):
+            raise ValueError("INVALID_ENGRAM_MODE")
+        return "shared", "rpc_owner"
     if mode is None:
         return ("shared", "legacy_bundle") if BUNDLE_ENV in env else ("local", "default")
     if mode not in ("local", "shared", "auto"):
@@ -48,3 +58,17 @@ def freeze_auto_mode(environ=None):
         mode, reason = resolve_mode(env)
         env[MODE_ENV] = mode
         logging.info("ENGRAM_STORAGE_SELECTION requested=auto selected=%s reason=%s", mode, reason)
+
+
+def prepare_engram_startup(environ=None):
+    """Pin one RPC generation before any ranks spawn; never fetch handles here."""
+    env = os.environ if environ is None else environ
+    mode, reason = resolve_mode(env)
+    if mode == "shared" and reason == "rpc_owner":
+        from .engram_rpc import pin_generation
+        pin_generation(env)
+        env[MODE_ENV] = "shared"
+        logging.info("ENGRAM_STORAGE_SELECTION selected=shared source=rpc generation=%s",
+                     env["RTP_ENGRAM_RPC_GENERATION"])
+    else:
+        freeze_auto_mode(env)
