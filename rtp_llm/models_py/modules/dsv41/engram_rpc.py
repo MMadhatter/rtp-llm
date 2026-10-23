@@ -84,6 +84,10 @@ class Client:
 
         self.env = os.environ if environ is None else environ
         endpoint = self.env.get(ENDPOINT_ENV, "")
+        if self.env.get("RTP_ENGRAM_REGISTRY_ENDPOINT"):
+            if endpoint:
+                raise ControlError("AMBIGUOUS_ENGRAM_SOURCE")
+            endpoint = self.env.get("RTP_ENGRAM_RESOLVED_OWNER_ENDPOINT", "")
         # Explicit host:port; no resolver URI, userinfo or TLS-name override.
         if not re.fullmatch(r"[a-zA-Z0-9_.-]+:[0-9]{1,5}", endpoint):
             raise ControlError("RPC_ENDPOINT_REQUIRED")
@@ -150,7 +154,8 @@ def pin_generation(environ=None):
 class OwnerControl:
     """One immutable generation. RPC loss never releases published backing."""
 
-    def __init__(self, service_id, allowed_client_names):
+    def __init__(self, service_id, allowed_client_names, *, admission=None):
+        self.admission = admission
         self.service_id = service_id
         self.allowed = {name.encode() for name in allowed_client_names}
         if not self.allowed or not service_id:
@@ -189,6 +194,8 @@ class OwnerControl:
         names = set(context.auth_context().get("x509_common_name", []))
         if not names.intersection(self.allowed):
             context.abort(grpc.StatusCode.PERMISSION_DENIED, "CLIENT_NOT_AUTHORIZED")
+        if self.admission is not None and not self.admission():
+            context.abort(grpc.StatusCode.UNAVAILABLE, "PRODUCER_CLAIM_NOT_LIVE")
         fields = (
             {"schema_version", "identity", "generation"}
             if acquire

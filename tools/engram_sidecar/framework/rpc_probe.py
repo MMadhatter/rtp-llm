@@ -69,6 +69,10 @@ def main():
         raise AssertionError("online lookup attempted control RPC")
 
     Client.call = forbidden
+    if os.environ.get("RTP_ENGRAM_REGISTRY_ENDPOINT"):
+        from rtp_llm.models_py.modules.dsv41.engram_registry import RegistryClient
+
+        RegistryClient.call = forbidden
     tests = []
     for layer_id in layout.layer_ids:
         embedding = HostEngramEmbedding.from_storage(storage, layer_id)
@@ -113,6 +117,7 @@ def main():
                 stage="RPC_LOOKUP_GRAPH_OK",
                 tests=tests,
                 online_rpc_calls=0,
+                registry_discovery=bool(os.environ.get("RTP_ENGRAM_REGISTRY_ENDPOINT")),
                 counters=counters,
             )
         ),

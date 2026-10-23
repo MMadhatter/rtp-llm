@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Startup-only selection; no CUDA, RPC or container-runtime dependency."""
+"""Startup-only selection and RPC discovery; no CUDA or container runtime."""
 import logging
 import os
 from pathlib import Path
@@ -7,6 +7,7 @@ from pathlib import Path
 MODE_ENV = "RTP_ENGRAM_MODE"
 BUNDLE_ENV = "RTP_ENGRAM_EXTERNAL_BUNDLE"
 ENDPOINT_ENV = "RTP_ENGRAM_OWNER_ENDPOINT"
+REGISTRY_ENV = "RTP_ENGRAM_REGISTRY_ENDPOINT"
 
 
 def resolve_mode(environ=None):
@@ -20,6 +21,12 @@ def resolve_mode(environ=None):
     endpoint = env.get(ENDPOINT_ENV)
     if mode == "local":
         return "local", "explicit_local"
+    if REGISTRY_ENV in env:
+        if not env[REGISTRY_ENV] or ENDPOINT_ENV in env or BUNDLE_ENV in env:
+            raise ValueError("AMBIGUOUS_ENGRAM_SOURCE")
+        if mode not in (None, "shared", "auto"):
+            raise ValueError("INVALID_ENGRAM_MODE")
+        return "shared", "rpc_registry"
     if endpoint is not None:
         if not endpoint or BUNDLE_ENV in env:
             raise ValueError("AMBIGUOUS_ENGRAM_SOURCE")
@@ -64,7 +71,10 @@ def prepare_engram_startup(environ=None):
     """Pin one RPC generation before any ranks spawn; never fetch handles here."""
     env = os.environ if environ is None else environ
     mode, reason = resolve_mode(env)
-    if mode == "shared" and reason == "rpc_owner":
+    if mode == "shared" and reason in ("rpc_owner", "rpc_registry"):
+        if reason == "rpc_registry":
+            from .engram_registry import resolve_for_launcher
+            resolve_for_launcher(env)
         from .engram_rpc import pin_generation
         pin_generation(env)
         env[MODE_ENV] = "shared"

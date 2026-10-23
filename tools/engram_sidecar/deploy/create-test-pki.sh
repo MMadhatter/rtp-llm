@@ -7,7 +7,7 @@ ip=${2:?OWNER_IP required}
 umask 077
 mkdir "$out"
 openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj /CN=engram-experiment-ca -keyout "$out/ca.key" -out "$out/ca.crt" >/dev/null 2>&1
-for role in owner consumer; do
+for role in owner consumer producer; do
   openssl req -newkey rsa:2048 -nodes -subj "/CN=engram-$role" -keyout "$out/$role.key" -out "$out/$role.csr" >/dev/null 2>&1
   if [[ $role == owner ]]; then
     printf 'subjectAltName=IP:%s,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' "$ip" > "$out/$role.ext"

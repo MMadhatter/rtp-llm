@@ -17,12 +17,14 @@ cd "$RTP_RUNTIME_DIR"
 command=${1:-help}
 if (($#)); then shift; fi
 case "$command" in
+  registry) exec python -m tools.engram_sidecar.framework.registry_server "$@" ;;
+  sidecar) exec python -m tools.engram_sidecar.framework.sidecar "$@" ;;
   owner) exec python -m tools.engram_sidecar.framework.checkpoint_owner "$@" ;;
   serve) exec python -m rtp_llm.start_server "$@" ;;
   check) exec python "$RTP_IMAGE_ROOT/repo/tools/engram_sidecar/image/check_runtime.py" "$@" ;;
   python) exec python "$@" ;;
   shell) exec /bin/bash "$@" ;;
   help) printf '%s
-' 'Engram experimental image: owner [checkpoint_owner args] | serve [start_server args] | check | python ... | shell' 'RTP_ENGRAM_MODE=local|shared|auto; shared requires RTP_ENGRAM_EXTERNAL_BUNDLE.' 'Owner must outlive all consumers. Local/auto fallback requires complete checkpoint weights.' ;;
+' 'Engram experimental image: sidecar [role args] -- [owner args] | registry [dev coordinator args] | owner [checkpoint_owner args] | serve [start_server args] | check | python ... | shell' 'RTP_ENGRAM_MODE=local|shared|auto; shared uses RTP_ENGRAM_REGISTRY_ENDPOINT or RTP_ENGRAM_OWNER_ENDPOINT; legacy file bootstrap remains supported.' 'Owner must outlive all consumers. Local/auto fallback requires complete checkpoint weights.' ;;
   *) printf 'Unknown command: %s\n' "$command" >&2; exit 2 ;;
 esac

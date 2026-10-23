@@ -158,7 +158,7 @@ def selected_samples(checkpoint, manifest):
     return samples
 
 
-def main(argv=None):
+def main(argv=None, *, producer_session=None):
     parser = parser_for_owner()
     args = parser.parse_args(argv)
     if (not args.publication.is_absolute()
@@ -178,7 +178,13 @@ def main(argv=None):
         from rtp_llm.models_py.modules.dsv41.engram_rpc import OwnerControl
         if not all((args.service_id, args.tls_ca, args.tls_cert, args.tls_key, args.allowed_client)):
             parser.error("RPC requires service-id, TLS CA/cert/key and allowed-client")
-        control = OwnerControl(args.service_id, args.allowed_client)
+        if producer_session is not None:
+            if (args.rpc_listen != producer_session.grant["owner_endpoint"]
+                    or args.service_id != producer_session.client.identity["service_id"]
+                    or source.model_revision != producer_session.client.identity["model_revision"]):
+                parser.error("Owner endpoint/model/service must match platform grant")
+        control = OwnerControl(args.service_id, args.allowed_client,
+                               admission=producer_session.live if producer_session else None)
         control.start(args.rpc_listen, ca=args.tls_ca, cert=args.tls_cert, key=args.tls_key)
     checkpoint = source.checkpoint
     published, failed, generation, native = False, False, None, None
@@ -227,9 +233,15 @@ def main(argv=None):
              config_sha256=source.config_sha256, index_sha256=source.index_sha256,
              component_fixture=source.component_fixture, physical_bytes=plan.physical_bytes,
              budget_bytes=args.budget_bytes, max_allocation_bytes=args.max_allocation_bytes)
+        if producer_session is not None:
+            producer_session.ensure_capacity(plan.physical_bytes)
         generation = load_checkpoint(plan, native=native, device=args.device, numa=args.numa,
                                      discard_file_cache=args.discard_private_checkpoint_cache)
         manifest = generation.manifest
+        if producer_session is not None:
+            producer_session.ensure_capacity(generation.physical_bytes)
+            if manifest.dataset_id != producer_session.client.identity["dataset_id"]:
+                raise ValueError("Owner checkpoint differs from platform dataset")
         bundle = dict(schema_version=1, manifest="manifest.json", capabilities="capabilities.json",
                       manifest_sha256=digest(generation.manifest_bytes),
                       dataset_id=manifest.dataset_id, generation=manifest.generation,
@@ -247,6 +259,8 @@ def main(argv=None):
         if control is None:
             private_write(args.publication / "bundle.json", json.dumps(bundle, sort_keys=True).encode())
         del capabilities
+        if producer_session is not None:
+            producer_session.publish_ready(manifest.generation, generation.physical_bytes)
         emit("READY", dataset_id=manifest.dataset_id, generation=manifest.generation,
              physical_bytes=generation.physical_bytes, allocation_count=len(generation.private_handles),
              device=args.device, numa=args.numa, counters=native.resource_counters())

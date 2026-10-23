@@ -140,7 +140,7 @@ def initialize_model_engram(
         logging.info("ENGRAM_STORAGE_SELECTION selected=%s reason=%s",
                      attachment.storage_mode, attachment.selection_reason)
         if attachment.external:
-            if (not env.get("RTP_ENGRAM_OWNER_ENDPOINT") and
+            if (not (env.get("RTP_ENGRAM_OWNER_ENDPOINT") or env.get("RTP_ENGRAM_REGISTRY_ENDPOINT")) and
                     (not isinstance(bundle_path, str) or not bundle_path or not Path(bundle_path).is_absolute())):
                 raise EngramModelInitializationError("INVALID_EXTERNAL_ENGRAM_BUNDLE_PATH")
             attachment.graph_mode = env.get(EXTERNAL_GRAPH_MODE_ENV, "eager")
@@ -166,7 +166,7 @@ def initialize_model_engram(
             if attach_factory is None:
                 from .engram_bootstrap import attach_from_bundle, attach_from_rpc
 
-                if env.get("RTP_ENGRAM_OWNER_ENDPOINT"):
+                if env.get("RTP_ENGRAM_OWNER_ENDPOINT") or env.get("RTP_ENGRAM_REGISTRY_ENDPOINT"):
                     attach_factory = lambda unused, **kwargs: attach_from_rpc(environ=env, **kwargs)
                 else:
                     attach_factory = attach_from_bundle

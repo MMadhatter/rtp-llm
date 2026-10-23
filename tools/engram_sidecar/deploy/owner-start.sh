@@ -19,11 +19,32 @@ umask 077
 mkdir -m 700 "$STATE_DIR"
 extra=()
 if [[ -n ${CODE_PATCH_DIR:-} ]]; then
-  # Development overlay only; the CI image already contains these files.
+  # Development overlay only; omit when using a CI image built from this revision.
   while IFS= read -r -d '' file; do
     relative=${file#"$CODE_PATCH_DIR/"}
-    extra+=(-v "$file:/opt/engram-runtime/repo/$relative:ro")
-  done < <(find "$CODE_PATCH_DIR" -type f -name '*.py' -print0)
+    if [[ $relative == rtp_llm/* ]]; then
+      target=/opt/engram-runtime/venv/lib/python3.10/site-packages/$relative
+    else
+      target=/opt/engram-runtime/repo/$relative
+    fi
+    extra+=(-v "$file:$target:ro")
+  done < <(find "$CODE_PATCH_DIR" -type f \( -name '*.py' -o -path '*/image/entrypoint.sh' \) -print0)
+fi
+allowed=()
+for principal in ${ALLOWED_CLIENT_NAMES:-engram-consumer}; do
+  allowed+=(--allowed-client "$principal")
+done
+command=(owner)
+if [[ -n ${REGISTRY_ENDPOINT:-} ]]; then
+  : "${FABRIC_DOMAIN:?}" "${AUTHORIZATION_GROUP:?}" "${INSTANCE_ID:?}" "${DATASET_ID:?}" "${REQUIRED_MEMORY_BYTES:?}"
+  for f in producer.crt producer.key; do test -f "$TLS_DIR/$f"; done
+  extra+=(-e "RTP_ENGRAM_REGISTRY_ENDPOINT=$REGISTRY_ENDPOINT"
+    -e "RTP_ENGRAM_FABRIC_DOMAIN=$FABRIC_DOMAIN" -e "RTP_ENGRAM_AUTHORIZATION_GROUP=$AUTHORIZATION_GROUP"
+    -e "RTP_ENGRAM_INSTANCE_ID=$INSTANCE_ID" -e "RTP_ENGRAM_SERVICE_ID=$SERVICE_ID"
+    -e "RTP_ENGRAM_MODEL_REVISION=$MODEL_REVISION" -e "RTP_ENGRAM_DATASET_ID=$DATASET_ID"
+    -e RTP_ENGRAM_TLS_CA=/run/engram-tls/ca.crt -e RTP_ENGRAM_TLS_CERT=/run/engram-tls/producer.crt
+    -e RTP_ENGRAM_TLS_KEY=/run/engram-tls/producer.key)
+  command=(sidecar --role "${SIDECAR_ROLE:-auto}" --required-memory-bytes "$REQUIRED_MEMORY_BYTES" --)
 fi
 pouch run -d --name "$NAME" --net=host \
   --user "$CONTAINER_UID:$CONTAINER_GID" --memory "$MEMORY_LIMIT" \
@@ -33,12 +54,12 @@ pouch run -d --name "$NAME" --net=host \
   -e PYTHONUNBUFFERED=1 -e CUDA_VISIBLE_DEVICES=0 \
   -v "$CHECKPOINT:/checkpoint:ro" -v "$STATE_DIR:/run/engram:rw" \
   -v "$TLS_DIR:/run/engram-tls:ro" "${extra[@]}" \
-  "$IMAGE" owner --checkpoint /checkpoint --model-revision "$MODEL_REVISION" \
+  "$IMAGE" "${command[@]}" --checkpoint /checkpoint --model-revision "$MODEL_REVISION" \
   --publication /run/engram/state --device 0 --numa "$NUMA" \
   --max-allocation-bytes "${MAX_ALLOCATION_BYTES:-137438953472}" \
   --budget-bytes "${BUDGET_BYTES:-274877906944}" \
   --discard-private-checkpoint-cache \
   --rpc-listen "$OWNER_IP:$OWNER_PORT" --service-id "$SERVICE_ID" \
   --tls-ca /run/engram-tls/ca.crt --tls-cert /run/engram-tls/owner.crt \
-  --tls-key /run/engram-tls/owner.key --allowed-client engram-consumer
+  --tls-key /run/engram-tls/owner.key "${allowed[@]}"
 printf 'Started %s. Wait for READY using pouch logs. Keep Owner alive until all consumers exit.\n' "$NAME"
