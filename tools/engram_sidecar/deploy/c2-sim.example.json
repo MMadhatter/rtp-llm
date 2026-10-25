@@ -32,6 +32,7 @@
       "gpu_uuids": ["GPU-REPLACE-P0", "GPU-REPLACE-P1", "GPU-REPLACE-P2", "GPU-REPLACE-P3"],
       "memory_limit": "300g",
       "shm_size": "32g",
+      "rdma_devices": [],
       "uid": 1000,
       "gid": 1000,
       "http_port": 18640
@@ -46,6 +47,7 @@
       "gpu_uuids": ["GPU-REPLACE-D0", "GPU-REPLACE-D1", "GPU-REPLACE-D2", "GPU-REPLACE-D3"],
       "memory_limit": "300g",
       "shm_size": "32g",
+      "rdma_devices": [],
       "uid": 1000,
       "gid": 1000,
       "http_port": 18641

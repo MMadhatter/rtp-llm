@@ -127,7 +127,21 @@ def validate(spec):
     )
     ids, ports, gpu_hosts = set(), set(), {}
     for m in members:
-        require(set(m) == set(MEMBER), "instance fields must match example exactly")
+        require(
+            set(MEMBER) <= set(m) <= set(MEMBER) | {"rdma_devices"},
+            "instance fields must match example (rdma_devices is optional)",
+        )
+        devices = m.get("rdma_devices", [])
+        require(isinstance(devices, list), "rdma_devices must be a list")
+        require(
+            all(
+                isinstance(d, str)
+                and re.fullmatch(r"/dev/infiniband/[A-Za-z0-9_-]+", d)
+                for d in devices
+            )
+            and len(set(devices)) == len(devices),
+            "rdma_devices must contain unique explicit /dev/infiniband device paths",
+        )
         identifier(m["instance_id"])
         identifier(m["hostname"])
         require(m["instance_id"] not in ids, "duplicate instance ID")
@@ -236,6 +250,8 @@ def config_for(spec, member, sidecar):
             MEMORY_LIMIT=member["memory_limit"],
             SHM_SIZE=member["shm_size"],
         )
+    if not sidecar and member.get("rdma_devices"):
+        cfg["RDMA_DEVICES"] = " ".join(member["rdma_devices"])
     return cfg
 
 
