@@ -60,6 +60,13 @@ class CudaDriverOps:
 
     def map(self, va: int, size: int, offset: int, handle: int) -> None:
         self._check(self._driver.cuMemMap(va, size, offset, handle, 0), "map")
+        # Mapping alone leaves the range inaccessible to the device; grant the
+        # consumer GPU read access exactly like the native Consumer does.
+        access = self._driver.CUmemAccessDesc()
+        access.location.type = self._driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        access.location.id = self.device
+        access.flags = self._driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READ
+        self._check(self._driver.cuMemSetAccess(va, size, [access], 1), "set_access")
 
     def unmap(self, va: int, size: int) -> None:
         self._check(self._driver.cuMemUnmap(va, size), "unmap")

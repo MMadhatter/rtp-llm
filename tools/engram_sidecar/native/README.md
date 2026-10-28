@@ -82,6 +82,15 @@ Native tests cover property/bounds checks, sealed writes, constructor rollback,
 alias leases and repeated attach/view/drain/close. Fault-injection exceptions
 exercise resource ownership; they are not GPU/driver failure recovery tests.
 
+## Sharded mapping check
+
+`check_shard_mapping.py` verifies that N fabric allocations can be stitched
+into the two VA spans the lookup kernel expects. `shard_owner.py` publishes one
+shard from another node and keeps it alive until `STOP`; pass its private
+handle file to the consumer with `--remote-handles`. Each mapped range needs
+`cuMemSetAccess` before the consumer GPU can read it.
+
+
 References: [CUDA EGM](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/extended-gpu-memory.html#multi-node-multi-gpu),
 [CUDA VMM](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__VA.html),
 [ATen from_blob](https://github.com/pytorch/pytorch/blob/v2.11.0/aten/src/ATen/ops/from_blob.h).
