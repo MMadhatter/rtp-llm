@@ -169,3 +169,48 @@ def local_rows(plan: ShardPlan, shard_index: int) -> tuple[int, int]:
     if shard_index < 0:
         return (0, 0)
     return plan.row_range(shard_index)
+
+
+@dataclass(frozen=True)
+class MappingRequest:
+    """One ``cuMemMap`` call: map ``size`` bytes of a shard at ``va``."""
+
+    va: int
+    size: int
+    handle_offset: int
+    shard: int
+    kind: str  # "weight" | "scale"
+
+
+def mapping_requests(
+    plan: ShardPlan, weight_base: int, scale_base: int
+) -> list[MappingRequest]:
+    """Map every shard's weight and scale region into the two VA spans.
+
+    ``weight_base`` and ``scale_base`` must be granularity aligned; the caller
+    reserves ``plan.weight_span`` and ``plan.scale_span`` bytes respectively.
+    """
+    for name, base in (("weight_base", weight_base), ("scale_base", scale_base)):
+        if base < 0 or base % plan.granularity:
+            raise ValueError(f"{name} must be a non-negative granularity multiple")
+    requests = []
+    for shard in range(plan.shard_count):
+        requests.append(
+            MappingRequest(
+                va=weight_base + plan.weight_offset(shard),
+                size=plan.weight_bytes,
+                handle_offset=0,
+                shard=shard,
+                kind="weight",
+            )
+        )
+        requests.append(
+            MappingRequest(
+                va=scale_base + plan.scale_offset(shard),
+                size=plan.scale_bytes,
+                handle_offset=plan.weight_bytes,
+                shard=shard,
+                kind="scale",
+            )
+        )
+    return requests

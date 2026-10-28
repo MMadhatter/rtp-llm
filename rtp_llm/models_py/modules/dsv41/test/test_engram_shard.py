@@ -5,6 +5,7 @@ from rtp_llm.models_py.modules.dsv41.engram_shard import (
     DEFAULT_GRANULARITY,
     ShardPlan,
     local_rows,
+    mapping_requests,
     plan_shards,
     split_rows,
 )
@@ -99,6 +100,43 @@ class PlanShardsTest(unittest.TestCase):
         self.assertEqual(hash(plan), hash(plan_shards(1000, DIM, 4)))
         with self.assertRaises(Exception):
             plan.shard_rows = 1
+
+
+class MappingRequestsTest(unittest.TestCase):
+    def test_covers_both_spans_without_overlap(self):
+        plan = plan_shards(REAL_ROWS[0], DIM, 4)
+        weight_base = 1 << 40
+        scale_base = weight_base + plan.weight_span
+        requests = mapping_requests(plan, weight_base, scale_base)
+        self.assertEqual(len(requests), plan.shard_count * 2)
+
+        weights = [r for r in requests if r.kind == "weight"]
+        scales = [r for r in requests if r.kind == "scale"]
+        for group, base, span in (
+            (weights, weight_base, plan.weight_span),
+            (scales, scale_base, plan.scale_span),
+        ):
+            group.sort(key=lambda r: r.va)
+            cursor = base
+            for request in group:
+                self.assertEqual(request.va, cursor)
+                self.assertEqual(request.va % DEFAULT_GRANULARITY, 0)
+                cursor += request.size
+            self.assertEqual(cursor, base + span)
+
+    def test_handle_offsets(self):
+        plan = plan_shards(REAL_ROWS[0], DIM, 4)
+        requests = mapping_requests(plan, 0, plan.weight_span)
+        for request in requests:
+            expected = 0 if request.kind == "weight" else plan.weight_bytes
+            self.assertEqual(request.handle_offset, expected)
+
+    def test_rejects_misaligned_bases(self):
+        plan = plan_shards(1000, DIM, 4)
+        with self.assertRaises(ValueError):
+            mapping_requests(plan, 1, plan.weight_span)
+        with self.assertRaises(ValueError):
+            mapping_requests(plan, 0, -1)
 
 
 if __name__ == "__main__":
