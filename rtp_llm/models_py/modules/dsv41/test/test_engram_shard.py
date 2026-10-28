@@ -124,12 +124,13 @@ class MappingRequestsTest(unittest.TestCase):
                 cursor += request.size
             self.assertEqual(cursor, base + span)
 
-    def test_handle_offsets(self):
+    def test_handle_offsets_are_zero(self):
+        # Fabric handles cannot map a sub-range, so weight and scale must be
+        # separate Owner allocations and every map uses offset 0.
         plan = plan_shards(REAL_ROWS[0], DIM, 4)
         requests = mapping_requests(plan, 0, plan.weight_span)
         for request in requests:
-            expected = 0 if request.kind == "weight" else plan.weight_bytes
-            self.assertEqual(request.handle_offset, expected)
+            self.assertEqual(request.handle_offset, 0)
 
     def test_rejects_misaligned_bases(self):
         plan = plan_shards(1000, DIM, 4)

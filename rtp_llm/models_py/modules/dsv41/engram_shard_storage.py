@@ -86,13 +86,16 @@ class CudaDriverOps:
 class ShardedLayerMapping:
     """One tensor (layer) mapped from ``shard_count`` fabric handles."""
 
-    def __init__(self, plan: ShardPlan, handles: Sequence[bytes], device: int, ops=None):
-        if len(handles) != plan.shard_count:
-            raise ValueError("handle count must equal shard_count")
-        if any(not isinstance(handle, bytes) or not handle for handle in handles):
-            raise ValueError("fabric handles must be non-empty bytes")
+    def __init__(self, plan: ShardPlan, weight_handles: Sequence[bytes],
+                 scale_handles: Sequence[bytes], device: int, ops=None):
+        for name, handles in (("weight", weight_handles), ("scale", scale_handles)):
+            if len(handles) != plan.shard_count:
+                raise ValueError(f"{name} handle count must equal shard_count")
+            if any(not isinstance(handle, bytes) or not handle for handle in handles):
+                raise ValueError(f"{name} fabric handles must be non-empty bytes")
         self.plan = plan
-        self.handles = tuple(handles)
+        self.weight_handles = tuple(weight_handles)
+        self.scale_handles = tuple(scale_handles)
         self.device = device
         self.ops = ops if ops is not None else CudaDriverOps(device)
         self._weight_ptr = 0
@@ -112,7 +115,8 @@ class ShardedLayerMapping:
             self._weight_ptr = self.ops.reserve(self.plan.weight_span)
             self._scale_ptr = self.ops.reserve(self.plan.scale_span)
             for request in mapping_requests(self.plan, self._weight_ptr, self._scale_ptr):
-                handle = self.ops.import_handle(self.handles[request.shard])
+                source = self.weight_handles if request.kind == "weight" else self.scale_handles
+                handle = self.ops.import_handle(source[request.shard])
                 self._imported.append(handle)
                 self.ops.map(request.va, request.size, request.handle_offset, handle)
                 self._mapped.append(request)

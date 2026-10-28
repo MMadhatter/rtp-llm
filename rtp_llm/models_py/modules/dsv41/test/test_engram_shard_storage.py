@@ -50,7 +50,7 @@ class ShardedLayerMappingTest(unittest.TestCase):
 
     def test_attach_maps_every_shard(self):
         ops = FakeOps()
-        mapping = ShardedLayerMapping(self.plan, self.handles, 0, ops=ops).attach()
+        mapping = ShardedLayerMapping(self.plan, self.handles, self.handles, 0, ops=ops).attach()
         self.assertEqual(mapping.state, "MAPPED")
         reserves = [c for c in ops.calls if c[0] == "reserve"]
         self.assertEqual([c[1] for c in reserves], [self.plan.weight_span, self.plan.scale_span])
@@ -59,11 +59,11 @@ class ShardedLayerMappingTest(unittest.TestCase):
         for _, va, size, offset, _ in maps:
             self.assertEqual(va % self.plan.granularity, 0)
             self.assertEqual(size % self.plan.granularity, 0)
-            self.assertIn(offset, (0, self.plan.weight_bytes))
+            self.assertEqual(offset, 0)  # fabric handles: offset must be zero
 
     def test_views_cover_padded_rows(self):
         ops = FakeOps()
-        mapping = ShardedLayerMapping(self.plan, self.handles, 0, ops=ops).attach()
+        mapping = ShardedLayerMapping(self.plan, self.handles, self.handles, 0, ops=ops).attach()
         weight = mapping.weight_view()
         scale = mapping.scale_view()
         self.assertEqual(weight[1], (self.plan.padded_rows, DIM))
@@ -71,7 +71,7 @@ class ShardedLayerMappingTest(unittest.TestCase):
 
     def test_close_unmaps_and_frees(self):
         ops = FakeOps()
-        mapping = ShardedLayerMapping(self.plan, self.handles, 0, ops=ops).attach()
+        mapping = ShardedLayerMapping(self.plan, self.handles, self.handles, 0, ops=ops).attach()
         mapping.close()
         self.assertEqual(mapping.state, "CLOSED")
         unmaps = [c for c in ops.calls if c[0] == "unmap"]
@@ -85,7 +85,7 @@ class ShardedLayerMappingTest(unittest.TestCase):
 
     def test_failed_attach_rolls_back(self):
         ops = FakeOps(fail_on="map")
-        mapping = ShardedLayerMapping(self.plan, self.handles, 0, ops=ops)
+        mapping = ShardedLayerMapping(self.plan, self.handles, self.handles, 0, ops=ops)
         with self.assertRaises(RuntimeError):
             mapping.attach()
         self.assertEqual(mapping.state, "CLOSED")
@@ -94,17 +94,17 @@ class ShardedLayerMappingTest(unittest.TestCase):
 
     def test_rejects_bad_handles(self):
         with self.assertRaises(ValueError):
-            ShardedLayerMapping(self.plan, self.handles[:3], 0, ops=FakeOps())
+            ShardedLayerMapping(self.plan, self.handles[:3], self.handles, 0, ops=FakeOps())
         with self.assertRaises(ValueError):
-            ShardedLayerMapping(self.plan, [b""] * 4, 0, ops=FakeOps())
+            ShardedLayerMapping(self.plan, [b""] * 4, self.handles, 0, ops=FakeOps())
 
     def test_double_attach_rejected(self):
-        mapping = ShardedLayerMapping(self.plan, self.handles, 0, ops=FakeOps()).attach()
+        mapping = ShardedLayerMapping(self.plan, self.handles, self.handles, 0, ops=FakeOps()).attach()
         with self.assertRaises(RuntimeError):
             mapping.attach()
 
     def test_view_before_attach_rejected(self):
-        mapping = ShardedLayerMapping(self.plan, self.handles, 0, ops=FakeOps())
+        mapping = ShardedLayerMapping(self.plan, self.handles, self.handles, 0, ops=FakeOps())
         with self.assertRaises(RuntimeError):
             mapping.weight_view()
 

@@ -187,8 +187,11 @@ def mapping_requests(
 ) -> list[MappingRequest]:
     """Map every shard's weight and scale region into the two VA spans.
 
-    ``weight_base`` and ``scale_base`` must be granularity aligned; the caller
-    reserves ``plan.weight_span`` and ``plan.scale_span`` bytes respectively.
+    Weight and scale live in **separate** Owner allocations because
+    ``cuMemMap`` on a fabric handle only accepts ``offset == 0`` (observed
+    ``CUDA_ERROR_NOT_SUPPORTED`` for any non-zero offset).  ``weight_base`` and
+    ``scale_base`` must be granularity aligned; the caller reserves
+    ``plan.weight_span`` and ``plan.scale_span`` bytes respectively.
     """
     for name, base in (("weight_base", weight_base), ("scale_base", scale_base)):
         if base < 0 or base % plan.granularity:
@@ -208,7 +211,7 @@ def mapping_requests(
             MappingRequest(
                 va=scale_base + plan.scale_offset(shard),
                 size=plan.scale_bytes,
-                handle_offset=plan.weight_bytes,
+                handle_offset=0,  # fabric handles cannot map a sub-range
                 shard=shard,
                 kind="scale",
             )
