@@ -46,6 +46,39 @@ def fixture():
     return result
 
 
+def sharded_fixture():
+    """Two layers, each weight/scale split into two 4096-row shards."""
+    result = dict(schema_version=1, model_revision="release-immutable-42",
+                  generation=uid(1), layout_abi=m.LAYOUT_ABI,
+                  hash_abi="sha256:" + "b" * 64, backend="fabric_egm",
+                  state="READY", tensors=[])
+    rows, shard_rows = 8192, 4096
+    for layer in (1, 14):
+        for role, columns in (("weight", 32), ("scale", 1)):
+            weight = role == "weight"
+            shards = []
+            for index in range(2):
+                begin = index * shard_rows
+                end = min(begin + shard_rows, rows)
+                shards.append(dict(
+                    shard_id=uid(1000 + layer * 10 + (not weight) * 2 + index),
+                    row_begin=begin, row_end=end,
+                    logical_bytes=(end - begin) * columns, byte_offset=0,
+                    allocation_bytes=shard_rows * columns,
+                    allocation_granularity=4096,
+                    owner_id=f"shard-owner-{index}", owner_incarnation=uid(2000 + index),
+                    allocation_id=uid(3000 + layer * 10 + (not weight) * 2 + index),
+                    handle_ref=f"opaque-{layer}-{role}-{index}",
+                    sha256="sha256:" + ("a" if weight else "c") * 64))
+            result["tensors"].append(dict(
+                name=f"layers.{layer}.engram.embed.{role}", shape=[rows, columns],
+                dtype="float8_e4m3fn" if weight else "float8_e8m0fnu",
+                storage_dtype="uint8", row_bytes=columns, quant_block=32,
+                shards=shards))
+    result["dataset_id"] = m.compute_dataset_id(result)
+    return result
+
+
 def encode(document):
     return json.dumps(document).encode()
 
@@ -240,10 +273,33 @@ class ManifestTest(unittest.TestCase):
                 t["shards"][0][key] = value
             self.assert_error("MULTIPLE_OWNERS", m.parse_manifest, encode(d))
 
+
+    def test_two_shard_generation_and_validation(self):
+        d = sharded_fixture()
+        parsed = m.parse_manifest(encode(d))
+        verified = m.validate_for_attach(
+            parsed, expected(layers=((1, 8192), (14, 8192))), d["dataset_id"], d["generation"])
+        self.assertEqual(verified.allocation_count, 8)
+        self.assertEqual(verified.physical_bytes, 540672)
+        for t in parsed.tensors:
+            self.assertEqual(len(t.shards), 2)
+            self.assertEqual(t.shards[0].row_begin, 0)
+            self.assertEqual(t.shards[1].row_end, t.shape[0])
+
+        d = sharded_fixture()
+        d["tensors"][0]["shards"][1].update(row_begin=4097, logical_bytes=(8192 - 4097) * 32)
+        self.assert_error("INCOMPLETE_RANGE", m.parse_manifest, encode(d))
+        d = sharded_fixture()
+        d["tensors"][0]["shards"][1]["allocation_bytes"] = 8192 * 32
+        self.assert_error("UNEVEN_SHARDS", m.parse_manifest, encode(d))
+        d = sharded_fixture()
+        d["tensors"][0]["shards"][1]["byte_offset"] = 4096
+        self.assert_error("INVALID_ALLOCATION_SIZE", m.parse_manifest, encode(d))
+
     def test_sharding_duplicate_shard_and_unknown_fields(self):
         d = fixture()
         d["tensors"][0]["shards"] *= 2
-        self.assert_error("UNSUPPORTED_SHARDING", m.parse_manifest, encode(d))
+        self.assert_error("DUPLICATE_SHARD", m.parse_manifest, encode(d))
         d = fixture()
         d["tensors"][1]["shards"][0]["shard_id"] = d["tensors"][0]["shards"][0]["shard_id"]
         self.assert_error("DUPLICATE_SHARD", m.parse_manifest, encode(d))

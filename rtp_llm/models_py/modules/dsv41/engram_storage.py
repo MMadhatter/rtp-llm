@@ -32,6 +32,8 @@ class FabricEngramStorage:
     def __init__(self):
         self._lock = threading.RLock()
         self._mappings = {}
+        self._shard_mappings = []
+        self._allocation_count = 0
         self._views = {}
         self._graph_pins = 0
         self._state = "ATTACHING"
@@ -39,15 +41,15 @@ class FabricEngramStorage:
     @classmethod
     def attach(cls, manifest_bytes: bytes, *, expected_layout: ExpectedLayout,
                dataset_id: str, generation: str, handles: Mapping[str, bytes],
-               device: int, native, limits: Limits = Limits()):
+               device: int, native, limits: Limits = Limits(), shard_ops=None):
         if type(device) is not int or device < 0:
             raise ValueError("device must be a local CUDA ordinal")
         verified = validate_for_attach(parse_manifest(manifest_bytes, limits),
                                        expected_layout, dataset_id, generation, limits)
         if verified.manifest.backend != "fabric_egm":
             raise ValueError("FabricEngramStorage requires fabric_egm")
-        slices = {t.shards[0].allocation_id: t.shards[0]
-                  for t in verified.manifest.tensors}
+        slices = {s.allocation_id: s
+                  for t in verified.manifest.tensors for s in t.shards}
         if not isinstance(handles, Mapping) or set(handles) != set(slices):
             raise ValueError("handle allocation set does not match the manifest")
         if any(not isinstance(h, bytes) for h in handles.values()):
@@ -55,21 +57,30 @@ class FabricEngramStorage:
         result = cls()
         result.validated = verified
         result.device = device
+        result._allocation_count = len(slices)
         try:
-            for aid, part in sorted(slices.items()):
-                result._mappings[aid] = native.Consumer(
-                    handles[aid], part.allocation_bytes,
-                    part.allocation_granularity, device)
-            for tensor in verified.manifest.tensors:
-                part = tensor.shards[0]
-                result._views[tensor.name] = result._mappings[part.allocation_id].tensor_view(
-                    list(tensor.shape), part.byte_offset)
+            if any(len(t.shards) > 1 for t in verified.manifest.tensors):
+                result._attach_sharded(verified.manifest, handles, device, shard_ops)
+            else:
+                for aid, part in sorted(slices.items()):
+                    result._mappings[aid] = native.Consumer(
+                        handles[aid], part.allocation_bytes,
+                        part.allocation_granularity, device)
+                for tensor in verified.manifest.tensors:
+                    part = tensor.shards[0]
+                    result._views[tensor.name] = result._mappings[part.allocation_id].tensor_view(
+                        list(tensor.shape), part.byte_offset)
             result._state = "MAPPED"
             return result
         except BaseException as original:
             # No GPU work can have been submitted through this unpublished object.
             result._views.clear()
             failures = []
+            for mapping in reversed(result._shard_mappings):
+                try:
+                    mapping.close()
+                except Exception as error:
+                    failures.append(type(error).__name__)
             for mapping in reversed(list(result._mappings.values())):
                 try:
                     mapping.close()
@@ -79,6 +90,56 @@ class FabricEngramStorage:
             if failures:
                 raise CleanupPendingError("attach failed and native cleanup was incomplete", result) from original
             raise
+
+    def _attach_sharded(self, manifest, handles, device, shard_ops=None):
+        """Stitch every tensor's shards into two contiguous VA spans."""
+        from .engram_shard import ShardPlan
+        from .engram_shard_storage import ShardedLayerMapping
+
+        by_name = {t.name: t for t in manifest.tensors}
+        paired = set()
+        for tensor in manifest.tensors:
+            if tensor.name in paired:
+                continue
+            prefix, role = tensor.name.rsplit(".", 1)
+            if role == "scale":
+                continue
+            if role != "weight":
+                raise ValueError("sharded manifest requires weight/scale pairs")
+            weight = tensor
+            scale = by_name.get(prefix + ".scale")
+            if scale is None:
+                raise ValueError("sharded manifest is missing a scale tensor")
+            shard_rows = weight.shards[0].allocation_bytes // weight.shape[1]
+            plan = ShardPlan(
+                total_rows=weight.shape[0], shard_count=len(weight.shards),
+                shard_rows=shard_rows, dim=weight.shape[1],
+                block=weight.quant_block,
+                granularity=weight.shards[0].allocation_granularity)
+            if plan.weight_bytes != weight.shards[0].allocation_bytes:
+                raise ValueError("weight shard geometry mismatch")
+            if plan.scale_bytes != scale.shards[0].allocation_bytes:
+                raise ValueError("scale shard geometry mismatch")
+            if len(scale.shards) != plan.shard_count:
+                raise ValueError("scale shard count mismatch")
+            for index, (weight_shard, scale_shard) in enumerate(
+                    zip(weight.shards, scale.shards)):
+                expected = plan.row_range(index)
+                if (weight_shard.row_begin, weight_shard.row_end) != expected:
+                    raise ValueError("weight shard row range mismatch")
+                if (scale_shard.row_begin, scale_shard.row_end) != expected:
+                    raise ValueError("scale shard row range mismatch")
+            mapping = ShardedLayerMapping(
+                plan,
+                [handles[s.allocation_id] for s in weight.shards],
+                [handles[s.allocation_id] for s in scale.shards],
+                device, ops=shard_ops).attach()
+            self._shard_mappings.append(mapping)
+            self._views[weight.name] = mapping.weight_view()
+            self._views[scale.name] = mapping.scale_view()
+            paired.update((weight.name, scale.name))
+        if paired != set(by_name):
+            raise ValueError("sharded manifest has an unpaired tensor")
 
     def verify(self, verify_views):
         """Verify GPU reads before READY; callback must drain and return True.
@@ -137,7 +198,7 @@ class FabricEngramStorage:
             return dict(state=self._state, generation=self.validated.manifest.generation,
                         dataset_id=self.validated.manifest.dataset_id,
                         physical_bytes=self.validated.physical_bytes,
-                        allocation_count=len(self._mappings), graph_pins=self._graph_pins,
+                        allocation_count=self._allocation_count, graph_pins=self._graph_pins,
                         allocations={aid: mapping.info() for aid, mapping in self._mappings.items()})
 
     def close(self):
@@ -158,11 +219,14 @@ class FabricEngramStorage:
             if any(m.info()["active_views"] for m in self._mappings.values()):
                 raise StorageBusyError("external tensor views must be released before close")
             try:
+                for mapping in reversed(self._shard_mappings):
+                    mapping.close()
                 for mapping in reversed(list(self._mappings.values())):
                     mapping.close()
             except Exception:
                 self._state = "FAILED"
                 raise
+            self._shard_mappings.clear()
             self._mappings.clear()
             self._state = "CLOSED"
 

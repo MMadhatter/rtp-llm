@@ -211,41 +211,73 @@ def _metadata(document, limits):
         if rows > _MAX_INTEGER // columns:
             raise ManifestError("SIZE_OVERFLOW", path + ".shape")
         logical_bytes = rows * columns
-        if not isinstance(t["shards"], list) or len(t["shards"]) != 1:
+        shards = t["shards"]
+        if not isinstance(shards, list) or not 1 <= len(shards) <= 64:
             raise ManifestError("UNSUPPORTED_SHARDING", path + ".shards")
-        s = _object(t["shards"][0], AllocationSlice, path + ".shards[0]")
-        for key in ("shard_id", "owner_incarnation", "allocation_id"):
-            _uuid(s[key], path + "." + key)
-        for key in ("row_begin", "byte_offset"):
-            _integer(s[key], path + "." + key, minimum=0)
-        for key in ("row_end", "logical_bytes", "allocation_bytes", "allocation_granularity"):
-            _integer(s[key], path + "." + key)
-        _text(s["owner_id"], path + ".owner_id")
-        _text(s["handle_ref"], path + ".handle_ref")
-        _digest(s["sha256"], path + ".sha256")
-        if s["shard_id"] in shard_ids:
-            raise ManifestError("DUPLICATE_SHARD", path)
-        shard_ids.add(s["shard_id"])
-        if (s["row_begin"], s["row_end"], s["logical_bytes"]) != (0, rows, logical_bytes):
-            raise ManifestError("INCOMPLETE_RANGE", path)
-        size, offset, granularity = s["allocation_bytes"], s["byte_offset"], s["allocation_granularity"]
-        if size > limits.max_allocation_bytes or size % granularity:
-            raise ManifestError("INVALID_ALLOCATION_SIZE", path)
-        # Tensor offsets need not be VMM-granularity aligned: map the entire
-        # allocation at map offset 0, then address uint8 subranges within it.
-        if offset > size or logical_bytes > size - offset:
-            raise ManifestError("OUT_OF_BOUNDS", path)
-        owner = (s["owner_id"], s["owner_incarnation"])
-        owners.add(owner)
-        aid = s["allocation_id"]
-        metadata = (size, granularity, *owner, s["handle_ref"])
-        if aid in allocations and allocations[aid] != metadata:
-            raise ManifestError("ALLOCATION_CONFLICT", path)
-        allocations[aid] = metadata
-        intervals.setdefault(aid, []).append((offset, offset + logical_bytes))
+        multi = len(shards) > 1
+        parts, shard_rows = [], None
+        for j, raw_shard in enumerate(shards):
+            spath = f"{path}.shards[{j}]"
+            s = _object(raw_shard, AllocationSlice, spath)
+            for key in ("shard_id", "owner_incarnation", "allocation_id"):
+                _uuid(s[key], spath + "." + key)
+            for key in ("row_begin", "byte_offset"):
+                _integer(s[key], spath + "." + key, minimum=0)
+            for key in ("row_end", "logical_bytes", "allocation_bytes", "allocation_granularity"):
+                _integer(s[key], spath + "." + key)
+            _text(s["owner_id"], spath + ".owner_id")
+            _text(s["handle_ref"], spath + ".handle_ref")
+            _digest(s["sha256"], spath + ".sha256")
+            if s["shard_id"] in shard_ids:
+                raise ManifestError("DUPLICATE_SHARD", spath)
+            shard_ids.add(s["shard_id"])
+            if not multi and (s["row_begin"], s["row_end"], s["logical_bytes"]) != (
+                    0, rows, logical_bytes):
+                raise ManifestError("INCOMPLETE_RANGE", path)
+            if not 0 <= s["row_begin"] < s["row_end"] <= rows:
+                raise ManifestError("INVALID_RANGE", spath)
+            if s["logical_bytes"] != (s["row_end"] - s["row_begin"]) * columns:
+                raise ManifestError("INVALID_LOGICAL_BYTES", spath)
+            size, offset, granularity = s["allocation_bytes"], s["byte_offset"], s["allocation_granularity"]
+            if size > limits.max_allocation_bytes or size % granularity:
+                raise ManifestError("INVALID_ALLOCATION_SIZE", spath)
+            if multi:
+                # Stitched shards are separate allocations mapped at offset 0.
+                if offset != 0 or size % columns:
+                    raise ManifestError("INVALID_ALLOCATION_SIZE", spath)
+                local_rows = size // columns
+                if s["row_end"] - s["row_begin"] > local_rows:
+                    raise ManifestError("OUT_OF_BOUNDS", spath)
+                if shard_rows is None:
+                    shard_rows = local_rows
+                elif local_rows != shard_rows:
+                    raise ManifestError("UNEVEN_SHARDS", spath)
+            else:
+                # Tensor offsets need not be VMM-granularity aligned: map the
+                # entire allocation at map offset 0, then address subranges.
+                if offset > size or logical_bytes > size - offset:
+                    raise ManifestError("OUT_OF_BOUNDS", spath)
+            owner = (s["owner_id"], s["owner_incarnation"])
+            owners.add(owner)
+            aid = s["allocation_id"]
+            metadata = (size, granularity, *owner, s["handle_ref"])
+            if aid in allocations and allocations[aid] != metadata:
+                raise ManifestError("ALLOCATION_CONFLICT", spath)
+            allocations[aid] = metadata
+            intervals.setdefault(aid, []).append((offset, offset + s["logical_bytes"]))
+            parts.append(s)
+        parts.sort(key=lambda s: s["row_begin"])
+        if multi:
+            cursor = 0
+            for s in parts:
+                if s["row_begin"] != cursor:
+                    raise ManifestError("INCOMPLETE_RANGE", path)
+                cursor = s["row_end"]
+            if cursor != rows:
+                raise ManifestError("INCOMPLETE_RANGE", path)
         tensors.append(TensorSpec(name, tuple(shape), dtype, "uint8", columns, 32,
-                                  (AllocationSlice(**s),)))
-    if len(owners) != 1:
+                                  tuple(AllocationSlice(**s) for s in parts)))
+    if len(owners) != 1 and not any(len(t.shards) > 1 for t in tensors):
         raise ManifestError("MULTIPLE_OWNERS", "tensors")
     total = sum(metadata[0] for metadata in allocations.values())
     if total > limits.max_total_allocation_bytes:
@@ -260,6 +292,14 @@ def _metadata(document, limits):
         weight, scale = by_name.get(prefix + ".weight"), by_name.get(prefix + ".scale")
         if weight is None or scale is None or scale.shape != (weight.shape[0], weight.shape[1] // 32):
             raise ManifestError("INCOMPLETE_WEIGHT_SCALE", "tensors")
+        if len(weight.shards) != len(scale.shards):
+            raise ManifestError("INCOMPLETE_WEIGHT_SCALE", "tensors")
+        if len(weight.shards) > 1:
+            for ws, ss in zip(weight.shards, scale.shards):
+                if (ws.row_begin, ws.row_end) != (ss.row_begin, ss.row_end):
+                    raise ManifestError("INCOMPLETE_WEIGHT_SCALE", "tensors")
+                if ws.allocation_bytes // weight.row_bytes != ss.allocation_bytes // scale.row_bytes:
+                    raise ManifestError("UNEVEN_SHARDS", "tensors")
     result = dict(d, tensors=tuple(sorted(tensors, key=lambda t: t.name)))
     return Manifest(**result), total, len(allocations)
 
@@ -267,7 +307,9 @@ def _metadata(document, limits):
 def _content_digest(manifest):
     tensors = [{"name": t.name, "shape": t.shape, "dtype": t.dtype,
                 "storage_dtype": t.storage_dtype, "row_bytes": t.row_bytes,
-                "quant_block": t.quant_block, "sha256": t.shards[0].sha256}
+                "quant_block": t.quant_block,
+                "sha256": (t.shards[0].sha256 if len(t.shards) == 1
+                           else [s.sha256 for s in t.shards])}
                for t in manifest.tensors]
     return _hash({"model_revision": manifest.model_revision, "layout_abi": manifest.layout_abi,
                   "hash_abi": manifest.hash_abi, "tensors": tensors})

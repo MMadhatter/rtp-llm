@@ -47,6 +47,65 @@ def fixture():
     return document, layout
 
 
+def sharded_fixture():
+    document = dict(schema_version=1, model_revision="fixture-v1", generation=uid(1),
+                    layout_abi=m.LAYOUT_ABI, hash_abi="sha256:" + "a" * 64,
+                    backend="fabric_egm", state="READY", tensors=[])
+    rows, shard_rows = 8192, 4096
+    for layer in (1, 2):
+        for role, width in (("weight", 32), ("scale", 1)):
+            shards = []
+            for index in range(2):
+                begin = index * shard_rows
+                end = min(begin + shard_rows, rows)
+                shards.append(dict(
+                    shard_id=uid(1000 + layer * 10 + (role == "scale") * 2 + index),
+                    row_begin=begin, row_end=end,
+                    logical_bytes=(end - begin) * width, byte_offset=0,
+                    allocation_bytes=shard_rows * width, allocation_granularity=4096,
+                    owner_id=f"shard-owner-{index}", owner_incarnation=uid(2000 + index),
+                    allocation_id=uid(3000 + layer * 10 + (role == "scale") * 2 + index),
+                    handle_ref=f"capability-{layer}-{role}-{index}",
+                    sha256="sha256:" + "b" * 64))
+            document["tensors"].append(dict(
+                name=f"layers.{layer}.engram.embed.{role}", shape=[rows, width],
+                dtype="float8_e4m3fn" if role == "weight" else "float8_e8m0fnu",
+                storage_dtype="uint8", row_bytes=width, quant_block=32, shards=shards))
+    document["dataset_id"] = m.compute_dataset_id(document)
+    layout = m.ExpectedLayout(layers=((1, rows), (2, rows)), head_dim=32,
+                              model_revision="fixture-v1", hash_abi=document["hash_abi"])
+    return document, layout
+
+
+class FakeShardOps:
+    def __init__(self):
+        self.calls = []
+        self._next = 0x1000_0000_0000
+
+    def reserve(self, size):
+        self.calls.append(("reserve", size))
+        pointer = self._next
+        self._next += 1 << 34
+        return pointer
+
+    def import_handle(self, raw):
+        self.calls.append(("import", raw))
+        return int.from_bytes(raw[:8], "little")
+
+    def map(self, va, size, offset, handle):
+        self.calls.append(("map", va, size, offset, handle))
+
+    def unmap(self, va, size):
+        self.calls.append(("unmap", va, size))
+
+    def free(self, va, size):
+        self.calls.append(("free", va, size))
+
+    def view(self, va, shape):
+        self.calls.append(("view", va, shape))
+        return (va, shape)
+
+
 class View:
     def __init__(self, mapping):
         self.mapping = mapping
@@ -105,6 +164,32 @@ class StorageTest(unittest.TestCase):
         if verify:
             result.verify(lambda views, verified: True)
         return result
+
+
+    def test_two_shard_attach_stitches_two_spans(self):
+        d, layout = sharded_fixture()
+        handles = {shard["allocation_id"]: b"handle-" + shard["allocation_id"].encode()
+                   for tensor in d["tensors"] for shard in tensor["shards"]}
+        ops = FakeShardOps()
+        storage = s.FabricEngramStorage.attach(
+            json.dumps(d).encode(), expected_layout=layout, dataset_id=d["dataset_id"],
+            generation=d["generation"], handles=handles, device=0, native=Native(),
+            shard_ops=ops)
+        self.assertEqual(storage.info()["allocation_count"], 8)
+        reserves = [c for c in ops.calls if c[0] == "reserve"]
+        maps = [c for c in ops.calls if c[0] == "map"]
+        self.assertEqual(len(reserves), 4)  # two layers, weight + scale spans
+        self.assertEqual(len(maps), 8)     # two shards per span
+        for _, _, size, offset, _ in maps:
+            self.assertEqual(offset, 0)
+        storage.verify(lambda views, verified: True)
+        weight, scale = storage.table_views(1)
+        self.assertEqual(weight[1], (8192, 32))
+        self.assertEqual(scale[1], (8192, 1))
+        storage.close()
+        self.assertEqual(storage.info()["state"], "CLOSED")
+        self.assertEqual(len([c for c in ops.calls if c[0] == "unmap"]), 8)
+        self.assertEqual(len([c for c in ops.calls if c[0] == "free"]), 4)
 
     def test_deduplicated_imports_and_close_are_idempotent(self):
         native = Native()

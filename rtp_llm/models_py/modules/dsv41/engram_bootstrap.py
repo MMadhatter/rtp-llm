@@ -182,7 +182,8 @@ def _read_bundle(path, layout, actual_hash_abi, *, limits=None):
                 or type(sample["sha256"]) is not str or not _DIGEST.fullmatch(sample["sha256"])):
             raise BootstrapError("INVALID_READ_SAMPLE")
     capabilities = _json(_private_read(path.parent / bundle["capabilities"], 256 << 10))
-    allocation_ids = {tensor.shards[0].allocation_id for tensor in validated.manifest.tensors}
+    allocation_ids = {shard.allocation_id for tensor in validated.manifest.tensors
+                      for shard in tensor.shards}
     if type(capabilities) is not dict or capabilities.keys() != allocation_ids:
         raise BootstrapError("CAPABILITY_SET_MISMATCH")
     handles = {}
@@ -234,7 +235,8 @@ def attach_from_bundle(bundle_path, *, layout, hash_state, device, environ=None)
     manifest = parse_manifest(raw, limits)
     native_limit = getattr(native, "max_allocation_bytes", None)
     if (type(native_limit) is not int or native_limit <= 0
-            or any(t.shards[0].allocation_bytes > native_limit for t in manifest.tensors)):
+            or any(shard.allocation_bytes > native_limit
+                   for t in manifest.tensors for shard in t.shards)):
         raise BootstrapError("NATIVE_ALLOCATION_LIMIT")
     try:
         storage = FabricEngramStorage.attach(
