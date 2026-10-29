@@ -7,12 +7,21 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tools.engram_sidecar.framework.sharded_checkpoint_owner import load_rows, tensor_shard_layout
+from tools.engram_sidecar.framework.sharded_checkpoint_owner import load_rows, tensor_shard_layout, layer_numa_placement
 from rtp_llm.models_py.modules.dsv41.engram_checkpoint import CheckpointError, TensorPlan, _header
 from rtp_llm.models_py.modules.dsv41.engram_shard import plan_shards
 
 
 class ShardedCheckpointLayoutTest(unittest.TestCase):
+    def test_placement_is_complete_and_never_silently_falls_back(self):
+        self.assertEqual(layer_numa_placement(None, [1, 14], 0), {1: 0, 14: 0})
+        self.assertEqual(layer_numa_placement('{"1":0,"14":1}', [1, 14], 0), {1: 0, 14: 1})
+        for value in ('{}', '{"1":0}', '{"1":0,"14":1,"2":0}',
+                      '{"1":true,"14":1}', '{"1":0,"14":-1}',
+                      '{"1":0,"14":1.0}', '{"1":0,"1":1,"14":0}', '[]'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                layer_numa_placement(value, [1, 14], 0)
+
     def test_fp8_scale_uses_weight_partition_on_every_owner(self):
         rows, dim, granularity = 384006168, 256, 2 << 20
         tensors = [SimpleNamespace(name="layers.1.engram.embed." + role, shape=(rows, width))
