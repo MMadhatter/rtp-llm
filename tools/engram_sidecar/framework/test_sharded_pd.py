@@ -15,6 +15,15 @@ def topology():
 
 
 class ShardedPDTest(unittest.TestCase):
+    def test_preflight_capacity_uses_explicit_arguments(self):
+        args = SimpleNamespace(max_allocation_bytes=128 << 30, budget_bytes=256 << 30)
+        limits = pd.full_model_http.bundle_limits(args)
+        self.assertEqual(limits.max_allocation_bytes, 128 << 30)
+        self.assertEqual(limits.max_total_allocation_bytes, 256 << 30)
+        args.budget_bytes = 0
+        with self.assertRaises(ValueError):
+            pd.full_model_http.bundle_limits(args)
+
     def env(self, node, graph=False, storage="external-egm", decode_moe="mega"):
         args = SimpleNamespace(checkpoint=Path("/model"), bundle=Path("/private/bundle.json"),
                                storage_mode=storage, cuda_graph=graph,

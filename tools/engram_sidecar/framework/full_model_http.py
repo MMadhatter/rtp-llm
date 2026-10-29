@@ -247,6 +247,15 @@ def launch_environment(args, inherited=None):
     return env
 
 
+def bundle_limits(args):
+    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _configured_limits
+
+    return _configured_limits({
+        "RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(args.max_allocation_bytes),
+        "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": str(args.budget_bytes),
+    })
+
+
 def verify_bundle(args):
     from rtp_llm.models_py.modules.dsv41.engram import EngramLayout, NgramHashState
     from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _read_bundle, hash_state_digest
@@ -255,7 +264,7 @@ def verify_bundle(args):
     source = read_source(checkpoint=args.checkpoint, model_revision=args.model_revision)
     layout = EngramLayout(source.config)
     actual = hash_state_digest(NgramHashState(layout, str(args.checkpoint)))
-    bundle, _, _, handles = _read_bundle(args.bundle, layout, actual)
+    bundle, _, _, handles = _read_bundle(args.bundle, layout, actual, limits=bundle_limits(args))
     del handles
     if bundle["model_revision"] != args.model_revision:
         raise ValueError("operator checkpoint revision differs from Owner bundle")
