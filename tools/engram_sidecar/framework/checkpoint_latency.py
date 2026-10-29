@@ -68,6 +68,9 @@ def diagnostic_declaration(args):
 
 def check_options(args):
     args.allow_numa_cache_reclaim = getattr(args, "allow_numa_cache_reclaim", False)
+    args.allow_source_hardlinks = getattr(args, "allow_source_hardlinks", False)
+    if args.allow_source_hardlinks and not args.discard_private_source_cache:
+        raise ValueError("hardlink cache advice requires explicit source cache discard")
     if args.allow_numa_cache_reclaim and args.source_cache_numa is not None:
         raise ValueError("cache-reclaim admission is only supported without source NUMA staging")
     args.batches = integer_list(args.batches, allowed=(1, 2, 4, 8, 16, 32, 64))
@@ -253,13 +256,15 @@ def source_paths(source, index, layer):
                    for role in ("weight", "scale")})
 
 
-def private_source_cache_advice(source, paths):
+def private_source_cache_advice(source, paths, *, allow_hardlinks=False):
     """Best-effort file-cache advice on an explicitly opted-in private source copy.
 
-    Files must be current-UID, single-link, owner-readable and non-writable;
+    Files must be current-UID, owner-readable and non-writable;
     source root must be mode0700. This cannot prove no same-UID process holds an
     open mapping. The operator promises immutable, task-owned copies. No global
     cache controls or writes to checkpoint bytes are used.
+    Hardlinks require separate opt-in: advice affects all aliases of the inode;
+    the operator must verify those aliases also belong to this experiment.
     """
     from tools.engram_sidecar.framework.stage_checkpoint import _canonical, _snapshot, _unchanged
     source = _canonical(source)
@@ -276,13 +281,15 @@ def private_source_cache_advice(source, paths):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or (info.st_nlink != 1 and not allow_hardlinks)
                     or stat.S_IMODE(info.st_mode) != 0o400
                     or (info.st_dev, info.st_ino) != (expected["device"], expected["inode"])):
                 raise ValueError("cache advice requires private single-link immutable mode0400 source files")
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
             _unchanged(path, expected)
-            advised.append(dict(file=path.name, bytes=info.st_size, advice="DONTNEED", reclaimed_bytes="NOT_ASSUMED"))
+            advised.append(dict(file=path.name, bytes=info.st_size, hardlinks=info.st_nlink,
+                                advice="DONTNEED", reclaimed_bytes="NOT_ASSUMED"))
         finally:
             os.close(fd)
     return advised
@@ -953,6 +960,7 @@ def run(args):
                    memory_headroom_bytes=args.memory_headroom_gib << 30,
                    discard_private_source_cache=args.discard_private_source_cache,
                    allow_numa_cache_reclaim=args.allow_numa_cache_reclaim,
+                   allow_source_hardlinks=args.allow_source_hardlinks,
                    source_cache_numa=args.source_cache_numa,
                    source_sha256={str(path.relative_to(REPO)): hashlib.sha256(path.read_bytes()).hexdigest()
                                   for path in source_files},
@@ -977,7 +985,8 @@ def run(args):
                 files = source_paths(args.source_checkpoint, index, layer)
                 source_bytes = sum(path.stat().st_size for path in files)
                 if args.discard_private_source_cache:
-                    advice = private_source_cache_advice(args.source_checkpoint, files)
+                    advice = private_source_cache_advice(args.source_checkpoint, files,
+                                                        allow_hardlinks=args.allow_source_hardlinks)
                     emit("PRIVATE_SOURCE_CACHE_ADVICE", layer=layer, phase="before_load", files=advice)
                 snapshot = memory_snapshot(node)
                 write_new_json(args.output / f"memory-layer{layer}-before.json", snapshot)
@@ -1000,7 +1009,8 @@ def run(args):
                     emit("SOURCE_CACHE_NUMA_VERIFIED", layer=layer, source_node=args.source_cache_numa,
                          gpu_host_numa=node, complete_source_verified=True, eviction_prevented=False)
                 if args.discard_private_source_cache:
-                    advice = private_source_cache_advice(args.source_checkpoint, files)
+                    advice = private_source_cache_advice(args.source_checkpoint, files,
+                                                        allow_hardlinks=args.allow_source_hardlinks)
                     emit("PRIVATE_SOURCE_CACHE_ADVICE", layer=layer, phase="after_load", files=advice)
                 snapshot = memory_snapshot(node)
                 write_new_json(args.output / f"memory-layer{layer}-after.json", snapshot)
@@ -1111,6 +1121,9 @@ def main(argv=None):
                         help="Admission may count clean inactive NUMA file cache; "
                              "not a reservation. Post-load free-memory and NUMA checks remain strict.")
     parser.add_argument("--discard-private-source-cache", action="store_true")
+    parser.add_argument("--allow-source-hardlinks", action="store_true",
+                        help="Operator confirms all source hardlinks are experiment-owned; "
+                             "DONTNEED affects every alias. Requires source cache discard.")
     parser.add_argument("--source-cache-numa", type=int, default=None)
     parser.add_argument("--modes", default="eager,graph")
     parser.add_argument("--distributions", default="hot,random")

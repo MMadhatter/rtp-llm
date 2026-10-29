@@ -238,6 +238,23 @@ class LatencyContractTest(unittest.TestCase):
                     h.private_source_cache_advice(root, [path])
                 advice.assert_not_called()
 
+    def test_owned_hardlink_advice_is_explicit_and_preserves_bytes_and_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            path = root / "table.safetensors"
+            path.write_bytes(b"unchanged")
+            path.chmod(0o400)
+            os.link(path, root / "pinned-alias")
+            with patch.object(os, "posix_fadvise", create=True), patch.object(os, "POSIX_FADV_DONTNEED", 4, create=True):
+                result = h.private_source_cache_advice(root, [path], allow_hardlinks=True)
+            self.assertEqual(result[0]["hardlinks"], 2)
+            self.assertEqual(path.read_bytes(), b"unchanged")
+            self.assertEqual(path.stat().st_nlink, 2)
+            args = self.options(root)
+            args.allow_source_hardlinks = True
+            with self.assertRaisesRegex(ValueError, "cache discard"):
+                h.check_options(args)
+
     def test_real_numa_metadata_survives_summary_validation_and_json_write(self):
         text = "1000 default file=/dev/shm/rtp_llm_engram_1_abc N1=1546692 kernelpagesize_kB=64\n"
         numa = h.parse_numa_pages(text, 0x1000, 1)
