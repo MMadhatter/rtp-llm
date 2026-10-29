@@ -104,6 +104,8 @@ def main(argv=None):
     parser.add_argument("--max-allocation-bytes", type=int, default=128 << 30)
     parser.add_argument("--budget-bytes", type=int, default=256 << 30)
     parser.add_argument("--report-timeout", type=float, default=3600)
+    parser.add_argument("--release-input-page-cache", action="store_true",
+                        help="advise eviction of input file cache after each tensor; use private checkpoint copies")
     args = parser.parse_args(argv)
 
     if (not args.checkpoint.is_absolute() or not args.publication.is_absolute()
@@ -150,6 +152,16 @@ def main(argv=None):
                 owners.append(owner)
                 with safe_open(checkpoint / tensor.relative_path, framework="pt", device="cpu") as reader:
                     digest = load_rows(owner, reader, tensor.name, start, end, columns)
+                if args.release_input_page_cache:
+                    # A large staging copy plus mmap reads can compete with EGM
+                    # backing for host RAM. Only advise the selected input file;
+                    # never drop machine-wide caches or change checkpoint bytes.
+                    fd = os.open(checkpoint / tensor.relative_path, os.O_RDONLY)
+                    try:
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    finally:
+                        os.close(fd)
+                    emit("INPUT_CACHE_RELEASE_ADVISED", tensor=tensor.name, shard=args.shard)
                 emit("LOADED", tensor=tensor.name, shard=args.shard,
                      logical_bytes=(end - start) * columns)
                 tensors[tensor.name] = dict(
