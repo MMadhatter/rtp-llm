@@ -184,15 +184,15 @@ def memory_snapshot(node, source_node=None):
                                                              Path("/proc/self/mountinfo").read_text())
     groups = read_cgroup_memory(current, mount, hierarchy_root)
     numa_text = Path(f"/sys/devices/system/node/node{node}/meminfo").read_text()
-    # An estimate, never a reservation: exclude dirty/writeback pages and leave
-    # 20% of inactive file cache uncounted. Shmem is not Inactive(file).
+    # An estimate, never a reservation: exclude dirty/writeback pages.
+    # Shmem is not Inactive(file); the admission check adds its headroom margin.
     clean_inactive = max(0, parse_kib_field(numa_text, "Inactive(file)")
                         - parse_kib_field(numa_text, "Dirty")
                         - parse_kib_field(numa_text, "Writeback"))
     result = dict(cgroups=groups, shm_free_bytes=shutil.disk_usage("/dev/shm").free,
                 host_available_bytes=parse_kib_field(Path("/proc/meminfo").read_text(), "MemAvailable"),
                 numa_free_bytes=parse_kib_field(numa_text, "MemFree"),
-                numa_cache_reclaim_estimate_bytes=clean_inactive * 4 // 5)
+                numa_cache_reclaim_estimate_bytes=clean_inactive)
     if source_node is not None:
         result["source_numa_free_bytes"] = parse_kib_field(
             Path(f"/sys/devices/system/node/node{source_node}/meminfo").read_text(), "MemFree")
@@ -1108,7 +1108,7 @@ def main(argv=None):
     parser.add_argument("--layer-mode", choices=("single", "together"), default="single")
     parser.add_argument("--memory-headroom-gib", type=int, default=16)
     parser.add_argument("--allow-numa-cache-reclaim", action="store_true",
-                        help="Admission may count 80%% of clean inactive NUMA file cache; "
+                        help="Admission may count clean inactive NUMA file cache; "
                              "not a reservation. Post-load free-memory and NUMA checks remain strict.")
     parser.add_argument("--discard-private-source-cache", action="store_true")
     parser.add_argument("--source-cache-numa", type=int, default=None)
