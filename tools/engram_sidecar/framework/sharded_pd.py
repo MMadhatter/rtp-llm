@@ -140,6 +140,9 @@ def main(argv=None):
         ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"], text=True, timeout=15).split())
     if not set(topology["nodes"][args.node]["gpu_uuids"]).issubset(available):
         raise RuntimeError("topology does not match this host's GPUs")
+    # Native/service imports initialize relative log paths. Match the standard
+    # launcher instead of relying on a writable container default directory.
+    os.chdir(full_model_http.REPO)
     # Fresh exec below loads this same environment again. Check the loader in a
     # CUDA-hidden child first, before mapping Engram or loading the backbone.
     native_check = (
