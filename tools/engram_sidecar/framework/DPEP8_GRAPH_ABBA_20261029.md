@@ -93,3 +93,20 @@ GPU was reset, and no global cache drop was used.
   sizes. This four-host experiment does not establish NVL72-wide scaling.
 - Qualify the production RPC path, owner lifecycle/failover and memory footprint
   independently. Functional chat and Graph checks do not establish those claims.
+
+## Separate eight-step trace check
+
+After timing, one diagnostic request per backend used the 2572-token prompt and
+8 forced output tokens with Kineto enabled. Both active decode rank0 traces
+contain eight `cudaGraphLaunch` calls and sixteen `_lookup_host_kernel` calls,
+correlated two lookups per Graph launch. Thus online Graph replay and the actual
+lookup kernel are observed, not inferred only from startup flags.
+
+In these **profiled short diagnostics**, the sum of the two lookup kernels per
+Graph was 20.800–26.176 us for pinned and 17.984–19.424 us for EGM. This is a
+different, small sample from the unprofiled 256-token ABBA requests. It neither
+proves EGM is generally faster nor attributes the long-input TPOT regression.
+The full Graph kernel spans and leading cumulative-duration kernels are retained
+in the JSON; overlapping kernel durations must not be summed as wall time.
+Further correlated, representative profiling is required before assigning a
+root cause. Profiler windows were completed before final service verification.
