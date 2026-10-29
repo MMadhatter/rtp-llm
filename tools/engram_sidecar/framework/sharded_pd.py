@@ -76,7 +76,8 @@ def launch_environment(config, node_name, args, inherited=None):
         "SEQ_SIZE_PER_BLOCK": "256",
         "KERNEL_SEQ_SIZE_PER_BLOCK": "128",
         "CP_ROTATE_METHOD": "ALL_GATHER" if is_prefill else "PREFILL_CP",
-        "DSV4_MOE_STRATEGY": "mega" if is_prefill else "deepep",
+        # Parallel topology does not choose the MoE kernel implementation.
+        "DSV4_MOE_STRATEGY": "mega" if is_prefill else getattr(args, "decode_moe_strategy", "mega"),
         "DSV41_CED": "1",
         "DSV41_SWA_BOUNDED_REPLAY": "1",
         "CACHE_STORE_RDMA_MODE": "1",
@@ -122,6 +123,7 @@ def main(argv=None):
     parser.add_argument("--max-allocation-bytes", type=int, default=128 * 1024**3)
     parser.add_argument("--budget-bytes", type=int, default=256 * 1024**3)
     parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--decode-moe-strategy", choices=("mega", "deepep"), default="mega")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.storage_mode == "external-egm" and args.bundle is None:

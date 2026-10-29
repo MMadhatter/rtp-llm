@@ -15,11 +15,11 @@ def topology():
 
 
 class ShardedPDTest(unittest.TestCase):
-    def env(self, node, graph=False, storage="external-egm"):
+    def env(self, node, graph=False, storage="external-egm", decode_moe="mega"):
         args = SimpleNamespace(checkpoint=Path("/model"), bundle=Path("/private/bundle.json"),
                                storage_mode=storage, cuda_graph=graph,
                                max_allocation_bytes=128*1024**3, budget_bytes=256*1024**3,
-                               port=18180)
+                               port=18180, decode_moe_strategy=decode_moe)
         return pd.launch_environment(topology(), node, args, inherited={
             "TP_SIZE": "8", "DP_SIZE": "1", "WORLD_RANK": "99",
             "GANG_CONFIG_STRING": "stale", "GANG_CONFIG_PATH": "/old",
@@ -31,13 +31,20 @@ class ShardedPDTest(unittest.TestCase):
             self.assertEqual([e[k] for k in ("TP_SIZE", "DP_SIZE", "EP_SIZE")], ["1", "8", "8"])
             self.assertEqual(e["WORLD_SIZE"], "8")
             self.assertEqual(e["LOCAL_WORLD_SIZE"], "4")
-            self.assertEqual(e["DSV4_MOE_STRATEGY"], "deepep")
+            self.assertEqual(e["DSV4_MOE_STRATEGY"], "mega")
             self.assertEqual(e["PREFILL_CP_SIZE"], "4")
             self.assertEqual(e["PREFILL_CP_KV_CACHE_SHARDED"], "1")
             self.assertEqual(e["LD_LIBRARY_PATH"], "/native")
         self.assertEqual([e["WORLD_RANK"] for e in envs], ["0", "4"])
         self.assertEqual(envs[0]["GANG_CONFIG_STRING"], envs[1]["GANG_CONFIG_STRING"])
         self.assertIn("name:decode_part1,ip:192.0.2.4", envs[0]["GANG_CONFIG_STRING"])
+
+    def test_decode_backend_is_independent_of_parallel_topology(self):
+        for name in ("d0", "d1"):
+            env = self.env(name, decode_moe="deepep")
+            self.assertEqual(env["DSV4_MOE_STRATEGY"], "deepep")
+            self.assertEqual([env[k] for k in ("TP_SIZE", "DP_SIZE", "EP_SIZE")], ["1", "8", "8"])
+        self.assertEqual(self.env("p0", decode_moe="deepep")["DSV4_MOE_STRATEGY"], "mega")
 
     def test_two_independent_prefills_and_local_frontends(self):
         for i, name in enumerate(("p0", "p1")):
