@@ -155,6 +155,8 @@ def main(argv=None):
     native_check = (
         "import rtp_llm.ops as ops; ops.ensure_engine_ops_loaded(); "
         "import librtp_compute_ops; "
+        "from rtp_llm.async_decoder_engine.rpc_engine import LanguageCppEngine; "
+        "from rtp_llm.models_py.model_desc.deepseek_v41_model import DeepSeekV41Model; "
         "from tools.engram_sidecar.framework.native_runtime import assert_single_compute_library; "
         "print('NATIVE_COMPUTE_SINGLETON_OK', assert_single_compute_library())"
     )

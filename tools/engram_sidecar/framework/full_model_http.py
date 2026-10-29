@@ -182,6 +182,8 @@ def runtime_preflight(repository=REPO, *, load_native=False):
             "from rtp_llm.dash_sc.app import DashScApp; "
             "from rtp_llm.frontend.frontend_app import FrontendApp; "
             "from rtp_llm.server.backend_manager import BackendManager; "
+            "from rtp_llm.async_decoder_engine.rpc_engine import LanguageCppEngine; "
+            "from rtp_llm.models_py.model_desc.deepseek_v41_model import DeepSeekV41Model; "
             "import rtp_llm.start_backend_server; "
             # These are lazy in the RTP wrappers; load the actual wheel and
             # its CUDA bindings before any complete-checkpoint allocation.
