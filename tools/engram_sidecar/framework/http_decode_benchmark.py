@@ -216,7 +216,7 @@ def payload(prompt, seed, tokens, *, temperature=0.7):
     return {"model": "deepseek_v41", "messages": [{"role": "user", "content": prompt}],
             "stream": True, "n": 1, "seed": seed, "max_tokens": tokens,
             "temperature": temperature, "thinking": {"type": "disabled"}, "aux_info": True,
-            "extra_configs": {"min_new_tokens": tokens, "ignore_eos": True}}
+            "extra_configs": {"min_new_tokens": tokens, "ignore_eos": True, "reuse_cache": False}}
 
 
 def measure(endpoint, body, *, expected_prompt_tokens, timeout=600, opener=None, clock=time.perf_counter):
