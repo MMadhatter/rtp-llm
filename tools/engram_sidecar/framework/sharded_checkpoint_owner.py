@@ -109,19 +109,19 @@ def tensor_shard_layout(tensor, weight_shape, shard, shards, granularity):
     return start, end, allocation_bytes
 
 
-def layer_numa_placement(raw, layers, default):
+def layer_numa_placement(raw, layers, default, label="NUMA"):
     """Complete explicit local placement; no automatic fallback after allocation failure."""
     if raw is None:
         return {layer: default for layer in layers}
     def unique(pairs):
         if len(pairs) != len({key for key, _ in pairs}):
-            raise ValueError("duplicate layer NUMA key")
+            raise ValueError(f"duplicate layer {label} key")
         return dict(pairs)
     values = json.loads(raw, object_pairs_hook=unique)
     if not isinstance(values, dict) or set(values) != {str(layer) for layer in layers}:
-        raise ValueError("layer NUMA map must cover exactly the model's Engram layers")
+        raise ValueError(f"layer {label} map must cover exactly the model's Engram layers")
     if any(type(node) is not int or node < 0 for node in values.values()):
-        raise ValueError("layer NUMA IDs must be nonnegative local integers")
+        raise ValueError(f"layer {label} IDs must be nonnegative local integers")
     return {layer: values[str(layer)] for layer in layers}
 
 
@@ -138,6 +138,9 @@ def main(argv=None):
     parser.add_argument("--layer-numa-map",
                         help='Explicit local placement for every Engram layer, e.g. {"1":0,"14":1}; '
                              'weight and scale stay together. Default uses --numa for all layers.')
+    parser.add_argument("--layer-device-map",
+                        help='Explicit CUDA-visible device ordinal for every layer; '
+                             'pair each selected HOST_NUMA with its local GPU. Default uses --device.')
     parser.add_argument("--max-allocation-bytes", type=int, default=128 << 30)
     parser.add_argument("--budget-bytes", type=int, default=256 << 30)
     parser.add_argument("--report-timeout", type=float, default=3600)
@@ -164,6 +167,7 @@ def main(argv=None):
     config = {**config, **config.get("text_config", {})}
     layout = EngramLayout(config)
     numa_by_layer = layer_numa_placement(args.layer_numa_map, layout.layer_ids, args.numa)
+    device_by_layer = layer_numa_placement(args.layer_device_map, layout.layer_ids, args.device, "device")
     actual_hash_abi = hash_state_digest(NgramHashState(layout, str(checkpoint)))
     expected = ExpectedLayout(
         layers=tuple(zip(layout.layer_ids, layout.num_embeddings)),
@@ -172,8 +176,8 @@ def main(argv=None):
 
     torch.cuda.set_device(args.device)
     native = _load_native()
-    granularities = {native.host_numa_granularity(node, args.device)
-                     for node in set(numa_by_layer.values())}
+    granularities = {native.host_numa_granularity(numa_by_layer[layer], device_by_layer[layer])
+                     for layer in layout.layer_ids}
     if len(granularities) != 1:
         raise ValueError("selected NUMA nodes must share the same allocation granularity")
     granularity = granularities.pop()
@@ -192,14 +196,15 @@ def main(argv=None):
     try:
         for layer_plan in plan.layers:
             numa = numa_by_layer[layer_plan.layer_id]
+            device = device_by_layer[layer_plan.layer_id]
             weight_shape = next(t.shape for t in layer_plan.tensors if t.name.endswith(".weight"))
             for tensor in layer_plan.tensors:
                 rows, columns = tensor.shape
                 start, end, local_bytes = tensor_shard_layout(
                     tensor, weight_shape, args.shard, args.shards, granularity)
                 emit("ALLOCATING", tensor=tensor.name, shard=args.shard,
-                     allocation_bytes=local_bytes, device=args.device, numa=numa)
-                owner = native.Owner(local_bytes, numa, args.device)
+                     allocation_bytes=local_bytes, device=device, numa=numa)
+                owner = native.Owner(local_bytes, numa, device)
                 owners.append(owner)
                 digest = load_rows(owner, checkpoint, tensor, snapshots[tensor.relative_path],
                                    start, end, columns,
@@ -224,7 +229,7 @@ def main(argv=None):
         private_write(args.publication / "shard.json",
                       json.dumps(document, sort_keys=True).encode("utf-8"))
         emit("READY", shard=args.shard, shards=args.shards, generation=args.generation,
-             tensors=len(tensors), device=args.device, numa_by_layer=numa_by_layer,
+             tensors=len(tensors), device_by_layer=device_by_layer, numa_by_layer=numa_by_layer,
              counters=native.resource_counters())
         deadline = time.monotonic() + args.report_timeout
         while not (args.publication / "STOP").is_file():

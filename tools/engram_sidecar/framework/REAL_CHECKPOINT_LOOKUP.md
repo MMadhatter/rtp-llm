@@ -205,7 +205,13 @@ quality claim follows from a successful lookup probe.
 
 ## Explicit per-layer Owner placement
 
-The sharded development Owner accepts `--layer-numa-map '{"1":0,"14":1}'`.
+The sharded development Owner accepts `--layer-numa-map '{"1":0,"14":1}'`
+and `--layer-device-map '{"1":0,"14":1}'`. Device IDs are ordinals within
+`CUDA_VISIBLE_DEVICES`; choose each NUMA node's local GPU, not a host-global
+index copied into a filtered device list. Omitting the device map uses
+`--device` for every layer. On the tested platform, pairing a remote local-host
+NUMA node with the same GPU context returned CUDA_ERROR_INVALID_VALUE, so the
+NUMA map alone is insufficient for that placement.
 Without it, `--numa` still places all layers on one local NUMA node. An explicit
 map must cover exactly the checkpoint's Engram layers, with nonnegative integer
 node IDs; duplicate, missing and extra keys are rejected. A layer's weight and
