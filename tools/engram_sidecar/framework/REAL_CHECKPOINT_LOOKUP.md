@@ -201,3 +201,20 @@ Do not print their contents into logs.
 The probe reports PyTorch allocation changes, but those do not measure all
 driver resources. No latency acceptance, CUDA Graph support or full-model
 quality claim follows from a successful lookup probe.
+
+
+## Explicit per-layer Owner placement
+
+The sharded development Owner accepts `--layer-numa-map '{"1":0,"14":1}'`.
+Without it, `--numa` still places all layers on one local NUMA node. An explicit
+map must cover exactly the checkpoint's Engram layers, with nonnegative integer
+node IDs; duplicate, missing and extra keys are rejected. A layer's weight and
+scale share the selected node. All selected nodes must report the same CUDA
+allocation granularity before any table allocation begins.
+
+This is an operator-selected placement, not an automatic allocation retry or
+failover mechanism. It preserves shard row ranges and weight bytes, while
+changing physical access locality. Record the allocation logs' `numa` and the
+READY record's `numa_by_layer`; validate all consumer GPUs again. A small probe
+or total free memory does not prove that all large allocations will succeed.
+Do not combine measurements from different placements as one A/B experiment.
