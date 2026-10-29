@@ -144,10 +144,14 @@ def main(argv=None):
                 rows, columns = tensor.shape
                 start, end, local_bytes = tensor_shard_layout(
                     tensor, weight_shape, args.shard, args.shards, granularity)
+                emit("ALLOCATING", tensor=tensor.name, shard=args.shard,
+                     allocation_bytes=local_bytes, device=args.device, numa=args.numa)
                 owner = native.Owner(local_bytes, args.numa, args.device)
                 owners.append(owner)
                 with safe_open(checkpoint / tensor.relative_path, framework="pt", device="cpu") as reader:
                     digest = load_rows(owner, reader, tensor.name, start, end, columns)
+                emit("LOADED", tensor=tensor.name, shard=args.shard,
+                     logical_bytes=(end - start) * columns)
                 tensors[tensor.name] = dict(
                     allocation_id=str(uuid4()),
                     handle=base64.b64encode(owner.export_handle()).decode("ascii"),
