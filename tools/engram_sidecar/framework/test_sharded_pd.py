@@ -41,6 +41,7 @@ class ShardedPDTest(unittest.TestCase):
             self.assertEqual(e["WORLD_SIZE"], "8")
             self.assertEqual(e["LOCAL_WORLD_SIZE"], "4")
             self.assertEqual(e["DSV4_MOE_STRATEGY"], "mega")
+            self.assertEqual(e["MOE_STRATEGY"], "mega_moe")
             self.assertEqual(e["PREFILL_CP_SIZE"], "4")
             self.assertEqual(e["PREFILL_CP_KV_CACHE_SHARDED"], "1")
             self.assertEqual(e["LD_LIBRARY_PATH"], "/native")
@@ -52,6 +53,7 @@ class ShardedPDTest(unittest.TestCase):
         for name in ("d0", "d1"):
             env = self.env(name, decode_moe="deepep")
             self.assertEqual(env["DSV4_MOE_STRATEGY"], "deepep")
+            self.assertEqual(env["MOE_STRATEGY"], "auto")
             self.assertEqual([env[k] for k in ("TP_SIZE", "DP_SIZE", "EP_SIZE")], ["1", "8", "8"])
         self.assertEqual(self.env("p0", decode_moe="deepep")["DSV4_MOE_STRATEGY"], "mega")
 

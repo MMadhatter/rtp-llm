@@ -61,6 +61,7 @@ def launch_environment(config, node_name, args, inherited=None):
     # previous experiment's rank or CP layout from the shell.
     env.pop("GANG_CONFIG_STRING", None)
     env.pop("GANG_CONFIG_PATH", None)
+    strategy = "mega" if is_prefill else getattr(args, "decode_moe_strategy", "mega")
     env.update({
         "ROLE_TYPE": "PREFILL" if is_prefill else "DECODE",
         "CUDA_VISIBLE_DEVICES": ",".join(node["gpu_uuids"]),
@@ -77,7 +78,10 @@ def launch_environment(config, node_name, args, inherited=None):
         "KERNEL_SEQ_SIZE_PER_BLOCK": "128",
         "CP_ROTATE_METHOD": "ALL_GATHER" if is_prefill else "PREFILL_CP",
         # Parallel topology does not choose the MoE kernel implementation.
-        "DSV4_MOE_STRATEGY": "mega" if is_prefill else getattr(args, "decode_moe_strategy", "mega"),
+        "DSV4_MOE_STRATEGY": strategy,
+        # The engine initializes communication before Python model selection.
+        # Keep both layers aligned so Mega does not initialize unused DeepEP.
+        "MOE_STRATEGY": "mega_moe" if strategy == "mega" else "auto",
         "DSV41_CED": "1",
         "DSV41_SWA_BOUNDED_REPLAY": "1",
         "CACHE_STORE_RDMA_MODE": "1",
