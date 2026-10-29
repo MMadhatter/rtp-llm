@@ -172,6 +172,7 @@ class LatencyContractTest(unittest.TestCase):
         snapshot["cgroups"][0]["current_bytes"] = 188 * gib
         with self.assertRaisesRegex(RuntimeError, "cgroup"):
             h.check_memory_budget(snapshot, **args)
+
         snapshot = self.memory()
         snapshot["cgroups"].append(dict(path="ancestor", current_bytes=350 * gib, max_bytes=384 * gib))
         with self.assertRaisesRegex(RuntimeError, "cgroup"):
@@ -180,6 +181,25 @@ class LatencyContractTest(unittest.TestCase):
             snapshot = self.memory(); snapshot[key] = 0
             with self.assertRaises(RuntimeError):
                 h.check_memory_budget(snapshot, **args)
+
+    def test_numa_cache_estimate_requires_opt_in_and_never_weakens_post_load_checks(self):
+        gib = 1 << 30
+        snapshot = self.memory()
+        snapshot.update(numa_free_bytes=80*gib, numa_cache_reclaim_estimate_bytes=140*gib)
+        args = dict(table_bytes=95*gib, source_bytes=95*gib, headroom_bytes=16*gib, before=True)
+        with self.assertRaisesRegex(RuntimeError, "NUMA"):
+            h.check_memory_budget(snapshot, **args)
+        result = h.check_memory_budget(snapshot, **args, allow_numa_cache_reclaim=True)
+        self.assertEqual(result['numa_cache_reclaim_estimate_used_bytes'], 140*gib)
+        self.assertFalse(result['memory_reservation_guaranteed'])
+        snapshot['host_available_bytes'] = 100*gib
+        with self.assertRaisesRegex(RuntimeError, "host"):
+            h.check_memory_budget(snapshot, **args, allow_numa_cache_reclaim=True)
+        snapshot['host_available_bytes'] = 400*gib
+        snapshot['numa_free_bytes'] = 0
+        args['before'] = False
+        with self.assertRaisesRegex(RuntimeError, "NUMA"):
+            h.check_memory_budget(snapshot, **args, allow_numa_cache_reclaim=True)
 
     def test_postload_budget_checks_actual_headroom_without_readding_loaded_table(self):
         gib = 1 << 30

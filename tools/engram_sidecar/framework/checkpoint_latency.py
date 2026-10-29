@@ -67,6 +67,9 @@ def diagnostic_declaration(args):
 
 
 def check_options(args):
+    args.allow_numa_cache_reclaim = getattr(args, "allow_numa_cache_reclaim", False)
+    if args.allow_numa_cache_reclaim and args.source_cache_numa is not None:
+        raise ValueError("cache-reclaim admission is only supported without source NUMA staging")
     args.batches = integer_list(args.batches, allowed=(1, 2, 4, 8, 16, 32, 64))
     args.layers = None if args.layers == "first" else integer_list(args.layers)
     args.modes = choice_list(args.modes, ("eager", "graph"))
@@ -180,9 +183,16 @@ def memory_snapshot(node, source_node=None):
     current, mount, hierarchy_root = resolve_cgroup_directory(Path("/proc/self/cgroup").read_text(),
                                                              Path("/proc/self/mountinfo").read_text())
     groups = read_cgroup_memory(current, mount, hierarchy_root)
+    numa_text = Path(f"/sys/devices/system/node/node{node}/meminfo").read_text()
+    # An estimate, never a reservation: exclude dirty/writeback pages and leave
+    # 20% of inactive file cache uncounted. Shmem is not Inactive(file).
+    clean_inactive = max(0, parse_kib_field(numa_text, "Inactive(file)")
+                        - parse_kib_field(numa_text, "Dirty")
+                        - parse_kib_field(numa_text, "Writeback"))
     result = dict(cgroups=groups, shm_free_bytes=shutil.disk_usage("/dev/shm").free,
                 host_available_bytes=parse_kib_field(Path("/proc/meminfo").read_text(), "MemAvailable"),
-                numa_free_bytes=parse_kib_field(Path(f"/sys/devices/system/node/node{node}/meminfo").read_text(), "MemFree"))
+                numa_free_bytes=parse_kib_field(numa_text, "MemFree"),
+                numa_cache_reclaim_estimate_bytes=clean_inactive * 4 // 5)
     if source_node is not None:
         result["source_numa_free_bytes"] = parse_kib_field(
             Path(f"/sys/devices/system/node/node{source_node}/meminfo").read_text(), "MemFree")
@@ -215,7 +225,8 @@ def check_source_cache_budget(snapshot, *, table_bytes, source_bytes, headroom_b
                 snapshot=snapshot)
 
 
-def check_memory_budget(snapshot, *, table_bytes, source_bytes, headroom_bytes, before):
+def check_memory_budget(snapshot, *, table_bytes, source_bytes, headroom_bytes, before,
+                        allow_numa_cache_reclaim=False):
     """Conservative marginal budget; fadvise does not count as guaranteed reclaim."""
     if min(table_bytes, source_bytes, headroom_bytes) < 0 or headroom_bytes == 0:
         raise ValueError("nonnegative sizes and positive headroom required")
@@ -224,12 +235,16 @@ def check_memory_budget(snapshot, *, table_bytes, source_bytes, headroom_bytes, 
     for group in snapshot["cgroups"]:
         if group["max_bytes"] is not None and group["max_bytes"] - group["current_bytes"] < required:
             raise RuntimeError("insufficient measured cgroup memory headroom for complete-table baseline")
-    if snapshot["host_available_bytes"] < required or snapshot["numa_free_bytes"] < required:
+    reclaim = (snapshot.get("numa_cache_reclaim_estimate_bytes", 0)
+               if before and allow_numa_cache_reclaim else 0)
+    if snapshot["host_available_bytes"] < required or snapshot["numa_free_bytes"] + reclaim < required:
         raise RuntimeError("insufficient host or GPU-local NUMA headroom")
     if snapshot["shm_free_bytes"] < (table_bytes if before else 0):
         raise RuntimeError("insufficient /dev/shm for complete pinned table")
     return dict(required_marginal_bytes=additional, reserved_headroom_bytes=headroom_bytes,
-                phase="before_load" if before else "after_load", snapshot=snapshot)
+                phase="before_load" if before else "after_load", snapshot=snapshot,
+                numa_cache_reclaim_estimate_used_bytes=reclaim,
+                memory_reservation_guaranteed=False)
 
 
 def source_paths(source, index, layer):
@@ -937,6 +952,7 @@ def run(args):
                    batches=args.batches, modes=args.modes, samples=args.samples, seed=args.seed,
                    memory_headroom_bytes=args.memory_headroom_gib << 30,
                    discard_private_source_cache=args.discard_private_source_cache,
+                   allow_numa_cache_reclaim=args.allow_numa_cache_reclaim,
                    source_cache_numa=args.source_cache_numa,
                    source_sha256={str(path.relative_to(REPO)): hashlib.sha256(path.read_bytes()).hexdigest()
                                   for path in source_files},
@@ -967,7 +983,8 @@ def run(args):
                 write_new_json(args.output / f"memory-layer{layer}-before.json", snapshot)
                 if args.source_cache_numa is None:
                     check_memory_budget(snapshot, table_bytes=table_bytes, source_bytes=source_bytes,
-                                        headroom_bytes=args.memory_headroom_gib << 30, before=True)
+                                        headroom_bytes=args.memory_headroom_gib << 30, before=True,
+                                        allow_numa_cache_reclaim=args.allow_numa_cache_reclaim)
                 emit("BASELINE_LOADING", layer=layer, logical_bytes=table_bytes, source_file_bytes=source_bytes)
                 if args.source_cache_numa is None:
                     control = make_local_table(args.source_checkpoint, index, layout, layer, device)
@@ -1090,6 +1107,9 @@ def main(argv=None):
     parser.add_argument("--layers", default="first")
     parser.add_argument("--layer-mode", choices=("single", "together"), default="single")
     parser.add_argument("--memory-headroom-gib", type=int, default=16)
+    parser.add_argument("--allow-numa-cache-reclaim", action="store_true",
+                        help="Admission may count 80%% of clean inactive NUMA file cache; "
+                             "not a reservation. Post-load free-memory and NUMA checks remain strict.")
     parser.add_argument("--discard-private-source-cache", action="store_true")
     parser.add_argument("--source-cache-numa", type=int, default=None)
     parser.add_argument("--modes", default="eager,graph")
