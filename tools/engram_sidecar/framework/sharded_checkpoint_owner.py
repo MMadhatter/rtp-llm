@@ -30,7 +30,6 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
 LOAD_CHUNK = 64 << 20
-READ_ROWS = 1 << 20
 
 
 def emit(status, **fields):
@@ -53,21 +52,40 @@ def private_write(path, payload):
         temporary.unlink(missing_ok=True)
 
 
-def load_rows(owner, reader, name, start, end, columns):
-    """Stream a row range into the owner; padding stays zero."""
-    import torch
+def load_rows(owner, root, tensor, snapshot, start, end, columns,
+              *, discard_file_cache=False, chunk_bytes=8 << 20):
+    """Read exact FP8/scale bytes without creating full-file tensor mappings."""
+    from rtp_llm.models_py.modules.dsv41.engram_checkpoint import (
+        _cache_page_size, _discard_consumed_pages, _open_tensor_source, _read_exact,
+    )
 
-    view = reader.get_slice(name)
+    if not 0 <= start < end <= tensor.shape[0] or columns != tensor.shape[1]:
+        raise ValueError("invalid shard row range")
+    if not columns <= chunk_bytes <= LOAD_CHUNK:
+        raise ValueError("chunk must hold a row and fit the native load ceiling")
+    page_size = _cache_page_size(discard_file_cache)
+    rows_per_chunk = chunk_bytes // columns
     digest = hashlib.sha256()
     offset = 0
-    for row in range(start, end, READ_ROWS):
-        stop = min(row + READ_ROWS, end)
-        block = view[row:stop].contiguous().view(torch.uint8).numpy().tobytes()
-        digest.update(block)
-        for index in range(0, len(block), LOAD_CHUNK):
-            piece = block[index:index + LOAD_CHUNK]
-            owner.load(piece, offset)
-            offset += len(piece)
+    with _open_tensor_source(root, snapshot) as (source, data_start):
+        consumed = data_start + tensor.data_range[0] + start * columns
+        expected_end = data_start + tensor.data_range[0] + end * columns
+        if expected_end > data_start + tensor.data_range[1]:
+            raise ValueError("shard exceeds source tensor extent")
+        source.seek(consumed)
+        discarded = consumed
+        for row in range(start, end, rows_per_chunk):
+            length = min(rows_per_chunk, end - row) * columns
+            payload = _read_exact(source, length)
+            digest.update(payload)
+            owner.load(payload, offset)
+            offset += length
+            consumed += length
+            del payload
+            if page_size is not None and consumed - discarded >= LOAD_CHUNK:
+                discarded = _discard_consumed_pages(source, discarded, consumed, page_size)
+        if page_size is not None:
+            _discard_consumed_pages(source, discarded, consumed, page_size)
     expected = (end - start) * columns
     if offset != expected:
         raise RuntimeError("shard row range has an unexpected byte count")
@@ -115,10 +133,12 @@ def main(argv=None):
     args.publication.mkdir(mode=0o700, parents=True, exist_ok=False)
 
     import torch
-    from safetensors import safe_open
     from rtp_llm.models_py.modules.dsv41.engram import EngramLayout, NgramHashState
     from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _load_native, hash_state_digest
-    from rtp_llm.models_py.modules.dsv41.engram_checkpoint import inspect_checkpoint
+    from rtp_llm.models_py.modules.dsv41.engram_checkpoint import (
+        _cache_page_size, _discard_consumed_pages, _open_tensor_source,
+        _same_snapshot, inspect_checkpoint,
+    )
     from rtp_llm.models_py.modules.dsv41.engram_manifest import ExpectedLayout
     checkpoint = args.checkpoint
     config = json.loads((checkpoint / "config.json").read_text())
@@ -136,6 +156,12 @@ def main(argv=None):
     plan = inspect_checkpoint(
         checkpoint, expected, allocation_granularity=granularity,
         budget_bytes=args.budget_bytes, max_allocation_bytes=args.max_allocation_bytes)
+    snapshots = {snapshot.relative_path: snapshot for snapshot in plan.files}
+    page_size = _cache_page_size(args.release_input_page_cache)
+    if page_size is not None:
+        for snapshot in plan.files:
+            with _open_tensor_source(checkpoint, snapshot) as (source, _):
+                _discard_consumed_pages(source, 0, snapshot.stat_token[2], page_size)
 
     owners = []
     tensors = {}
@@ -150,18 +176,9 @@ def main(argv=None):
                      allocation_bytes=local_bytes, device=args.device, numa=args.numa)
                 owner = native.Owner(local_bytes, args.numa, args.device)
                 owners.append(owner)
-                with safe_open(checkpoint / tensor.relative_path, framework="pt", device="cpu") as reader:
-                    digest = load_rows(owner, reader, tensor.name, start, end, columns)
-                if args.release_input_page_cache:
-                    # A large staging copy plus mmap reads can compete with EGM
-                    # backing for host RAM. Only advise the selected input file;
-                    # never drop machine-wide caches or change checkpoint bytes.
-                    fd = os.open(checkpoint / tensor.relative_path, os.O_RDONLY)
-                    try:
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    finally:
-                        os.close(fd)
-                    emit("INPUT_CACHE_RELEASE_ADVISED", tensor=tensor.name, shard=args.shard)
+                digest = load_rows(owner, checkpoint, tensor, snapshots[tensor.relative_path],
+                                   start, end, columns,
+                                   discard_file_cache=args.release_input_page_cache)
                 emit("LOADED", tensor=tensor.name, shard=args.shard,
                      logical_bytes=(end - start) * columns)
                 tensors[tensor.name] = dict(
@@ -172,6 +189,9 @@ def main(argv=None):
                     allocation_bytes=local_bytes,
                     allocation_granularity=granularity,
                     sha256=digest)
+        _same_snapshot(checkpoint, plan.index, index=True)
+        for snapshot in plan.files:
+            _same_snapshot(checkpoint, snapshot)
         document = dict(schema_version=1, shard=args.shard, shards=args.shards,
                         generation=args.generation, model_revision=args.model_revision,
                         hash_abi=actual_hash_abi, owner_id=f"shard-owner-{args.shard}",
