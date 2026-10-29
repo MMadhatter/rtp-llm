@@ -76,6 +76,7 @@ def launch_environment(config, node_name, args, inherited=None):
         "SEQ_SIZE_PER_BLOCK": "256",
         "KERNEL_SEQ_SIZE_PER_BLOCK": "128",
         "CP_ROTATE_METHOD": "ALL_GATHER" if is_prefill else "PREFILL_CP",
+        "DSV4_MOE_STRATEGY": "mega" if is_prefill else "deepep",
         "DSV41_CED": "1",
         "DSV41_SWA_BOUNDED_REPLAY": "1",
         "CACHE_STORE_RDMA_MODE": "1",
@@ -131,7 +132,7 @@ def main(argv=None):
     env = launch_environment(topology, args.node, args)
     keys = ("ROLE_TYPE", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "WORLD_RANK", "TP_SIZE",
             "DP_SIZE", "EP_SIZE", "PREFILL_CP_SIZE", "PREFILL_CP_KV_CACHE_SHARDED",
-            "SEQ_SIZE_PER_BLOCK", "CACHE_STORE_RDMA_MODE", "ENABLE_CUDA_GRAPH",
+            "SEQ_SIZE_PER_BLOCK", "CACHE_STORE_RDMA_MODE", "ENABLE_CUDA_GRAPH", "DSV4_MOE_STRATEGY",
             "RTP_ENGRAM_TOPOLOGY_SHA256")
     print(json.dumps({k: env[k] for k in keys}, sort_keys=True), flush=True)
     if args.dry_run:
