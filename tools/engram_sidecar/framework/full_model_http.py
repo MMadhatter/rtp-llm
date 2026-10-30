@@ -261,7 +261,7 @@ def bundle_limits(args):
 def verify_bundle(args):
     from rtp_llm.models_py.modules.dsv41.engram import EngramLayout, NgramHashState
     from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _read_bundle, hash_state_digest
-    from tools.engram_sidecar.framework.checkpoint_owner import read_source
+    from tools.engram_sidecar.framework.checkpoint_support import read_source
 
     source = read_source(checkpoint=args.checkpoint, model_revision=args.model_revision)
     layout = EngramLayout(source.config)

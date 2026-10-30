@@ -9,7 +9,7 @@ coordinator creates ``STOP``. The coordinator merges the descriptors from all
 owners into one manifest/capability bundle.
 
     python3 sharded_checkpoint_owner.py --checkpoint /path/ckpt \
-        --model-revision rev --shard 0 --shards 2 \
+        --model-revision rev --host-id <physical-SN> --generation <uuid> --shard 0 --shards 2 \
         --publication /run/shard0 --device 0 --numa 0
 
 Never log or copy the private descriptor outside the authenticated transfer.
@@ -21,6 +21,7 @@ import base64
 import hashlib
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -125,10 +126,27 @@ def layer_numa_placement(raw, layers, default, label="NUMA"):
     return {layer: values[str(layer)] for layer in layers}
 
 
+def validate_local_budget(plan, shard, shards, granularity, max_allocation, budget):
+    from rtp_llm.models_py.modules.dsv41.engram_capacity import validate_capacity
+    validate_capacity(max_allocation, budget)
+    total = 0
+    for layer in plan.layers:
+        shape = next(t.shape for t in layer.tensors if t.name.endswith(".weight"))
+        for tensor in layer.tensors:
+            _, _, size = tensor_shard_layout(tensor, shape, shard, shards, granularity)
+            if size > max_allocation:
+                raise ValueError("local shard exceeds allocation limit")
+            total += size
+    if total > budget:
+        raise ValueError("local shards exceed host budget")
+    return total
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--host-id", required=True, help="Trusted physical host identity (SN), shared with topology")
     parser.add_argument("--shard", type=int, required=True)
     parser.add_argument("--shards", type=int, required=True)
     parser.add_argument("--publication", type=Path, required=True)
@@ -149,7 +167,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if (not args.checkpoint.is_absolute() or not args.publication.is_absolute()
-            or args.device < 0 or args.numa < 0 or args.shards < 1
+            or args.device < 0 or args.numa < 0 or not 2 <= args.shards <= 64
+            or not args.host_id.strip() or len(args.host_id) > 256
+            or not 0 < args.report_timeout < float("inf")
             or not 0 <= args.shard < args.shards):
         parser.error("absolute paths, valid shard index and nonnegative ordinals required")
     args.publication.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -181,9 +201,16 @@ def main(argv=None):
     if len(granularities) != 1:
         raise ValueError("selected NUMA nodes must share the same allocation granularity")
     granularity = granularities.pop()
+    from rtp_llm.models_py.modules.dsv41.engram_capacity import (
+        validate_capacity, HARD_MAX_ALLOCATION_BYTES, HARD_MAX_TOTAL_ALLOCATION_BYTES)
+    validate_capacity(args.max_allocation_bytes, args.budget_bytes)
+    # Inspect the complete checkpoint metadata, but enforce the caller's memory
+    # budget against only this host's padded weight/scale allocations.
     plan = inspect_checkpoint(
         checkpoint, expected, allocation_granularity=granularity,
-        budget_bytes=args.budget_bytes, max_allocation_bytes=args.max_allocation_bytes)
+        budget_bytes=HARD_MAX_TOTAL_ALLOCATION_BYTES, max_allocation_bytes=HARD_MAX_ALLOCATION_BYTES)
+    validate_local_budget(plan, args.shard, args.shards, granularity,
+                          args.max_allocation_bytes, args.budget_bytes)
     snapshots = {snapshot.relative_path: snapshot for snapshot in plan.files}
     page_size = _cache_page_size(args.release_input_page_cache)
     if page_size is not None:
@@ -193,6 +220,15 @@ def main(argv=None):
 
     owners = []
     tensors = {}
+    published = False
+
+    def interrupt(signum, frame):
+        if published:
+            emit("SIGNAL_WHILE_PUBLISHED", signal=signum, action="retained_until_STOP")
+        else:
+            raise SystemExit(128 + signum)
+
+    previous = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
         for layer_plan in plan.layers:
             numa = numa_by_layer[layer_plan.layer_id]
@@ -212,7 +248,7 @@ def main(argv=None):
                 emit("LOADED", tensor=tensor.name, shard=args.shard,
                      logical_bytes=(end - start) * columns)
                 tensors[tensor.name] = dict(
-                    allocation_id=str(uuid4()),
+                    shape=list(tensor.shape), allocation_id=str(uuid4()),
                     handle=base64.b64encode(owner.export_handle()).decode("ascii"),
                     row_begin=start, row_end=end,
                     logical_bytes=(end - start) * columns,
@@ -222,10 +258,13 @@ def main(argv=None):
         _same_snapshot(checkpoint, plan.index, index=True)
         for snapshot in plan.files:
             _same_snapshot(checkpoint, snapshot)
-        document = dict(schema_version=1, shard=args.shard, shards=args.shards,
+        document = dict(schema_version=2, shard=args.shard, shards=args.shards,
                         generation=args.generation, model_revision=args.model_revision,
-                        hash_abi=actual_hash_abi, owner_id=f"shard-owner-{args.shard}",
+                        hash_abi=actual_hash_abi, host_id=args.host_id, owner_id=args.host_id,
                         owner_incarnation=str(uuid4()), tensors=tensors)
+        # Protect backing before the first externally visible capability. Once
+        # published, only the coordinator's all-consumers-exited STOP may retire.
+        published = True
         private_write(args.publication / "shard.json",
                       json.dumps(document, sort_keys=True).encode("utf-8"))
         emit("READY", shard=args.shard, shards=args.shards, generation=args.generation,
@@ -238,6 +277,11 @@ def main(argv=None):
                 deadline = float("inf")
             time.sleep(1)
     finally:
+        if published:
+            while not (args.publication / "STOP").is_file():
+                time.sleep(1)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
         for owner in reversed(owners):
             try:
                 owner.close()

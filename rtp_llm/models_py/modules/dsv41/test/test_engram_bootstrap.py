@@ -54,7 +54,7 @@ def real_hash_state():
 
 
 class BundleFiles:
-    def prepare_bundle(self, layout=None, hash_abi=None):
+    def prepare_bundle(self, layout=None, hash_abi=None, shards=1):
         self.temporary = tempfile.TemporaryDirectory(prefix="engram-bootstrap-ut-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
@@ -75,12 +75,22 @@ class BundleFiles:
                         byte_offset=0 if tensor["name"].endswith(".weight") else rows * self.layout.head_dim,
                         allocation_bytes=((rows * (self.layout.head_dim + self.layout.head_dim // 32) + 4095) // 4096) * 4096)
             tensor["row_bytes"] = columns
+            if shards > 1:
+                from uuid import uuid4, UUID
+                step = (rows + shards - 1) // shards
+                tensor["shards"] = [dict(part, shard_id=str(uuid4()), allocation_id=str(uuid4()),
+                    owner_id=f"host-{i}", owner_incarnation=str(UUID(int=10 + i)),
+                    row_begin=i * step, row_end=min((i + 1) * step, rows),
+                    byte_offset=0, allocation_granularity=1, allocation_bytes=step * columns,
+                    logical_bytes=(min((i + 1) * step, rows) - i * step) * columns)
+                    for i in range(shards)]
         self.document["hash_abi"] = self.abi
         self.document["dataset_id"] = m.compute_dataset_id(self.document)
         self.manifest_raw = json.dumps(self.document).encode()
         self.samples = {
             tensor["name"]: {
-                "row_ids": sorted({0, tensor["shape"][0] // 2, tensor["shape"][0] - 1}),
+                "row_ids": sorted({0, tensor["shape"][0] // 2, tensor["shape"][0] - 1} |
+                                  {row for part in tensor["shards"] for row in (part["row_begin"], part["row_end"] - 1)}),
                 "sha256": "sha256:" + "c" * 64,
             }
             for tensor in self.document["tensors"]
@@ -93,8 +103,8 @@ class BundleFiles:
             samples=self.samples,
         )
         self.capabilities = {
-            tensor["shards"][0]["allocation_id"]: base64.b64encode(b"private-handle-bytes").decode()
-            for tensor in self.document["tensors"]
+            part["allocation_id"]: base64.b64encode(b"private-handle-bytes").decode()
+            for tensor in self.document["tensors"] for part in tensor["shards"]
         }
         self.write("manifest.json", self.manifest_raw)
         self.write("handles.json", self.capabilities)
@@ -308,7 +318,7 @@ class HashSemanticTest(unittest.TestCase):
 class AttachFailureTest(BundleFiles, unittest.TestCase):
     def setUp(self):
         self.hash_state = real_hash_state()
-        self.prepare_bundle(self.hash_state.layout, b.hash_state_digest(self.hash_state))
+        self.prepare_bundle(self.hash_state.layout, b.hash_state_digest(self.hash_state), shards=2)
         self.storage = mock.Mock()
         self.storage.verify.return_value = None
         self.storage.close.return_value = None
@@ -329,8 +339,21 @@ class AttachFailureTest(BundleFiles, unittest.TestCase):
                                     hash_state=self.hash_state, device=device,
                                     environ={} if environ is None else environ)
 
+    def test_explicit_p_mismatch_rejected_before_native_load(self):
+        with self.assertRaisesRegex(ValueError, "COUNT_MISMATCH"):
+            self.do_attach(environ={"ENGRAM_SHARD_COUNT": "3"})
+        self.native_mock.assert_not_called()
+        self.attach_mock.assert_not_called()
+
+    def test_single_owner_deployment_is_removed(self):
+        self.prepare_bundle(self.hash_state.layout, b.hash_state_digest(self.hash_state))
+        with self.assertRaisesRegex(ValueError, "2_TO_64"):
+            self.do_attach()
+        self.native_mock.assert_not_called()
+        self.attach_mock.assert_not_called()
+
     def test_native_capacity_mismatch_rejects_before_first_import(self):
-        for maximum in (None, True, 0, 4095):
+        for maximum in (None, True, 0, 1):
             self.native.max_allocation_bytes = maximum
             with self.assertRaisesRegex(b.BootstrapError, "NATIVE_ALLOCATION_LIMIT"):
                 self.do_attach()

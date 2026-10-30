@@ -257,16 +257,12 @@ py_library(
 py_library(
     name = "engram_storage_cpu",
     testonly = True,
-    srcs = ["modules/dsv41/engram_storage.py"],
-    deps = [":engram_manifest"],
-    visibility = ["//visibility:public"],
-)
-
-# The in-process session registry uses only stdlib. Keep the manifest type
-# contract in the closure without pulling in model, torch or CUDA libraries.
-py_library(
-    name = "engram_sessions",
-    srcs = ["modules/dsv41/engram_sessions.py"],
+    srcs = [
+        "modules/dsv41/engram_storage.py",
+        "modules/dsv41/engram_shard.py",
+        "modules/dsv41/engram_shard_config.py",
+        "modules/dsv41/engram_shard_storage.py",
+    ],
     deps = [":engram_manifest"],
     visibility = ["//visibility:public"],
 )

@@ -44,34 +44,89 @@ def private_write(path, payload):
         temporary.unlink(missing_ok=True)
 
 
-def read_shards(paths, shards, generation):
-    documents = [json.loads(Path(path).read_text()) for path in paths]
+def validate_documents(documents, shards, generation, model_revision=None, hash_abi=None):
+    from rtp_llm.models_py.modules.dsv41.engram_shard_config import validate_count
+    from rtp_llm.models_py.modules.dsv41.engram_shard import plan_shards
+    validate_count(shards)
     if len(documents) != shards:
-        raise ValueError("one descriptor per shard required")
-    if {int(d["shard"]) for d in documents} != set(range(shards)):
+        raise ValueError("one descriptor per storage host required")
+    if any(type(d.get("shard")) is not int or type(d.get("shards")) is not int
+           or type(d.get("schema_version")) is not int or d.get("schema_version") != 2 for d in documents):
+        raise ValueError("version 2 descriptors with integer shard indices required")
+    if {d["shard"] for d in documents} != set(range(shards)):
         raise ValueError("descriptor shard indices are incomplete or duplicated")
-    if any(int(d["shards"]) != shards or d["generation"] != generation for d in documents):
-        raise ValueError("descriptor generation/shard count mismatch")
-    names = {name for d in documents for name in d["tensors"]}
-    if any(set(d["tensors"]) != names for d in documents):
+    documents = sorted(documents, key=lambda d: d["shard"])
+    model_revision = documents[0]["model_revision"] if model_revision is None else model_revision
+    hash_abi = documents[0]["hash_abi"] if hash_abi is None else hash_abi
+    if any(d["shards"] != shards or d["generation"] != generation
+           or d["model_revision"] != model_revision or d["hash_abi"] != hash_abi for d in documents):
+        raise ValueError("descriptor generation/count/revision/hash mismatch")
+    hosts = [d.get("host_id") for d in documents]
+    if any(type(host) is not str or not host.strip() for host in hosts) or len(set(hosts)) != shards:
+        raise ValueError("storage host IDs must be nonempty and distinct")
+    if any(d["owner_id"] != d["host_id"] for d in documents):
+        raise ValueError("owner identity must be the storage host ID")
+    names = set(documents[0]["tensors"])
+    if not names or any(set(d["tensors"]) != names for d in documents):
         raise ValueError("descriptor tensor sets differ")
+    allocations, handles = set(), set()
     for name in names:
-        spans = sorted((int(d["tensors"][name]["row_begin"]),
-                        int(d["tensors"][name]["row_end"])) for d in documents)
-        cursor = 0
-        for begin, end in spans:
-            if begin != cursor or end <= begin:
-                raise ValueError("shard row ranges do not cover the tensor")
-            cursor = end
+        role = name.rsplit(".", 1)[-1]
+        if role not in ("weight", "scale"):
+            raise ValueError("unsupported tensor role")
+        weight_name = name.rsplit(".", 1)[0] + ".weight"
+        scale_name = name.rsplit(".", 1)[0] + ".scale"
+        if not {weight_name, scale_name} <= names:
+            raise ValueError("missing weight/scale pair")
+        first = documents[0]["tensors"][weight_name]
+        shape = first["shape"]
+        if type(shape) is not list or len(shape) != 2:
+            raise ValueError("invalid weight shape")
+        plan = plan_shards(*shape, shards, granularity=first["allocation_granularity"])
+        columns = plan.dim if role == "weight" else plan.dim // plan.block
+        size = plan.weight_bytes if role == "weight" else plan.scale_bytes
+        for index, document in enumerate(documents):
+            entry = document["tensors"][name]
+            for key in ("row_begin", "row_end", "logical_bytes", "allocation_bytes", "allocation_granularity"):
+                if type(entry[key]) is not int:
+                    raise ValueError("descriptor geometry must use integers")
+            if (type(entry["shape"]) is not list or len(entry["shape"]) != 2
+                    or any(type(n) is not int for n in entry["shape"])):
+                raise ValueError("descriptor shape must use integers")
+            start, end = plan.row_range(index)
+            if (entry["shape"] != [plan.total_rows, columns]
+                    or (entry["row_begin"], entry["row_end"]) != (start, end)
+                    or entry["allocation_bytes"] != size
+                    or entry["allocation_granularity"] != plan.granularity
+                    or entry["logical_bytes"] != (end - start) * columns):
+                raise ValueError("descriptor geometry does not match storage host index")
+            aid = entry["allocation_id"]
+            if aid in allocations:
+                raise ValueError("duplicate allocation ID")
+            allocations.add(aid)
+            try:
+                raw = base64.b64decode(entry["handle"], validate=True)
+            except (ValueError, TypeError):
+                raise ValueError("invalid capability encoding") from None
+            if not 0 < len(raw) <= 768 or raw in handles:
+                raise ValueError("empty, oversized or duplicate capability")
+            handles.add(raw)
     return documents
 
 
+def read_shards(paths, shards, generation):
+    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _private_read, _json
+    documents = [_json(_private_read(Path(path), 1 << 20)) for path in paths]
+    return validate_documents(documents, shards, generation)
+
+
 def build_manifest(documents, shards, generation, model_revision, hash_abi):
+    documents = validate_documents(documents, shards, generation, model_revision, hash_abi)
     names = sorted(documents[0]["tensors"])
     tensors = []
     for name in names:
         role = name.rsplit(".", 1)[1]
-        columns = 256 if role == "weight" else 8
+        columns = documents[0]["tensors"][name]["shape"][1]
         entries = []
         for document in documents:
             entry = document["tensors"][name]
@@ -99,6 +154,8 @@ def build_manifest(documents, shards, generation, model_revision, hash_abi):
                     tensors=tensors)
     from rtp_llm.models_py.modules.dsv41.engram_manifest import compute_dataset_id
     document["dataset_id"] = compute_dataset_id(document)
+    from rtp_llm.models_py.modules.dsv41.engram_manifest import parse_manifest
+    parse_manifest(json.dumps(document).encode())
     return document
 
 
@@ -113,7 +170,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if (not args.checkpoint.is_absolute() or not args.publication.is_absolute()
-            or args.shards < 1):
+            or not 2 <= args.shards <= 64):
         parser.error("absolute paths and a positive shard count required")
     documents = read_shards(args.shard_json, args.shards, args.generation)
     hash_abi = documents[0]["hash_abi"]
@@ -124,7 +181,7 @@ def main(argv=None):
     manifest_bytes = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
     from rtp_llm.models_py.modules.dsv41.engram_manifest import parse_manifest
-    from tools.engram_sidecar.framework.checkpoint_owner import selected_samples
+    from tools.engram_sidecar.framework.checkpoint_support import selected_samples
     manifest = parse_manifest(manifest_bytes)
     samples = selected_samples(args.checkpoint, manifest)
     bundle = dict(schema_version=1, manifest="manifest.json",

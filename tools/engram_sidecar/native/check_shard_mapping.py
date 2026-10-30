@@ -139,6 +139,7 @@ def main() -> int:
             break
     print(f"padding rows: {plan.padded_rows - total_rows}")
 
+    del weight_view, scale_view
     mapping.close()
     for owner in owners:
         owner.close()

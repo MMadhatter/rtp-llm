@@ -86,8 +86,9 @@ class ModelAttachTest(unittest.TestCase):
         self.assertEqual((path, device), ("/small/checkpoint", "cuda:1"))
         return self.hash_state
 
-    def attach_storage(self, path, *, layout, hash_state, device):
+    def attach_storage(self, path, *, layout, hash_state, device, environ):
         self.trace.append("attach")
+        self.attached_environ = environ
         self.assertEqual((path, device), ("/private/bundle.json", "cuda:1"))
         self.assertIs(layout, self.layout)
         self.assertIs(hash_state, self.hash_state)
@@ -102,6 +103,16 @@ class ModelAttachTest(unittest.TestCase):
 
     def run_init(self, **overrides):
         return attach.initialize_model_engram(self.model, **{**self.kwargs, **overrides})
+
+    def test_explicit_storage_p_environment_reaches_bootstrap(self):
+        environment = {**self.env, "ENGRAM_SHARD_COUNT": "3"}
+        self.run_init(environ=environment)
+        self.assertIs(self.attached_environ, environment)
+
+    def test_p_without_bundle_cannot_silently_load_local_tables(self):
+        with self.assertRaisesRegex(attach.EngramModelInitializationError, "REQUIRES_BUNDLE"):
+            self.run_init(environ={"ENGRAM_SHARD_COUNT": "3"})
+        self.assertEqual(self.trace, ["layout"])
 
     def test_all_layers_bind_one_storage_after_hash_and_attach(self):
         state = self.run_init()

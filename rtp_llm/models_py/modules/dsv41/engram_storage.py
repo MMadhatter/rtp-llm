@@ -93,7 +93,10 @@ class FabricEngramStorage:
 
     def _attach_sharded(self, manifest, handles, device, shard_ops=None):
         """Stitch every tensor's shards into two contiguous VA spans."""
-        from .engram_shard import ShardPlan
+        from .engram_shard import plan_shards
+        from .engram_shard_config import ShardConfig
+
+        ShardConfig(len(manifest.tensors[0].shards)).validate_manifest(manifest)
         from .engram_shard_storage import ShardedLayerMapping
 
         by_name = {t.name: t for t in manifest.tensors}
@@ -110,10 +113,9 @@ class FabricEngramStorage:
             scale = by_name.get(prefix + ".scale")
             if scale is None:
                 raise ValueError("sharded manifest is missing a scale tensor")
-            shard_rows = weight.shards[0].allocation_bytes // weight.shape[1]
-            plan = ShardPlan(
+            plan = plan_shards(
                 total_rows=weight.shape[0], shard_count=len(weight.shards),
-                shard_rows=shard_rows, dim=weight.shape[1],
+                dim=weight.shape[1],
                 block=weight.quant_block,
                 granularity=weight.shards[0].allocation_granularity)
             if plan.weight_bytes != weight.shards[0].allocation_bytes:
@@ -124,6 +126,10 @@ class FabricEngramStorage:
                 raise ValueError("scale shard count mismatch")
             for index, (weight_shard, scale_shard) in enumerate(
                     zip(weight.shards, scale.shards)):
+                if any(part.allocation_granularity != plan.granularity for part in (weight_shard, scale_shard)):
+                    raise ValueError("shard allocation granularity mismatch")
+                if weight_shard.allocation_bytes != plan.weight_bytes or scale_shard.allocation_bytes != plan.scale_bytes:
+                    raise ValueError("nonuniform shard allocations")
                 expected = plan.row_range(index)
                 if (weight_shard.row_begin, weight_shard.row_end) != expected:
                     raise ValueError("weight shard row range mismatch")
@@ -133,8 +139,9 @@ class FabricEngramStorage:
                 plan,
                 [handles[s.allocation_id] for s in weight.shards],
                 [handles[s.allocation_id] for s in scale.shards],
-                device, ops=shard_ops).attach()
+                device, ops=shard_ops)
             self._shard_mappings.append(mapping)
+            mapping.attach()
             self._views[weight.name] = mapping.weight_view()
             self._views[scale.name] = mapping.scale_view()
             paired.update((weight.name, scale.name))
@@ -216,7 +223,7 @@ class FabricEngramStorage:
                 raise StorageBusyError("captured graphs still hold this storage")
             self._state = "CLOSING"
             self._views.clear()
-            if any(m.info()["active_views"] for m in self._mappings.values()):
+            if any(m.info()["active_views"] for m in [*self._mappings.values(), *self._shard_mappings]):
                 raise StorageBusyError("external tensor views must be released before close")
             try:
                 for mapping in reversed(self._shard_mappings):

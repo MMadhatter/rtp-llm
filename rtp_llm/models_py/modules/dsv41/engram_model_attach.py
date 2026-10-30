@@ -130,6 +130,8 @@ def initialize_model_engram(
 
         env = os.environ if environ is None else environ
         bundle_path = env.get(EXTERNAL_BUNDLE_ENV)
+        if bundle_path is None and "ENGRAM_SHARD_COUNT" in env:
+            raise EngramModelInitializationError("DISTRIBUTED_ENGRAM_REQUIRES_BUNDLE")
         attachment.external = bundle_path is not None
         if attachment.external:
             if not isinstance(bundle_path, str) or not bundle_path or not Path(bundle_path).is_absolute():
@@ -159,7 +161,7 @@ def initialize_model_engram(
 
                 attach_factory = attach_from_bundle
             storage = attach_factory(
-                bundle_path, layout=layout, hash_state=hash_state, device=device
+                bundle_path, layout=layout, hash_state=hash_state, device=device, environ=env
             )
             attachment.storage = storage
 

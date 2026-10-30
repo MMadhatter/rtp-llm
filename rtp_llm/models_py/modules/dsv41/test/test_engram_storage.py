@@ -82,7 +82,7 @@ class FakeShardOps:
         self.calls = []
         self._next = 0x1000_0000_0000
 
-    def reserve(self, size):
+    def reserve(self, size, alignment):
         self.calls.append(("reserve", size))
         pointer = self._next
         self._next += 1 << 34
@@ -95,13 +95,24 @@ class FakeShardOps:
     def map(self, va, size, offset, handle):
         self.calls.append(("map", va, size, offset, handle))
 
+    def set_access(self, va, size):
+        self.calls.append(("set_access", va, size))
+        if getattr(self, "fail_on", "") == "set_access":
+            raise RuntimeError("set_access failed")
+
+    def release(self, handle):
+        self.calls.append(("release", handle))
+
+    def synchronize(self):
+        self.calls.append(("synchronize",))
+
     def unmap(self, va, size):
         self.calls.append(("unmap", va, size))
 
     def free(self, va, size):
         self.calls.append(("free", va, size))
 
-    def view(self, va, shape):
+    def view(self, va, shape, owner):
         self.calls.append(("view", va, shape))
         return (va, shape)
 

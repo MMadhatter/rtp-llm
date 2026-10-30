@@ -388,6 +388,12 @@ class ReadOnlySourceMapping:
     def verify(self, text, node):
         from tools.engram_sidecar.framework.stage_checkpoint import _unchanged
         _unchanged(self.path, self.expected)
+        # Permission changes can share the same coarse filesystem timestamp.
+        # Recheck the admitted immutable-file contract, not just stat identity.
+        info = os.fstat(self.fd)
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o400
+                or info.st_uid != os.getuid() or info.st_nlink != 1):
+            raise RuntimeError("source mapping no longer has immutable private-file permissions")
         evidence = parse_complete_numa_pages(text, self.address, node, self.size, self.page_size)
         return dict(file=self.path.name, file_bytes=self.size, **evidence)
 

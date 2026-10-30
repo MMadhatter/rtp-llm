@@ -26,7 +26,7 @@ from uuid import UUID, uuid4
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
-from tools.engram_sidecar.framework.checkpoint_owner import emit, private_write
+from tools.engram_sidecar.framework.checkpoint_support import emit, private_write
 from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _json, _private_read
 
 ROWS = (1 << 24) + 257

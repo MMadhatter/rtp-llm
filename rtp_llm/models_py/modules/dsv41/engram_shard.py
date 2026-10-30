@@ -75,13 +75,13 @@ class ShardPlan:
         return self.scale_bytes * self.shard_count
 
     def shard_of_row(self, row: int) -> int:
-        if not 0 <= row < self.padded_rows:
-            raise IndexError(f"row {row} outside padded table of {self.padded_rows}")
+        if type(row) is not int or not 0 <= row < self.total_rows:
+            raise IndexError(f"row {row} outside logical table of {self.total_rows}")
         return row // self.shard_rows
 
     def row_range(self, shard: int) -> tuple[int, int]:
         """Half-open *real* row range owned by ``shard`` (padding excluded)."""
-        if not 0 <= shard < self.shard_count:
+        if type(shard) is not int or not 0 <= shard < self.shard_count:
             raise IndexError(f"shard {shard} outside 0..{self.shard_count - 1}")
         start = shard * self.shard_rows
         end = min(start + self.shard_rows, self.total_rows)
@@ -89,13 +89,13 @@ class ShardPlan:
 
     def weight_offset(self, shard: int) -> int:
         """Byte offset of ``shard`` inside the concatenated weight VA."""
-        if not 0 <= shard < self.shard_count:
+        if type(shard) is not int or not 0 <= shard < self.shard_count:
             raise IndexError(f"shard {shard} outside 0..{self.shard_count - 1}")
         return shard * self.weight_bytes
 
     def scale_offset(self, shard: int) -> int:
         """Byte offset of ``shard`` inside the concatenated scale VA."""
-        if not 0 <= shard < self.shard_count:
+        if type(shard) is not int or not 0 <= shard < self.shard_count:
             raise IndexError(f"shard {shard} outside 0..{self.shard_count - 1}")
         return shard * self.scale_bytes
 
@@ -128,6 +128,11 @@ def plan_shards(
     Raises ``ValueError`` for geometries that cannot be mapped at a granularity
     boundary (for example a ``dim`` that is not a multiple of ``block``).
     """
+    for name, value in (("total_rows", total_rows), ("dim", dim),
+                        ("shard_count", shard_count), ("block", block),
+                        ("granularity", granularity)):
+        if type(value) is not int or not 0 < value < (1 << 63):
+            raise ValueError(f"{name} must be a positive integer below 2**63")
     if total_rows <= 0:
         raise ValueError("total_rows must be positive")
     if dim <= 0 or dim % block:
@@ -143,6 +148,10 @@ def plan_shards(
 
     rows_per_shard = -(-total_rows // shard_count)
     shard_rows = _round_up(rows_per_shard, align_rows)
+    if (shard_count - 1) * shard_rows >= total_rows:
+        raise ValueError("shard_count too large: alignment would produce empty shards")
+    if shard_rows * shard_count * dim >= (1 << 63):
+        raise ValueError("shard address span exceeds 63-bit limit")
     plan = ShardPlan(
         total_rows=total_rows,
         shard_count=shard_count,
@@ -161,12 +170,16 @@ def plan_shards(
 
 def split_rows(total_rows: int, plan: ShardPlan) -> list[tuple[int, int]]:
     """Real row ranges for every shard, in shard order."""
+    if type(total_rows) is not int or total_rows != plan.total_rows:
+        raise ValueError("total_rows does not match plan")
     return [plan.row_range(shard) for shard in range(plan.shard_count)]
 
 
 def local_rows(plan: ShardPlan, shard_index: int) -> tuple[int, int]:
     """Rows the process at ``shard_index`` must load (``-1`` means none)."""
-    if shard_index < 0:
+    if type(shard_index) is not int:
+        raise ValueError("shard_index must be an integer")
+    if shard_index == -1:
         return (0, 0)
     return plan.row_range(shard_index)
 

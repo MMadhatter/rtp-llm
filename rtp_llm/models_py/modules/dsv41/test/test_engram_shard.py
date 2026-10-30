@@ -43,7 +43,7 @@ class PlanShardsTest(unittest.TestCase):
 
     def test_rows_cover_table_exactly_once(self):
         total = 1000
-        plan = plan_shards(total, DIM, 4)
+        plan = plan_shards(total, DIM, 4, granularity=8)
         ranges = split_rows(total, plan)
         covered = []
         for start, end in ranges:
@@ -78,8 +78,8 @@ class PlanShardsTest(unittest.TestCase):
         self.assertEqual(end, REAL_ROWS[0])
 
     def test_last_shard_holds_padding(self):
-        total = 1000
-        plan = plan_shards(total, DIM, 4)
+        total = 1001
+        plan = plan_shards(total, DIM, 4, granularity=8)
         start, end = plan.row_range(3)
         self.assertLessEqual(end, total)
         self.assertLess(end - start, plan.shard_rows)
@@ -95,11 +95,44 @@ class PlanShardsTest(unittest.TestCase):
             plan_shards(100, DIM, 4, granularity=3)
 
     def test_plan_is_hashable_and_immutable(self):
-        plan = plan_shards(1000, DIM, 4)
+        plan = plan_shards(1000, DIM, 4, granularity=8)
         self.assertIsInstance(plan, ShardPlan)
-        self.assertEqual(hash(plan), hash(plan_shards(1000, DIM, 4)))
+        self.assertEqual(hash(plan), hash(plan_shards(1000, DIM, 4, granularity=8)))
         with self.assertRaises(Exception):
             plan.shard_rows = 1
+
+    def test_non_power_of_two_host_counts_cover_exactly(self):
+        for count in (2, 3, 5, 7, 18, 36, 64):
+            for total in REAL_ROWS:
+                plan = plan_shards(total, DIM, count)
+                cursor = 0
+                for shard in range(count):
+                    begin, end = plan.row_range(shard)
+                    self.assertEqual(begin, cursor)
+                    self.assertLess(begin, end)
+                    self.assertEqual(plan.shard_of_row(begin), shard)
+                    self.assertEqual(plan.shard_of_row(end - 1), shard)
+                    cursor = end
+                self.assertEqual(cursor, total)
+                with self.assertRaises(IndexError):
+                    plan.shard_of_row(total)
+
+    def test_empty_shards_rejected_before_allocating(self):
+        with self.assertRaisesRegex(ValueError, "empty shards"):
+            plan_shards(1000, DIM, 4)
+
+    def test_invalid_integer_geometry(self):
+        for key in ("total_rows", "dim", "shard_count", "block", "granularity"):
+            for bad in (0, -1, True, 1.5, "2"):
+                args = dict(total_rows=1048576, dim=256, shard_count=2, block=32, granularity=4096)
+                args[key] = bad
+                with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                    plan_shards(**args)
+        plan = plan_shards(1048576, 256, 2)
+        with self.assertRaises(ValueError):
+            split_rows(10, plan)
+        with self.assertRaises(IndexError):
+            local_rows(plan, -2)
 
 
 class MappingRequestsTest(unittest.TestCase):
@@ -133,7 +166,7 @@ class MappingRequestsTest(unittest.TestCase):
             self.assertEqual(request.handle_offset, 0)
 
     def test_rejects_misaligned_bases(self):
-        plan = plan_shards(1000, DIM, 4)
+        plan = plan_shards(1000, DIM, 4, granularity=8)
         with self.assertRaises(ValueError):
             mapping_requests(plan, 1, plan.weight_span)
         with self.assertRaises(ValueError):

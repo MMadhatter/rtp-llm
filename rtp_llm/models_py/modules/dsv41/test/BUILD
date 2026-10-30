@@ -126,15 +126,6 @@ py_test(
     legacy_create_init = 0,
 )
 
-py_test(
-    name = "test_engram_sessions",
-    size = "small",
-    srcs = ["test_engram_sessions.py"],
-    main = "test_engram_sessions.py",
-    deps = ["//rtp_llm/models_py:engram_sessions"],
-    legacy_create_init = 0,
-)
-
 # Capacity policy and arithmetic must run without torch or CUDA.
 py_test(
     name = "test_engram_capacity",
@@ -196,4 +187,17 @@ py_test(
         ("test_engram_external_checkpoint", "engram_model_cpu"),
         ("test_engram_external_warmup", "engram_warmup_cpu"),
     ]
+]
+
+# Distributed layout and rollback tests do not import Torch or CUDA.
+[
+    py_test(
+        name = name,
+        size = "small",
+        srcs = [name + ".py"],
+        main = name + ".py",
+        deps = ["//rtp_llm/models_py:engram_storage_cpu"],
+        legacy_create_init = 0,
+    )
+    for name in ["test_engram_shard", "test_engram_shard_config", "test_engram_shard_storage"]
 ]

@@ -1,77 +1,49 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
-
-from rtp_llm.models_py.modules.dsv41.engram_shard_config import (
-    ShardConfig,
-    ShardConfigError,
-)
+from types import SimpleNamespace as NS
+from rtp_llm.models_py.modules.dsv41.engram_shard_config import ShardConfig, ShardConfigError
 
 
-class ShardConfigTest(unittest.TestCase):
-    def test_defaults_disable_sharing(self):
-        config = ShardConfig.from_environ({})
-        self.assertEqual(config.shard_count, 1)
-        self.assertEqual(config.shard_index, 0)
-        self.assertTrue(config.holds_shard)
-        self.assertFalse(config.sharded)
-        self.assertEqual(config.mode, "prefill")
-        self.assertEqual(config.endpoints, ())
+def manifest(count):
+    return NS(tensors=[NS(shards=[NS(owner_id=f"host-{i}", owner_incarnation=f"boot-{i}")
+                                 for i in range(count)]) for _ in range(4)])
 
-    def test_sharded_without_endpoints_is_rejected(self):
-        with self.assertRaises(ShardConfigError):
-            ShardConfig.from_environ({"ENGRAM_SHARD_COUNT": "4"})
 
-    def test_full_config(self):
-        env = {
-            "ENGRAM_SHARD_COUNT": "4",
-            "ENGRAM_SHARD_INDEX": "2",
-            "ENGRAM_SHARD_ENDPOINTS": "10.0.0.1:19780, 10.0.0.2:19780,10.0.0.3:19780,10.0.0.4:19780",
-            "ENGRAM_SHARD_MODE": "decode",
-        }
-        config = ShardConfig.from_environ(env)
-        self.assertEqual(config.shard_index, 2)
-        self.assertEqual(config.endpoint(0), "10.0.0.1:19780")
-        self.assertEqual(config.endpoint(3), "10.0.0.4:19780")
-        self.assertEqual(config.mode, "decode")
+class ConfigTest(unittest.TestCase):
+    def test_p_is_independent_of_model_parallelism_and_instance_count(self):
+        for count in (2, 3, 5, 18, 36, 64):
+            for instances in (1, 2, 10):
+                config = ShardConfig.from_environ({"ENGRAM_SHARD_COUNT": str(count),
+                    "TP_SIZE": "1", "DP_SIZE": "8", "EP_SIZE": "8", "INSTANCES": str(instances)})
+                self.assertEqual(config.shard_count, count)
+                config.validate_manifest(manifest(count))
 
-    def test_pure_consumer(self):
-        env = {
-            "ENGRAM_SHARD_COUNT": "4",
-            "ENGRAM_SHARD_INDEX": "-1",
-            "ENGRAM_SHARD_ENDPOINTS": "a:1,b:2,c:3,d:4",
-        }
-        config = ShardConfig.from_environ(env)
-        self.assertFalse(config.holds_shard)
-        self.assertEqual(config.endpoint(2), "c:3")
+    def test_inference_from_manifest_and_explicit_mismatch(self):
+        self.assertEqual(ShardConfig.from_environ({}, inferred_count=3).shard_count, 3)
+        with self.assertRaisesRegex(ShardConfigError, "COUNT_MISMATCH"):
+            ShardConfig(3).validate_manifest(manifest(2))
 
-    def test_single_shard_needs_no_endpoints(self):
-        config = ShardConfig.from_environ({"ENGRAM_SHARD_COUNT": "1", "ENGRAM_SHARD_INDEX": "0"})
-        self.assertFalse(config.sharded)
-        self.assertTrue(config.holds_shard)
+    def test_single_host_and_invalid_p_are_rejected(self):
+        for value in (None, True, 1, 0, -1, 65, 2.0, "2"):
+            with self.subTest(value=value), self.assertRaises(ShardConfigError):
+                ShardConfig(value)
+        for value in ("", "-1", "2.0", "２", " 2", 2):
+            with self.subTest(value=value), self.assertRaises(ShardConfigError):
+                ShardConfig.from_environ({"ENGRAM_SHARD_COUNT": value})
 
-    def test_rejects_bad_values(self):
-        bad = [
-            {"ENGRAM_SHARD_COUNT": "0"},
-            {"ENGRAM_SHARD_COUNT": "x"},
-            {"ENGRAM_SHARD_INDEX": "4"},
-            {"ENGRAM_SHARD_INDEX": "-2"},
-            {"ENGRAM_SHARD_COUNT": "4", "ENGRAM_SHARD_INDEX": "0", "ENGRAM_SHARD_ENDPOINTS": "a:1"},
-            {"ENGRAM_SHARD_COUNT": "2", "ENGRAM_SHARD_ENDPOINTS": "a:1,a:1"},
-            {"ENGRAM_SHARD_COUNT": "2", "ENGRAM_SHARD_ENDPOINTS": "a:1,b:99999"},
-            {"ENGRAM_SHARD_COUNT": "2", "ENGRAM_SHARD_ENDPOINTS": "a,b:1"},
-            {"ENGRAM_SHARD_MODE": "training"},
-        ]
-        for env in bad:
-            with self.assertRaises(ShardConfigError, msg=str(env)):
-                ShardConfig.from_environ(env)
+    def test_cancelled_mode_and_rpc_options_fail_explicitly(self):
+        for key in ("ENGRAM_SHARD_MODE", "ENGRAM_SHARD_INDEX", "ENGRAM_SHARD_ENDPOINTS"):
+            with self.assertRaisesRegex(ShardConfigError, "REMOVED"):
+                ShardConfig.from_environ({key: "x"}, inferred_count=2)
 
-    def test_describe_has_no_handle_material(self):
-        config = ShardConfig.from_environ(
-            {"ENGRAM_SHARD_COUNT": "2", "ENGRAM_SHARD_INDEX": "1", "ENGRAM_SHARD_ENDPOINTS": "a:1,b:2"}
-        )
-        described = config.describe()
-        self.assertEqual(described["shard_count"], 2)
-        self.assertNotIn("handle", str(described).lower())
+    def test_missing_duplicate_or_replaced_host_is_rejected(self):
+        for case in ("missing", "duplicate", "restart"):
+            doc = manifest(3)
+            if case == "missing": doc.tensors[1].shards.pop()
+            if case == "duplicate": doc.tensors[1].shards[1].owner_id = "host-0"
+            if case == "restart": doc.tensors[1].shards[1].owner_incarnation = "new-boot"
+            with self.subTest(case=case), self.assertRaises(ShardConfigError):
+                ShardConfig(3).validate_manifest(doc)
 
 
 if __name__ == "__main__":

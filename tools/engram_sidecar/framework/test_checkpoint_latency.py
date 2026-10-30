@@ -724,7 +724,8 @@ class SourceCacheContractTest(unittest.TestCase):
                         f"kernelpagesize_kB={page_kib}\n")
                 self.assertEqual(mapping.verify(text, 1)["file_bytes"], 8193)
                 path.chmod(0o600)  # Even unchanged bytes are no longer the admitted immutable source.
-                with self.assertRaises(RuntimeError):
+                # Model filesystems whose ctime resolution misses the chmod.
+                with patch("tools.engram_sidecar.framework.stage_checkpoint._unchanged"), self.assertRaises(RuntimeError):
                     mapping.verify(text, 1)
             finally:
                 mapping.close()

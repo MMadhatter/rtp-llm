@@ -174,7 +174,8 @@ def _read_bundle(path, layout, actual_hash_abi, *, limits=None):
         raise BootstrapError("INCOMPLETE_READ_SAMPLES")
     for tensor in validated.manifest.tensors:
         sample = samples[tensor.name]
-        required_rows = sorted({0, tensor.shape[0] // 2, tensor.shape[0] - 1})
+        required_rows = sorted({0, tensor.shape[0] // 2, tensor.shape[0] - 1} |
+                      {row for part in tensor.shards for row in (part.row_begin, part.row_end - 1)})
         if (type(sample) is not dict or sample.keys() != {"row_ids", "sha256"}
                 or type(sample["row_ids"]) is not list
                 or any(type(row) is not int for row in sample["row_ids"])
@@ -230,9 +231,11 @@ def attach_from_bundle(bundle_path, *, layout, hash_state, device, environ=None)
     bundle, raw, expected, handles = _read_bundle(
         bundle_path, layout, hash_state_digest(hash_state), limits=limits)
     ordinal = target.index if target.index is not None else torch.cuda.current_device()
-    native = _load_native()
     # Reject an older/smaller bridge before importing even the first allocation.
     manifest = parse_manifest(raw, limits)
+    from .engram_shard_config import ShardConfig
+    ShardConfig.from_environ(environ, inferred_count=len(manifest.tensors[0].shards)).validate_manifest(manifest)
+    native = _load_native()
     native_limit = getattr(native, "max_allocation_bytes", None)
     if (type(native_limit) is not int or native_limit <= 0
             or any(shard.allocation_bytes > native_limit
