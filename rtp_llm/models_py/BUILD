@@ -340,3 +340,22 @@ py_library(
     ],
     visibility = ["//visibility:public"],
 )
+
+# Static-cohort startup contracts use stdlib only; Torch is imported lazily for
+# the real Store/checkpoint adapter and covered separately on CUDA13 hosts.
+py_library(
+    name = "engram_exchange_cpu",
+    testonly = True,
+    srcs = [
+        "modules/dsv41/engram_bootstrap.py",
+        "modules/dsv41/engram_descriptors.py",
+        "modules/dsv41/engram_exchange.py",
+        "modules/dsv41/engram_startup.py",
+    ],
+    deps = [
+        ":engram_capacity",
+        ":engram_manifest",
+        ":engram_storage_cpu",
+    ],
+    visibility = ["//visibility:public"],
+)

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Render a distributed storage launch plan, without creating containers or RPC.
+"""Render a static distributed Engram launch plan without remote deployment.
 
-Run each holder command on its declared host. After all descriptors are READY,
-transfer them privately to the coordinator and run the bundle command. Transfer
-that SAME bundle to every consumer host, then start their existing RTP commands
-with the emitted env. Holders must outlive all consumers; STOP is manual only
-once every consumer and CUDA graph has exited. This tool does not perform remote
-execution, service discovery, topology attestation or live resharding.
+With exchange configuration, existing per-instance Store and temporary mTLS RPC
+collect handles automatically during BackendManager startup. Without exchange,
+the explicit offline bundle workflow remains available for diagnostics.
+Start each holder on its declared host; retain all holders until every model
+worker and CUDA graph in the fixed cohort has exited. No live reshard/election.
 """
 from __future__ import annotations
 import argparse
@@ -99,16 +98,66 @@ def render_plan(config):
               '--publication', f'{root}/bundle']
     for index in range(p):
         bundle += ['--shard-json', f'{root}/shard-{index}/shard.json']
-    return dict(instance_count=n, membership='static', storage_host_count=p, generation=generation, holders=holders,
+    result = dict(instance_count=n, membership='static', storage_host_count=p, generation=generation, holders=holders,
                 coordinator_argv=bundle, consumers=consumers,
                 lifecycle='all N instances start their assigned P holders -> complete bundle -> all N instances attach; stop all N before retiring any holder')
+    if config.get('exchange') is not None:
+        from rtp_llm.models_py.modules.dsv41.engram_exchange import validate_group
+        exchange = config['exchange']
+        members = []
+        for instance in instances:
+            local_size = instance.get('local_world_size')
+            if type(local_size) is not int or local_size < 1:
+                raise ValueError('RPC mode requires each instance local_world_size')
+            member = dict(instance_id=instance['instance_id'],
+                          world_size=local_size * len(instance['hosts']), shards=[])
+            for holder in holders:
+                if holder['instance_id'] == instance['instance_id']:
+                    member['shards'].append(dict(index=holder['shard_index'], host_id=holder['host_id'],
+                        publisher_rank=local_size * instance['hosts'].index(holder['host_id'])))
+            members.append(member)
+        group = dict(generation=generation, model_revision=revision, members=members)
+        validate_group(group)
+        result['startup_configs'] = {}
+        result['coordinator_argv'] = None  # No manual bundle merge/copy in RPC mode.
+        for member_index, consumer in enumerate(consumers):
+            ident = consumer['instance_id']
+            startup = dict(group=group, instance_id=ident, checkpoint=config['checkpoint'],
+                coordinator=exchange.get('coordinator'),
+                tls=exchange.get('tls', {}).get(ident),
+                timeout_seconds=exchange.get('timeout_seconds', 1800),
+                local_descriptors={str(index): f'{root}/shard-{index}/shard.json' for index in consumer['held_shards']})
+            if n > 1 and (startup['coordinator'] is None or startup['tls'] is None):
+                raise ValueError('multi-instance RPC requires coordinator address and per-instance TLS configuration')
+            result['startup_configs'][ident] = startup
+            consumer['env'].pop('RTP_ENGRAM_EXTERNAL_BUNDLE')
+            consumer['env']['RTP_ENGRAM_STATIC_GROUP_CONFIG'] = f'{root}/startup-{member_index}.json'
+        result['lifecycle'] = 'P holders READY -> existing instance Store -> one RPC connection per remote representative -> all-member ACK -> model attach'
+    return result
+
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--output-directory', type=Path, help='Write private plan/startup configs for launcher distribution')
     args = parser.parse_args()
-    print(json.dumps(render_plan(json.loads(args.config.read_text())), indent=2))
+    plan = render_plan(json.loads(args.config.read_text()))
+    if args.output_directory:
+        import os
+        destination = args.output_directory.resolve()
+        destination.mkdir(mode=0o700, parents=True, exist_ok=False)
+        documents = {'launch-plan.json': plan}
+        for index, consumer in enumerate(plan['consumers']):
+            if 'startup_configs' in plan:
+                documents[f'startup-{index}.json'] = plan['startup_configs'][consumer['instance_id']]
+        for name, document in documents.items():
+            fd = os.open(destination / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(document, stream, indent=2)
+        print(destination / 'launch-plan.json')
+    else:
+        print(json.dumps(plan, indent=2))
 
 
 if __name__ == '__main__':

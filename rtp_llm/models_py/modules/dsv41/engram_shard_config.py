@@ -2,7 +2,7 @@
 """Distributed storage P is independent of model instances and TP/DP/EP.
 
 No role election, endpoints, sidecar or implicit single-owner deployment.
-The trusted launcher distributes one immutable bundle to all consumers.
+Startup exchange (or an explicit offline launcher) delivers one immutable bundle.
 """
 from __future__ import annotations
 

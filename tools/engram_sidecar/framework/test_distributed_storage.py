@@ -206,3 +206,25 @@ class LaunchPlanTest(unittest.TestCase):
         config['storage_hosts'][0]['instance_id'] = 'unknown'
         with self.assertRaisesRegex(ValueError, 'must contain'):
             render_plan(config)
+
+    def test_rpc_plan_uses_only_leaders_and_no_offline_bundle(self):
+        config = self.config(4, 2)
+        for instance in config['instances']: instance['local_world_size'] = 4
+        config['exchange'] = dict(coordinator=dict(host='127.0.0.1', port=19780),
+                                 tls={f'i{i}': {'certificate_fixture': True} for i in range(2)})
+        plan = render_plan(config)
+        self.assertIsNone(plan['coordinator_argv'])
+        self.assertEqual(len(plan['startup_configs']), 2)
+        for consumer in plan['consumers']:
+            self.assertNotIn('RTP_ENGRAM_EXTERNAL_BUNDLE', consumer['env'])
+            self.assertIn('RTP_ENGRAM_STATIC_GROUP_CONFIG', consumer['env'])
+            member = next(m for m in plan['startup_configs'][consumer['instance_id']]['group']['members']
+                          if m['instance_id'] == consumer['instance_id'])
+            self.assertEqual(member['world_size'], 8)
+            self.assertEqual([s['publisher_rank'] for s in member['shards']], [0, 4])
+
+    def test_rpc_plan_requires_complete_topology_and_tls(self):
+        config = self.config(); config['exchange'] = {}
+        with self.assertRaisesRegex(ValueError, 'local_world_size'): render_plan(config)
+        for member in config['instances']: member['local_world_size'] = 1
+        with self.assertRaisesRegex(ValueError, 'TLS'): render_plan(config)

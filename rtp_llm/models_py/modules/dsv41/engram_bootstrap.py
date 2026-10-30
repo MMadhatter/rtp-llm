@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental file bootstrap for process-lifetime external Engram.
+"""Private local-cache bootstrap for process-lifetime external Engram.
 
-The trusted launcher transfers small private files over an authenticated channel.
+Startup RPC materializes this cache automatically; the explicit offline launcher
+can also transfer the small private files over an authenticated channel.
 This module does not discover an Owner, load a checkpoint table, run RPC, compile
 native code, or permit live generation replacement. The Owner must outlive all
 consumer processes. Experimental decode Graph requires the model attachment's
