@@ -57,6 +57,9 @@ def render_plan(config):
     instances = config['instances']
     if type(instances) is not list or not instances:
         raise ValueError('at least one instance required')
+    n = config.get('instance_count', len(instances))
+    if type(n) is not int or n < 1 or n != len(instances):
+        raise ValueError('instance_count N must equal the complete static instance list')
     seen, consumers = set(), []
     for instance in instances:
         identifier = instance['instance_id']
@@ -72,13 +75,33 @@ def render_plan(config):
             env={'RTP_ENGRAM_MAX_ALLOCATION_BYTES': str(allocation),
                  'RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES': str(total),
                  'ENGRAM_SHARD_COUNT': str(p), 'RTP_ENGRAM_EXTERNAL_BUNDLE': f'{root}/bundle/bundle.json'}))
+    # Every declared instance participates in holding backing. This is a fixed
+    # cohort, not an expandable consumer list; joining/removing requires a new
+    # generation. One holder per physical storage host is the current contract.
+    assignments = {identifier: [] for identifier in seen}
+    for host, holder in zip(hosts, holders):
+        candidates = [instance['instance_id'] for instance in instances
+                      if host['host_id'] in instance['hosts']]
+        owner = host.get('instance_id')
+        if owner is None:
+            if len(candidates) != 1:
+                raise ValueError('storage host must belong to exactly one instance, or specify instance_id')
+            owner = candidates[0]
+        if owner not in candidates:
+            raise ValueError('storage holder instance must contain its physical host')
+        holder['instance_id'] = owner
+        assignments[owner].append(holder['shard_index'])
+    if any(not indices for indices in assignments.values()):
+        raise ValueError('every static instance must hold at least one shard; consumer-only instances are not supported')
+    for consumer in consumers:
+        consumer['held_shards'] = assignments[consumer['instance_id']]
     bundle = ['python3', '-m', framework + 'sharded_bundle', *shared,
               '--publication', f'{root}/bundle']
     for index in range(p):
         bundle += ['--shard-json', f'{root}/shard-{index}/shard.json']
-    return dict(storage_host_count=p, generation=generation, holders=holders,
+    return dict(instance_count=n, membership='static', storage_host_count=p, generation=generation, holders=holders,
                 coordinator_argv=bundle, consumers=consumers,
-                lifecycle='all P holders READY -> bundle -> all consumers; stop all consumers before holders')
+                lifecycle='all N instances start their assigned P holders -> complete bundle -> all N instances attach; stop all N before retiring any holder')
 
 
 def main():

@@ -147,15 +147,19 @@ class DistributedDescriptorTest(unittest.TestCase):
 
 class LaunchPlanTest(unittest.TestCase):
     def config(self, p=3, instances=2):
-        return dict(storage_host_count=p, generation=GEN, checkpoint='/model',
+        return dict(instance_count=instances, storage_host_count=p, generation=GEN, checkpoint='/model',
             model_revision='revision', publication_root='/run/engram',
             storage_hosts=[dict(host_id=f'h{i}', device=0, numa=0) for i in range(p)],
-            instances=[dict(instance_id=f'i{i}', hosts=['h0', 'h1']) for i in range(instances)])
+            instances=[dict(instance_id=f'i{i}', hosts=[f'h{j}' for j in range(p) if j % instances == i])
+                       for i in range(instances)])
 
     def test_p_independent_of_instance_worker_count(self):
         for p in (2, 3, 5):
-            for instances in (1, 2, 10):
+            for instances in (1, 2):
                 plan = render_plan(self.config(p, instances))
+                self.assertEqual(plan['instance_count'], instances)
+                self.assertEqual(plan['membership'], 'static')
+                self.assertTrue(all(c['held_shards'] for c in plan['consumers']))
                 self.assertEqual(len(plan['holders']), p)
                 self.assertEqual(len(plan['consumers']), instances)
                 bundles = {c['env']['RTP_ENGRAM_EXTERNAL_BUNDLE'] for c in plan['consumers']}
@@ -170,3 +174,35 @@ class LaunchPlanTest(unittest.TestCase):
             if kind == 'p1': c['storage_host_count'] = 1
             if kind == 'invalid_device': c['storage_hosts'][0]['device'] = True
             with self.subTest(kind=kind), self.assertRaises(ValueError): render_plan(c)
+
+    def test_configured_n_must_match_exact_membership(self):
+        for n in (0, True, 1, 3, '2'):
+            config = self.config()
+            config['instance_count'] = n
+            with self.subTest(n=n), self.assertRaisesRegex(ValueError, 'instance_count'):
+                render_plan(config)
+
+    def test_extra_consumer_only_instance_rejected(self):
+        config = self.config()
+        config['instance_count'] = 3
+        config['instances'].append(dict(instance_id='late-reader', hosts=['h99']))
+        with self.assertRaisesRegex(ValueError, 'every static instance'):
+            render_plan(config)
+
+    def test_storage_outside_instance_gang_is_rejected(self):
+        config = self.config()
+        config['storage_hosts'][0]['host_id'] = 'outside'
+        with self.assertRaisesRegex(ValueError, 'belong'):
+            render_plan(config)
+
+    def test_overlap_requires_explicit_instance_assignment(self):
+        config = self.config()
+        config['instances'][1]['hosts'].append('h0')
+        with self.assertRaisesRegex(ValueError, 'exactly one instance'):
+            render_plan(config)
+        config['storage_hosts'][0]['instance_id'] = 'i0'
+        plan = render_plan(config)
+        self.assertEqual(plan['holders'][0]['instance_id'], 'i0')
+        config['storage_hosts'][0]['instance_id'] = 'unknown'
+        with self.assertRaisesRegex(ValueError, 'must contain'):
+            render_plan(config)

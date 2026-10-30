@@ -2,6 +2,8 @@
 
 审查基线：`engram-sharding-wip`，`f1b723d5f`；release 基线为 `feature/dsv41-release-20261019`。本文中的 P 是**存储物理 host 数量**，不是 Prefill，也不是模型实例数、GPU 数、TP/DP/EP。
 
+> 后续澄清：采用 [N 个实例静态共享组](STATIC_INSTANCE_GROUP.md)，全部实例共同启动并持有分片，纯消费者扩展不属于当前部署方案。下文的低层多消费者映射测试仍用于验证独立进程资源生命周期。
+
 ## 结论
 
 原实现已有跨 host 分片及多进程映射，但不能据此认定新要求已经完整验收：P 环境变量未接入运行路径，启动样例固定四节点，异常清理和分片身份校验存在缺口。当前修改补齐这些控制与生命周期问题，并移除取消的单点部署入口。生产发现、嵌入业务启动和故障恢复仍未实现。
@@ -44,6 +46,7 @@ python3 -m tools.engram_sidecar.framework.distributed_plan --config topology.jso
 
 ```json
 {
+  "instance_count": 2,
   "storage_host_count": 3,
   "generation": "84f39bf1-73da-4ea1-a667-9c6959341824",
   "checkpoint": "/models/dsv41",
@@ -56,7 +59,7 @@ python3 -m tools.engram_sidecar.framework.distributed_plan --config topology.jso
   ],
   "instances": [
     {"instance_id": "instance-1", "hosts": ["SN-A", "SN-B"]},
-    {"instance_id": "instance-2", "hosts": ["SN-B", "SN-C"]}
+    {"instance_id": "instance-2", "hosts": ["SN-C"]}
   ]
 }
 ```

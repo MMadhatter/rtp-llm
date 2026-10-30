@@ -2,6 +2,7 @@
 
 当前方案是 **P 个存储 host 分片持有 Engram，一个或多个 RTP 实例映射同一组分片**。P 与实例数、TP/DP/EP 独立。`engram_sidecar` 仅为历史目录名；已取消 sidecar 部署和完整权重集中在单个 owner 的方式。
 
+- [N 个实例静态共享语义与地址配置](framework/STATIC_INSTANCE_GROUP.md)
 - [当前审查、使用方法、边界和测试记录](framework/SHARDING_REVIEW_20261030.md)
 - `framework/distributed_plan.py`：按可配置 P 和实例拓扑生成启动命令/环境变量，不执行远程部署。
 - `framework/sharded_checkpoint_owner.py`：每个存储 host 加载自己的 weight/scale 行分片，持有 CUDA HOST_NUMA/FABRIC allocation。
