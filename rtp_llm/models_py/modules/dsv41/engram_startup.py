@@ -3,24 +3,38 @@
 
 Only called before engine construction. No lookup/kernel/Graph code calls this
 module. Holders remain owned by the launcher's static cohort lifecycle.
+
+The exchanged package stays in memory and is handed to the model attach through
+``engram_bootstrap.stage_package``; serving never reads bundle files.
 """
 from __future__ import annotations
 import base64
 from datetime import timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
-import tempfile
+import ssl
 import threading
 import time
+from uuid import NAMESPACE_URL, uuid5
 
 from .engram_exchange import (Cohort, ExchangeError, ExchangeServer, decode, digest, encode,
                               remote_exchange, tls_context, validate_group)
-from .engram_bootstrap import _json, _private_read
+from .engram_bootstrap import _json, _private_read, stage_package
 from .engram_descriptors import build_manifest
 from .engram_manifest import parse_manifest
+from .engram_shard_config import validate_count
 
-CONFIG_ENV = 'RTP_ENGRAM_STATIC_GROUP_CONFIG'
+COHORT_ENV = 'RTP_ENGRAM_COHORT'
+INDEX_ENV = 'RTP_ENGRAM_INSTANCE_INDEX'
+REVISION_ENV = 'RTP_ENGRAM_MODEL_REVISION'
+DESCRIPTORS_ENV = 'RTP_ENGRAM_LOCAL_DESCRIPTORS'
+TIMEOUT_ENV = 'RTP_ENGRAM_COHORT_TIMEOUT'
+TLS_DIR_ENV = 'RTP_ENGRAM_TLS_DIR'
+CHECKPOINT_ENV = 'RTP_ENGRAM_CHECKPOINT'
+COUNT_ENV = 'ENGRAM_SHARD_COUNT'
+DEFAULT_TIMEOUT = 1800
 
 
 def checkpoint_samples(checkpoint, manifest):
@@ -92,27 +106,40 @@ def verify_package(group, package):
     return manifest
 
 
-def materialize_package(group, package, root=None):
-    """Local private cache only; never manually transferred between hosts."""
+def to_memory_package(group, package):
+    """Validate the wire package and convert it to the in-memory attach form."""
     manifest = verify_package(group, package)
-    raw = encode(package['manifest'])
-    directory = Path(tempfile.mkdtemp(prefix='rtp-engram-' + group['generation'] + '-', dir=root))
-    bundle = dict(schema_version=1, manifest='manifest.json', capabilities='capabilities.json',
-                  manifest_sha256='sha256:' + digest(raw), dataset_id=manifest.dataset_id,
-                  generation=manifest.generation, model_revision=manifest.model_revision,
-                  hash_abi=manifest.hash_abi, samples=package['samples'])
-    try:
-        for name, data in (('manifest.json', raw), ('capabilities.json', encode(package['capabilities'])),
-                           ('bundle.json', encode(bundle))):
-            fd = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, 'wb') as stream:
-                stream.write(data)
-    except BaseException:
-        for name in ('manifest.json', 'capabilities.json', 'bundle.json'):
-            (directory / name).unlink(missing_ok=True)
-        directory.rmdir()
-        raise
-    return str(directory / 'bundle.json')
+    return dict(
+        raw=encode(package['manifest']),
+        dataset_id=manifest.dataset_id,
+        generation=manifest.generation,
+        model_revision=manifest.model_revision,
+        capabilities={aid: base64.b64decode(value, validate=True)
+                      for aid, value in package['capabilities'].items()},
+        samples=package['samples'],
+    )
+
+
+def offline_group(documents):
+    """Synthetic single-rank cohort for offline probes over published shards."""
+    ordered = sorted(documents, key=lambda item: item['shard'])
+    return dict(
+        generation=ordered[0]['generation'],
+        model_revision=ordered[0]['model_revision'],
+        members=[dict(instance_id=f'i{item["shard"]}', world_size=1,
+                      shards=[dict(index=item['shard'], host_id=item['host_id'],
+                                   publisher_rank=0)])
+                 for item in ordered],
+    )
+
+
+def package_from_descriptors(paths, checkpoint, samples=checkpoint_samples):
+    """Build an in-memory package from published shard descriptors (no bundle)."""
+    documents = [_json(_private_read(Path(path), 1 << 20)) for path in paths]
+    group = offline_group(documents)
+    validate_group(group)
+    package = assemble_package(group, documents, checkpoint, samples=samples)
+    return to_memory_package(group, package)
 
 
 def _wait(store, keys, deadline):
@@ -120,6 +147,122 @@ def _wait(store, keys, deadline):
     if remaining <= 0:
         raise ExchangeError('INSTANCE_STARTUP_TIMEOUT')
     store.wait(keys, timedelta(seconds=remaining))
+
+
+def _cohort(env):
+    raw = env.get(COHORT_ENV)
+    if raw is None:
+        return None
+    members = []
+    for item in raw.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        host, _, port = item.rpartition(':')
+        if not host or not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise ExchangeError('INVALID_COHORT')
+        members.append((host, int(port)))
+    if not members:
+        raise ExchangeError('INVALID_COHORT')
+    return members
+
+
+def _descriptors(env, count):
+    raw = env.get(DESCRIPTORS_ENV)
+    if raw is None:
+        raise ExchangeError('LOCAL_DESCRIPTORS_REQUIRED')
+    paths = [item.strip() for item in raw.split(',') if item.strip()]
+    if len(paths) != count:
+        raise ExchangeError('LOCAL_DESCRIPTOR_COUNT_MISMATCH')
+    for path in paths:
+        if not Path(path).is_absolute():
+            raise ExchangeError('DESCRIPTOR_PATH_MUST_BE_ABSOLUTE')
+    return paths
+
+
+def _tls(env, index, instances):
+    directory = env.get(TLS_DIR_ENV)
+    if not directory:
+        return None
+    root = Path(directory)
+    if not root.is_absolute():
+        raise ExchangeError('TLS_DIR_MUST_BE_ABSOLUTE')
+    fingerprints = {}
+    for member in range(instances):
+        pem = root / f'member-{member}.pem'
+        if not pem.is_file():
+            raise ExchangeError('MISSING_MEMBER_CERTIFICATE')
+        der = ssl.PEM_cert_to_DER_cert(pem.read_text())
+        fingerprints[f'i{member}'] = hashlib.sha256(der).hexdigest()
+    if len(set(fingerprints.values())) != len(fingerprints):
+        raise ExchangeError('DISTINCT_MEMBER_CERTIFICATES_REQUIRED')
+    return dict(ca_file=str(root / 'ca.pem'), cert_file=str(root / f'member-{index}.pem'),
+                key_file=str(root / f'member-{index}.key'),
+                instance_cert_sha256=fingerprints)
+
+
+def build_group(env, world_size):
+    """Derive cohort membership and shard ownership from the environment only."""
+    cohort = _cohort(env)
+    if cohort is None:
+        return None
+    raw_count = env.get(COUNT_ENV)
+    if raw_count is None or not raw_count.isdigit():
+        raise ExchangeError('STORAGE_HOST_COUNT_REQUIRED')
+    p = validate_count(int(raw_count))
+    instances = len(cohort)
+    if p < instances:
+        raise ExchangeError('STORAGE_HOST_COUNT_BELOW_INSTANCE_COUNT')
+    revision = env.get(REVISION_ENV)
+    if not revision:
+        raise ExchangeError('MODEL_REVISION_REQUIRED')
+    raw_index = env.get(INDEX_ENV, '0')
+    if not raw_index.isdigit() or not 0 <= int(raw_index) < instances:
+        raise ExchangeError('INVALID_INSTANCE_INDEX')
+    index = int(raw_index)
+    generation = str(uuid5(NAMESPACE_URL, 'engram|' + revision + '|' +
+                           ','.join(f'{host}:{port}' for host, port in cohort) + '|' + str(p)))
+    base, extra = divmod(p, instances)
+    members = []
+    for member_index in range(instances):
+        start = member_index * base + min(member_index, extra)
+        count = base + (1 if member_index < extra else 0)
+        if world_size % count:
+            raise ExchangeError('WORLD_SIZE_NOT_DIVISIBLE_BY_LOCAL_HOSTS')
+        local_world_size = world_size // count
+        host = cohort[member_index][0]
+        shards = [dict(index=start + offset, host_id=f'{host}#{start + offset}',
+                       publisher_rank=offset * local_world_size) for offset in range(count)]
+        members.append(dict(instance_id=f'i{member_index}', world_size=world_size, shards=shards))
+    group = dict(generation=generation, model_revision=revision, members=members)
+    validate_group(group)
+    local = members[index]
+    checkpoint = env.get(CHECKPOINT_ENV) or env.get('CHECKPOINT_PATH')
+    if not checkpoint:
+        raise ExchangeError('CHECKPOINT_REQUIRED')
+    raw_timeout = env.get(TIMEOUT_ENV)
+    timeout = DEFAULT_TIMEOUT if raw_timeout is None else float(raw_timeout)
+    if not 0 < timeout <= 86400:
+        raise ExchangeError('INVALID_TIMEOUT')
+    return dict(
+        group=group,
+        instance_id=local['instance_id'],
+        index=index,
+        checkpoint=checkpoint,
+        coordinator=dict(host=cohort[0][0], port=cohort[0][1]),
+        timeout_seconds=timeout,
+        local_shards=local['shards'],
+    )
+
+
+def build_config(env, world_size):
+    """Add the local-only inputs (descriptor paths, optional mTLS material)."""
+    config = build_group(env, world_size)
+    if config is None:
+        return None
+    config['tls'] = _tls(env, config['index'], len(config['group']['members']))
+    config['local_descriptors'] = _descriptors(env, len(config['local_shards']))
+    return config
 
 
 def exchange_leaders(config, documents, deadline, build=None):
@@ -133,19 +276,19 @@ def exchange_leaders(config, documents, deadline, build=None):
         cohort = Cohort(group, builder, max(0.001, deadline - time.monotonic()))
         return decode(cohort.submit(ident, group_digest, documents))['package']
     address = config['coordinator']
-    if type(address) is not dict or set(address) != {'host', 'port'} or type(address['port']) is not int or not 1 <= address['port'] <= 65535:
+    if (type(address) is not dict or set(address) != {'host', 'port'}
+            or type(address['port']) is not int or not 1 <= address['port'] <= 65535):
         raise ExchangeError('INVALID_COORDINATOR')
     tls = config['tls']
-    fingerprints = tls['instance_cert_sha256']
-    if (set(fingerprints) != {m['instance_id'] for m in group['members']}
-            or any(type(v) is not str or len(v) != 64 or any(c not in '0123456789abcdef' for c in v) for v in fingerprints.values())
-            or len(set(fingerprints.values())) != len(fingerprints)):
-        raise ExchangeError('DISTINCT_MEMBER_CERTIFICATES_REQUIRED')
+    context = tls_context(tls) if tls else None
+    server_context = tls_context(tls, server=True) if tls else None
+    fingerprints = tls['instance_cert_sha256'] if tls else {}
     if ident != coordinator:
-        return remote_exchange((address['host'], address['port']), tls_context(tls), ident, group_digest,
-                               documents, deadline, verifier, server_fingerprint=fingerprints[coordinator])
+        return remote_exchange((address['host'], address['port']), context, ident, group_digest,
+                               documents, deadline, verifier,
+                               server_fingerprint=fingerprints.get(coordinator))
     cohort = Cohort(group, builder, max(0.001, deadline - time.monotonic()))
-    server = ExchangeServer((address['host'], address['port']), cohort, tls_context(tls, server=True), fingerprints)
+    server = ExchangeServer((address['host'], address['port']), cohort, server_context, fingerprints)
     thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
     thread.start()
     try:
@@ -164,26 +307,17 @@ def exchange_leaders(config, documents, deadline, build=None):
 def prepare_static_engram(store, *, rank, world_size, environ=None, leader_exchange=exchange_leaders):
     """All ranks enter once. Only world rank 0 opens cross-instance connections."""
     env = os.environ if environ is None else environ
-    path = env.get(CONFIG_ENV)
-    if path is None:
+    config = build_config(env, world_size)
+    if config is None:
         return None
-    if 'RTP_ENGRAM_EXTERNAL_BUNDLE' in env:
-        raise ExchangeError('SELECT_STATIC_EXCHANGE_OR_OFFLINE_BUNDLE')
-    if not Path(path).is_absolute():
-        raise ExchangeError('CONFIG_PATH_MUST_BE_ABSOLUTE')
-    config = _json(_private_read(path, 1 << 20))
     group = config['group']
     group_digest = validate_group(group)
     members = {m['instance_id']: m for m in group['members']}
-    member = members.get(config['instance_id'])
-    if member is None or member['world_size'] != world_size or not 0 <= rank < world_size:
+    member = members[config['instance_id']]
+    if member['world_size'] != world_size or not 0 <= rank < world_size:
         raise ExchangeError('INSTANCE_WORLD_SIZE_MISMATCH')
-    timeout = config.get('timeout_seconds', 1800)
-    if type(timeout) not in (int, float) or not 0 < timeout <= 86400:
-        raise ExchangeError('INVALID_TIMEOUT')
     p = sum(len(m['shards']) for m in group['members'])
-    if 'ENGRAM_SHARD_COUNT' in env and env['ENGRAM_SHARD_COUNT'] != str(p):
-        raise ExchangeError('STORAGE_HOST_COUNT_MISMATCH')
+    timeout = config['timeout_seconds']
     deadline = time.monotonic() + timeout
     if store is None:
         if world_size != 1:
@@ -198,18 +332,16 @@ def prepare_static_engram(store, *, rank, world_size, environ=None, leader_excha
         _wait(store, config_keys, deadline)
         if any(store.get(k) != group_digest.encode() for k in config_keys):
             raise ExchangeError('INSTANCE_GROUP_CONFIG_MISMATCH')
-    for shard in member['shards']:
+    descriptors = config['local_descriptors']
+    for offset, shard in enumerate(member['shards']):
         if shard['publisher_rank'] != rank:
             continue
-        descriptor = Path(config['local_descriptors'][str(shard['index'])])
-        if not descriptor.is_absolute():
-            raise ExchangeError('DESCRIPTOR_PATH_MUST_BE_ABSOLUTE')
+        descriptor = Path(descriptors[offset])
         while not descriptor.exists():
             if time.monotonic() >= deadline:
                 raise ExchangeError('LOCAL_SHARD_NOT_READY')
             time.sleep(0.05)
-        raw = _private_read(descriptor, 1 << 20)
-        store.set(prefix + f'shard/{shard["index"]}', raw)
+        store.set(prefix + f'shard/{shard["index"]}', _private_read(descriptor, 1 << 20))
     if rank == 0:
         keys = [prefix + f'shard/{s["index"]}' for s in member['shards']]
         _wait(store, keys, deadline)
@@ -219,14 +351,13 @@ def prepare_static_engram(store, *, rank, world_size, environ=None, leader_excha
         store.set(prefix + 'package', encode(package))
     _wait(store, [prefix + 'package'], deadline)
     package = decode(store.get(prefix + 'package'))
-    bundle = materialize_package(group, package, root=config.get('cache_directory'))
-    env['ENGRAM_SHARD_COUNT'] = str(p)
-    env['RTP_ENGRAM_EXTERNAL_BUNDLE'] = bundle
+    stage_package(to_memory_package(group, package))
+    env[COUNT_ENV] = str(p)
     store.set(prefix + f'received/{rank}', b'1')
     if rank == 0:
         _wait(store, [prefix + f'received/{i}' for i in range(world_size)], deadline)
-        # All workers now have private local caches. No serving-time Store reads.
+        # Every worker holds the package in memory. No serving-time Store reads.
         for key in ([prefix + 'package'] + keys + config_keys +
                     [prefix + f'received/{i}' for i in range(world_size)]):
             store.delete_key(key)
-    return bundle
+    return None

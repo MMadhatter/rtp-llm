@@ -195,10 +195,11 @@ def load_cpu_projection(checkpoint, layer_id):
     return projection, values["q_weight"], values["k_weight"]
 
 
-def run(fixture_root, bundle, device_ordinal=0):
+def run(fixture_root, shard_json, device_ordinal=0):
     config, metadata = check_consumer_fixture(fixture_root)
-    if not Path(bundle).is_absolute() or not Path(bundle).is_file():
-        raise ValueError("bundle must be an existing absolute file")
+    shard_json = [Path(item) for item in shard_json]
+    if not shard_json or any(not item.is_absolute() or not item.is_file() for item in shard_json):
+        raise ValueError("shard-json must be existing absolute files")
     if type(device_ordinal) is not int or device_ordinal < 0:
         raise ValueError("device must be a nonnegative local CUDA ordinal")
     import torch
@@ -214,11 +215,14 @@ def run(fixture_root, bundle, device_ordinal=0):
     ops.ensure_compute_ops_loaded()
     from rtp_llm.models_py.model_desc.deepseek_v41_model import DeepSeekV41Model
     from rtp_llm.models_py.modules.dsv41.engram import gated_engram_residual
+    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import stage_package
     from rtp_llm.models_py.modules.dsv41.engram_model_attach import EngramModelInitializationError
+    from rtp_llm.models_py.modules.dsv41.engram_startup import package_from_descriptors
     from rtp_llm.models_py.modules.dsv41.utils import V41MXFP8Linear
     from checkpoint_fixture import HC, HIDDEN_DIM, LAYERS, WKV_N, make_inputs
 
-    os.environ["RTP_ENGRAM_EXTERNAL_BUNDLE"] = str(bundle)
+    stage_package(package_from_descriptors([str(item) for item in shard_json],
+                                            str(Path(fixture_root) / "consumer_checkpoint")))
     shell = SimpleNamespace(
         _v4_args=SimpleNamespace(v41_config=config),
         v4=SimpleNamespace(
@@ -330,11 +334,11 @@ def run(fixture_root, bundle, device_ordinal=0):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture-root", type=Path, required=True)
-    parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--shard-json", type=Path, action="append", required=True)
     parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
     try:
-        run(args.fixture_root, args.bundle, args.device)
+        run(args.fixture_root, args.shard_json, args.device)
     except BaseException as error:
         emit("consumer_failed", error_type=type(error).__name__, message=str(error)[:1024],
              full_llm=False, cleanup_boundary="consumer process exit; do not release owner early")

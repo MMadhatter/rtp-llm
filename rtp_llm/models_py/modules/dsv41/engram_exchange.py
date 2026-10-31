@@ -181,10 +181,13 @@ class ExchangeServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, cohort, context, fingerprints):
-        if not isinstance(context, ssl.SSLContext) or context.verify_mode != ssl.CERT_REQUIRED:
-            raise ExchangeError('MUTUAL_TLS_REQUIRED')
+        if context is not None:
+            if not isinstance(context, ssl.SSLContext) or context.verify_mode != ssl.CERT_REQUIRED:
+                raise ExchangeError('MUTUAL_TLS_REQUIRED')
+            if not fingerprints:
+                raise ExchangeError('MUTUAL_TLS_REQUIRED')
         self.cohort, self.context = cohort, context
-        self.fingerprints = fingerprints
+        self.fingerprints = fingerprints or {}
         self.connections = 0
         self._slots = threading.BoundedSemaphore(len(cohort.members) + 2)
         super().__init__(address, ExchangeHandler)
@@ -193,6 +196,9 @@ class ExchangeServer(ThreadingHTTPServer):
         raw, address = super().get_request()
         try:
             raw.settimeout(min(5, self.cohort.remaining()))
+            if self.context is None:
+                self.connections += 1
+                return raw, address
             secure = self.context.wrap_socket(raw, server_side=True)
             secure.settimeout(self.cohort.remaining())
             self.connections += 1
@@ -248,9 +254,12 @@ class ExchangeHandler(BaseHTTPRequestHandler):
                 raise ExchangeError('TRUNCATED_FRAME')
             request = decode(raw)
             ident = request.get('instance_id')
-            cert_digest = digest(self.connection.getpeercert(binary_form=True))
-            if self.server.fingerprints.get(ident) != cert_digest:
-                raise ExchangeError('UNAUTHORIZED_INSTANCE')
+            # Plain-HTTP mode has no peer certificate; the group digest still
+            # binds membership, but identity is self-asserted on a trusted link.
+            if self.server.context is not None:
+                cert_digest = digest(self.connection.getpeercert(binary_form=True))
+                if self.server.fingerprints.get(ident) != cert_digest:
+                    raise ExchangeError('UNAUTHORIZED_INSTANCE')
             if self.path == '/v1/exchange' and set(request) == {'instance_id', 'group_digest', 'documents'}:
                 payload = self.server.cohort.submit(ident, request['group_digest'], request['documents'])
                 self.respond(200, payload)
@@ -286,11 +295,16 @@ def remote_exchange(address, context, instance_id, group_digest, documents, dead
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ExchangeError('CONNECT_TIMEOUT')
-        candidate = http.client.HTTPSConnection(address[0], address[1], context=context,
-                                                timeout=min(remaining, 5))
+        if context is None:
+            candidate = http.client.HTTPConnection(address[0], address[1],
+                                                   timeout=min(remaining, 5))
+        else:
+            candidate = http.client.HTTPSConnection(address[0], address[1], context=context,
+                                                    timeout=min(remaining, 5))
         try:
             candidate.connect()
-            if server_fingerprint is not None and digest(candidate.sock.getpeercert(binary_form=True)) != server_fingerprint:
+            if (context is not None and server_fingerprint is not None
+                    and digest(candidate.sock.getpeercert(binary_form=True)) != server_fingerprint):
                 candidate.close()
                 raise ExchangeError('COORDINATOR_CERTIFICATE_MISMATCH')
             candidate.sock.settimeout(max(0.001, deadline - time.monotonic()))

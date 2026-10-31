@@ -20,25 +20,28 @@ from checkpoint_fixture import LAYERS, table_rows
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture-root", type=Path, required=True)
-    parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--shard-json", type=Path, action="append", required=True)
     parser.add_argument("--device", type=int, required=True)
     args = parser.parse_args()
     import torch
     from safetensors.torch import load_file
     from rtp_llm.models_py.modules.dsv41.engram import EngramLayout, HostEngramEmbedding, NgramHashState
-    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _load_native, attach_from_bundle
+    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _load_native, attach_from_package
+    from rtp_llm.models_py.modules.dsv41.engram_startup import package_from_descriptors
 
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
-    config = json.loads((args.fixture_root / "consumer_checkpoint" / "config.json").read_text())
+    checkpoint = args.fixture_root / "consumer_checkpoint"
+    config = json.loads((checkpoint / "config.json").read_text())
     layout = EngramLayout(config)
-    hash_state = NgramHashState(layout, str(args.fixture_root / "consumer_checkpoint"))
-    index = json.loads((args.fixture_root / "consumer_checkpoint" / "model.safetensors.index.json").read_text())
+    hash_state = NgramHashState(layout, str(checkpoint))
+    index = json.loads((checkpoint / "model.safetensors.index.json").read_text())
     if any(".embed." in key for key in index["weight_map"]):
         raise AssertionError("consumer checkpoint must have no embedding table")
     native = _load_native()
+    package = package_from_descriptors([str(path) for path in args.shard_json], str(checkpoint))
     before = torch.cuda.memory_allocated(device)
-    storage = attach_from_bundle(args.bundle, layout=layout, hash_state=hash_state, device=device)
+    storage = attach_from_package(package, layout=layout, hash_state=hash_state, device=device)
     after = torch.cuda.memory_allocated(device)
     embeddings = []
     results = []

@@ -12,6 +12,7 @@ import types
 import unittest
 from uuid import UUID
 import weakref
+from rtp_llm.models_py.modules.dsv41 import engram_bootstrap as b
 
 PACKAGE = "engram_storage_cpu_test"
 package = types.ModuleType(PACKAGE)
@@ -285,13 +286,15 @@ class StorageTest(unittest.TestCase):
                 self.views = storage.table_views(layer_id)
             def release_external_views(self):
                 self.views = None
+        b.stage_package({"staged": True})
+        self.addCleanup(b.clear_staged_package)
         attachment = a.initialize_model_engram(
             model, layout_factory=lambda config: types.SimpleNamespace(layer_ids=(1, 2)),
             hash_factory=lambda *args, **kwargs: object(),
             layer_factory=lambda config, layer_id, *args, **kwargs: LayerViews(layer_id),
             attach_factory=lambda *args, **kwargs: storage,
             retain=retained.append,
-            environ={a.EXTERNAL_BUNDLE_ENV: "/private/bundle.json", a.EXTERNAL_GRAPH_MODE_ENV: a.PROCESS_LIFETIME_GRAPH},
+            environ={a.EXTERNAL_GRAPH_MODE_ENV: a.PROCESS_LIFETIME_GRAPH},
         )
         self.assertEqual(attachment.phase, "READY")
         a.require_engram_runtime(model, is_cuda_graph=True)

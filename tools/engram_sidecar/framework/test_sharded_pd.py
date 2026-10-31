@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from tools.engram_sidecar.framework import sharded_pd as pd
+from rtp_llm.models_py.modules.dsv41.engram_capacity import CapacityError, validate_capacity
 
 
 def topology():
@@ -17,15 +18,14 @@ def topology():
 class ShardedPDTest(unittest.TestCase):
     def test_preflight_capacity_uses_explicit_arguments(self):
         args = SimpleNamespace(max_allocation_bytes=128 << 30, budget_bytes=256 << 30)
-        limits = pd.full_model_http.bundle_limits(args)
-        self.assertEqual(limits.max_allocation_bytes, 128 << 30)
-        self.assertEqual(limits.max_total_allocation_bytes, 256 << 30)
+        limits = validate_capacity(args.max_allocation_bytes, args.budget_bytes)
+        self.assertEqual(limits, (128 << 30, 256 << 30))
         args.budget_bytes = 0
-        with self.assertRaises(ValueError):
-            pd.full_model_http.bundle_limits(args)
+        with self.assertRaises(CapacityError):
+            validate_capacity(args.max_allocation_bytes, args.budget_bytes)
 
     def env(self, node, graph=False, storage="external-egm", decode_moe="mega"):
-        args = SimpleNamespace(checkpoint=Path("/model"), bundle=Path("/private/bundle.json"),
+        args = SimpleNamespace(checkpoint=Path("/model"),
                                storage_mode=storage, cuda_graph=graph,
                                max_allocation_bytes=128*1024**3, budget_bytes=256*1024**3,
                                port=18180, decode_moe_strategy=decode_moe)
@@ -81,6 +81,18 @@ class ShardedPDTest(unittest.TestCase):
             local = self.env(node, graph=True, storage="local-pinned")
             for key in pd.full_model_http.EXTERNAL_ENV:
                 self.assertNotIn(key, local)
+
+    def test_external_cohort_contract_reaches_the_server(self):
+        env = pd.launch_environment(
+            topology(), "d0", SimpleNamespace(
+                checkpoint=Path("/model"), storage_mode="external-egm", cuda_graph=False,
+                max_allocation_bytes=128 * 1024**3, budget_bytes=256 * 1024**3,
+                port=18180, decode_moe_strategy="mega"),
+            inherited={"RTP_ENGRAM_COHORT": "192.0.2.1:19780,192.0.2.2:19780",
+                       "RTP_ENGRAM_INSTANCE_INDEX": "1", "ENGRAM_SHARD_COUNT": "2"})
+        self.assertEqual(env["RTP_ENGRAM_COHORT"], "192.0.2.1:19780,192.0.2.2:19780")
+        self.assertEqual(env["RTP_ENGRAM_INSTANCE_INDEX"], "1")
+        self.assertEqual(env["ENGRAM_SHARD_COUNT"], "2")
 
     def test_reject_colocated_hosts_duplicate_devices_and_wrong_gang_ports(self):
         original = topology()

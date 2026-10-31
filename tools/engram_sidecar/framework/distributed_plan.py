@@ -73,7 +73,7 @@ def render_plan(config):
         consumers.append(dict(instance_id=identifier, hosts=workers,
             env={'RTP_ENGRAM_MAX_ALLOCATION_BYTES': str(allocation),
                  'RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES': str(total),
-                 'ENGRAM_SHARD_COUNT': str(p), 'RTP_ENGRAM_EXTERNAL_BUNDLE': f'{root}/bundle/bundle.json'}))
+                 'ENGRAM_SHARD_COUNT': str(p)}))
     # Every declared instance participates in holding backing. This is a fixed
     # cohort, not an expandable consumer list; joining/removing requires a new
     # generation. One holder per physical storage host is the current contract.
@@ -94,45 +94,38 @@ def render_plan(config):
         raise ValueError('every static instance must hold at least one shard; consumer-only instances are not supported')
     for consumer in consumers:
         consumer['held_shards'] = assignments[consumer['instance_id']]
-    bundle = ['python3', '-m', framework + 'sharded_bundle', *shared,
-              '--publication', f'{root}/bundle']
-    for index in range(p):
-        bundle += ['--shard-json', f'{root}/shard-{index}/shard.json']
-    result = dict(instance_count=n, membership='static', storage_host_count=p, generation=generation, holders=holders,
-                coordinator_argv=bundle, consumers=consumers,
-                lifecycle='all N instances start their assigned P holders -> complete bundle -> all N instances attach; stop all N before retiring any holder')
-    if config.get('exchange') is not None:
-        from rtp_llm.models_py.modules.dsv41.engram_exchange import validate_group
-        exchange = config['exchange']
-        members = []
-        for instance in instances:
-            local_size = instance.get('local_world_size')
-            if type(local_size) is not int or local_size < 1:
-                raise ValueError('RPC mode requires each instance local_world_size')
-            member = dict(instance_id=instance['instance_id'],
-                          world_size=local_size * len(instance['hosts']), shards=[])
-            for holder in holders:
-                if holder['instance_id'] == instance['instance_id']:
-                    member['shards'].append(dict(index=holder['shard_index'], host_id=holder['host_id'],
-                        publisher_rank=local_size * instance['hosts'].index(holder['host_id'])))
-            members.append(member)
-        group = dict(generation=generation, model_revision=revision, members=members)
-        validate_group(group)
-        result['startup_configs'] = {}
-        result['coordinator_argv'] = None  # No manual bundle merge/copy in RPC mode.
-        for member_index, consumer in enumerate(consumers):
-            ident = consumer['instance_id']
-            startup = dict(group=group, instance_id=ident, checkpoint=config['checkpoint'],
-                coordinator=exchange.get('coordinator'),
-                tls=exchange.get('tls', {}).get(ident),
-                timeout_seconds=exchange.get('timeout_seconds', 1800),
-                local_descriptors={str(index): f'{root}/shard-{index}/shard.json' for index in consumer['held_shards']})
-            if n > 1 and (startup['coordinator'] is None or startup['tls'] is None):
-                raise ValueError('multi-instance RPC requires coordinator address and per-instance TLS configuration')
-            result['startup_configs'][ident] = startup
-            consumer['env'].pop('RTP_ENGRAM_EXTERNAL_BUNDLE')
-            consumer['env']['RTP_ENGRAM_STATIC_GROUP_CONFIG'] = f'{root}/startup-{member_index}.json'
-        result['lifecycle'] = 'P holders READY -> existing instance Store -> one RPC connection per remote representative -> all-member ACK -> model attach'
+    result = dict(instance_count=n, membership='static', storage_host_count=p,
+                  generation=generation, holders=holders, consumers=consumers,
+                  lifecycle='all N instances start their assigned P holders -> '
+                            'existing instance Store -> one RPC connection per remote '
+                            'representative -> all-member ACK -> model attach')
+    if config.get('exchange') is None:
+        raise ValueError('exchange configuration is required; offline bundles were removed')
+    exchange = config['exchange']
+    coordinator = exchange.get('coordinator')
+    if type(coordinator) is not dict or set(coordinator) != {'host', 'port'}:
+        raise ValueError('exchange.coordinator must be {host, port}')
+    endpoints = []
+    for instance in instances:
+        ip = instance.get('ip') or instance['hosts'][0]
+        endpoints.append(f'{ip}:{coordinator["port"]}')
+    cohort = ','.join(endpoints)
+    for member_index, consumer in enumerate(consumers):
+        descriptors = ','.join(f'{root}/shard-{index}/shard.json'
+                               for index in consumer['held_shards'])
+        env = consumer['env']
+        env.pop('RTP_ENGRAM_EXTERNAL_BUNDLE', None)
+        env.update({
+            'RTP_ENGRAM_COHORT': cohort,
+            'RTP_ENGRAM_INSTANCE_INDEX': str(member_index),
+            'ENGRAM_SHARD_COUNT': str(p),
+            'RTP_ENGRAM_MODEL_REVISION': revision,
+            'RTP_ENGRAM_LOCAL_DESCRIPTORS': descriptors,
+            'RTP_ENGRAM_COHORT_TIMEOUT': str(exchange.get('timeout_seconds', 1800)),
+            'RTP_ENGRAM_CHECKPOINT': config['checkpoint'],
+        })
+        if exchange.get('tls_dir'):
+            env['RTP_ENGRAM_TLS_DIR'] = exchange['tls_dir']
     return result
 
 
@@ -140,21 +133,16 @@ def render_plan(config):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
-    parser.add_argument('--output-directory', type=Path, help='Write private plan/startup configs for launcher distribution')
+    parser.add_argument('--output-directory', type=Path, help='Write the private launch plan for launcher distribution')
     args = parser.parse_args()
     plan = render_plan(json.loads(args.config.read_text()))
     if args.output_directory:
         import os
         destination = args.output_directory.resolve()
         destination.mkdir(mode=0o700, parents=True, exist_ok=False)
-        documents = {'launch-plan.json': plan}
-        for index, consumer in enumerate(plan['consumers']):
-            if 'startup_configs' in plan:
-                documents[f'startup-{index}.json'] = plan['startup_configs'][consumer['instance_id']]
-        for name, document in documents.items():
-            fd = os.open(destination / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, 'w') as stream:
-                json.dump(document, stream, indent=2)
+        fd = os.open(destination / 'launch-plan.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(plan, stream, indent=2)
         print(destination / 'launch-plan.json')
     else:
         print(json.dumps(plan, indent=2))

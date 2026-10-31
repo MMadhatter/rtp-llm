@@ -95,186 +95,16 @@ class BundleFiles:
             }
             for tensor in self.document["tensors"]
         }
-        self.bundle = dict(
-            schema_version=1, manifest="manifest.json", capabilities="handles.json",
-            manifest_sha256=digest(self.manifest_raw),
+        self.package = dict(
+            raw=self.manifest_raw,
             dataset_id=self.document["dataset_id"], generation=self.document["generation"],
-            model_revision=self.document["model_revision"], hash_abi=self.abi,
+            model_revision=self.document["model_revision"],
+            capabilities={part["allocation_id"]: b"private-handle-bytes"
+                          for tensor in self.document["tensors"] for part in tensor["shards"]},
             samples=self.samples,
         )
-        self.capabilities = {
-            part["allocation_id"]: base64.b64encode(b"private-handle-bytes").decode()
-            for tensor in self.document["tensors"] for part in tensor["shards"]
-        }
-        self.write("manifest.json", self.manifest_raw)
-        self.write("handles.json", self.capabilities)
-        self.write("launch.json", self.bundle)
-
-    def write(self, name, value):
-        raw = value if isinstance(value, bytes) else json.dumps(value).encode()
-        path = self.root / name
-        path.write_bytes(raw)
-        path.chmod(0o600)
-        return path
-
-    def read(self):
-        return b._read_bundle(self.path, self.layout, self.abi, limits=b._configured_limits({}))
 
 
-class BundleFileTest(BundleFiles, unittest.TestCase):
-    def setUp(self):
-        self.prepare_bundle()
-
-    def assert_code(self, code, function=None):
-        with self.assertRaises((b.BootstrapError, m.ManifestError)) as raised:
-            (function or self.read)()
-        self.assertEqual(raised.exception.code, code)
-        self.assertNotIn("private-handle", str(raised.exception))
-
-    def test_real_private_files_validate_complete_generation(self):
-        bundle, raw, expected, handles = self.read()
-        self.assertEqual(bundle["dataset_id"], self.document["dataset_id"])
-        self.assertEqual(raw, self.manifest_raw)
-        self.assertEqual(expected.layers, ((1, 3), (14, 5)))
-        self.assertEqual(set(handles), set(self.capabilities))
-        self.assertEqual(set(handles.values()), {b"private-handle-bytes"})
-
-    def test_large_metadata_requires_explicit_local_policy(self):
-        # Only small JSON files are created: no table memory or native imports.
-        rows = ((1 << 30) // 33) + 1
-        self.prepare_bundle(types.SimpleNamespace(layer_ids=(1, 14),
-                            num_embeddings=(rows, rows), head_dim=32))
-        self.assert_code("INVALID_ALLOCATION_SIZE")
-        limits = b._configured_limits({"RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(128 << 30),
-                                       "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": str(256 << 30)})
-        bundle, _, _, _ = b._read_bundle(self.path, self.layout, self.abi, limits=limits)
-        self.assertEqual(bundle["dataset_id"], self.document["dataset_id"])
-
-    def test_total_capacity_counts_unique_backing_and_cannot_be_in_bundle(self):
-        limits = b._configured_limits({"RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": "8191"})
-        self.assert_code("TOTAL_ALLOCATION_LIMIT", lambda: b._read_bundle(
-            self.path, self.layout, self.abi, limits=limits))
-        self.bundle["max_total_allocation_bytes"] = 256 << 30
-        self.write("launch.json", self.bundle)
-        self.assert_code("INVALID_BUNDLE_FIELDS")
-
-    def test_real_table_metadata_needs_both_local_capacity_settings(self):
-        self.prepare_bundle(types.SimpleNamespace(layer_ids=(1, 14),
-                            num_embeddings=(384006168, 384016682), head_dim=256))
-        self.assert_code("INVALID_ALLOCATION_SIZE")
-        env = {"RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(128 << 30)}
-        self.assert_code("TOTAL_ALLOCATION_LIMIT", lambda: b._read_bundle(
-            self.path, self.layout, self.abi, limits=b._configured_limits(env)))
-        env["RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES"] = str(256 << 30)
-        _, _, expected, handles = b._read_bundle(
-            self.path, self.layout, self.abi, limits=b._configured_limits(env))
-        self.assertEqual(expected.layers, ((1, 384006168), (14, 384016682)))
-        self.assertEqual(expected.head_dim, 256)
-        self.assertEqual(len(handles), 2)
-
-    def test_invalid_local_policy_is_a_bounded_error(self):
-        for value in ("0", "-1", str((128 << 30) + 1), "private-value"):
-            self.assert_code("INVALID_CAPACITY_LIMIT", lambda: b._configured_limits(
-                {"RTP_ENGRAM_MAX_ALLOCATION_BYTES": value}))
-
-    def test_relative_bundle_rejected(self):
-        self.assert_code("BUNDLE_PATH_MUST_BE_ABSOLUTE",
-                         lambda: b._read_bundle("launch.json", self.layout, self.abi))
-
-    def test_symlinked_file_rejected(self):
-        self.path.unlink()
-        self.path.symlink_to(self.root / "manifest.json")
-        self.assert_code("BOOTSTRAP_FILE_UNAVAILABLE")
-
-    def test_public_mode_rejected_for_each_file(self):
-        for name in ("launch.json", "manifest.json", "handles.json"):
-            with self.subTest(file=name):
-                path = self.root / name
-                path.chmod(0o644)
-                self.assert_code("UNSAFE_BOOTSTRAP_FILE")
-                path.chmod(0o600)
-
-    def test_wrong_file_owner_rejected(self):
-        with mock.patch.object(b.os, "getuid", return_value=os.getuid() + 1):
-            self.assert_code("UNSAFE_BOOTSTRAP_FILE")
-
-    def test_directory_and_oversized_bundle_rejected(self):
-        self.assert_code("BOOTSTRAP_FILE_UNAVAILABLE",
-                         lambda: b._read_bundle(self.root, self.layout, self.abi))
-        self.write("launch.json", b" " * ((2 << 20) + 1))
-        self.assert_code("BOOTSTRAP_TOO_LARGE")
-
-    def test_duplicate_nonfinite_or_malformed_json_rejected(self):
-        for raw in (b'{"x":1,"x":2}', b'{"x":NaN}', b'\xff', b'{} trailing'):
-            with self.subTest(raw=raw):
-                self.write("launch.json", raw)
-                self.assert_code("INVALID_JSON")
-
-    def test_bundle_fields_and_version_are_strict(self):
-        for change, code in (({"unexpected": 1}, "INVALID_BUNDLE_FIELDS"),
-                             ({"schema_version": True}, "UNSUPPORTED_BUNDLE_VERSION")):
-            self.write("launch.json", {**self.bundle, **change})
-            self.assert_code(code)
-
-    def test_path_traversal_and_aliasing_rejected(self):
-        for name, code in (("../manifest.json", "INVALID_BUNDLE_FILENAME"),
-                           ("/manifest.json", "INVALID_BUNDLE_FILENAME"),
-                           ("launch.json", "BOOTSTRAP_FILES_MUST_DIFFER")):
-            with self.subTest(name=name):
-                self.write("launch.json", {**self.bundle, "manifest": name})
-                self.assert_code(code)
-
-    def test_manifest_byte_tamper_rejected(self):
-        self.write("manifest.json", self.manifest_raw + b" ")
-        self.assert_code("MANIFEST_DIGEST_MISMATCH")
-
-    def test_actual_hash_abi_pinned_before_other_files(self):
-        (self.root / "manifest.json").unlink()
-        self.assert_code("HASH_ABI_MISMATCH",
-                         lambda: b._read_bundle(self.path, self.layout, "sha256:" + "e" * 64))
-
-    def test_dataset_generation_and_layout_pin(self):
-        for field, value, code in (
-            ("dataset_id", "sha256:" + "0" * 64, "DATASET_MISMATCH"),
-            ("generation", fixture_module.uid(999), "GENERATION_MISMATCH"),
-            ("generation", "not-a-uuid", "INVALID_GENERATION"),
-            ("model_revision", "other-model", "MODEL_CONTRACT_MISMATCH"),
-        ):
-            with self.subTest(field=field, value=value):
-                self.write("launch.json", {**self.bundle, field: value})
-                self.assert_code(code)
-        self.write("launch.json", self.bundle)
-        self.layout.num_embeddings = (4, 5)
-        self.assert_code("INCOMPLETE_GENERATION")
-
-    def test_all_tensor_samples_required(self):
-        missing = copy.deepcopy(self.bundle)
-        missing["samples"].pop(next(iter(missing["samples"])))
-        self.write("launch.json", missing)
-        self.assert_code("INCOMPLETE_READ_SAMPLES")
-
-    def test_samples_require_exact_sorted_boundary_rows(self):
-        name = next(iter(self.samples))
-        for rows in ([0], [0, 2, 1], [0, True, 2], [0, 1, 1, 2]):
-            changed = copy.deepcopy(self.bundle)
-            changed["samples"][name]["row_ids"] = rows
-            self.write("launch.json", changed)
-            self.assert_code("INVALID_READ_SAMPLE")
-
-    def test_capability_set_must_match_allocations(self):
-        changed = dict(self.capabilities)
-        changed.pop(next(iter(changed)))
-        self.write("handles.json", changed)
-        self.assert_code("CAPABILITY_SET_MISMATCH")
-
-    def test_capability_encoding_is_bounded_and_strict(self):
-        key = next(iter(self.capabilities))
-        for encoded in ("", "?private-handle", "a" * 1025, 42):
-            self.write("handles.json", {**self.capabilities, key: encoded})
-            self.assert_code("INVALID_CAPABILITY_ENCODING")
-
-
-@unittest.skipIf(torch is None, "CPU PyTorch required; no GPU is used")
 class HashSemanticTest(unittest.TestCase):
     def test_real_hash_state_is_deterministic(self):
         self.assertEqual(b.hash_state_digest(real_hash_state()), b.hash_state_digest(real_hash_state()))
@@ -335,7 +165,7 @@ class AttachFailureTest(BundleFiles, unittest.TestCase):
         self.addCleanup(self.retain_patch.stop)
 
     def do_attach(self, device="cuda:2", environ=None):
-        return b.attach_from_bundle(self.path, layout=self.layout,
+        return b.attach_from_package(self.package, layout=self.layout,
                                     hash_state=self.hash_state, device=device,
                                     environ={} if environ is None else environ)
 
@@ -383,7 +213,6 @@ class AttachFailureTest(BundleFiles, unittest.TestCase):
         self.assertEqual(self.retained, [])  # Model-level success owns retention.
 
     def test_cpu_device_rejected_before_read_or_import(self):
-        self.path.unlink()
         with self.assertRaisesRegex(b.BootstrapError, "CUDA_DEVICE_REQUIRED"):
             self.do_attach("cpu")
         self.native_mock.assert_not_called()
@@ -397,8 +226,7 @@ class AttachFailureTest(BundleFiles, unittest.TestCase):
         self.attach_mock.assert_not_called()
 
     def test_missing_sample_rejected_before_native_import(self):
-        self.bundle["samples"].pop(next(iter(self.bundle["samples"])))
-        self.write("launch.json", self.bundle)
+        self.package["samples"].pop(next(iter(self.package["samples"])))
         with self.assertRaisesRegex(b.BootstrapError, "INCOMPLETE_READ_SAMPLES"):
             self.do_attach()
         self.attach_mock.assert_not_called()
@@ -434,8 +262,8 @@ class AttachFailureTest(BundleFiles, unittest.TestCase):
     def test_sample_callback_compares_bytes_and_synchronizes(self):
         validated = m.validate_for_attach(m.parse_manifest(self.manifest_raw),
                     m.ExpectedLayout(layers=tuple(zip(self.layout.layer_ids, self.layout.num_embeddings)),
-                                     head_dim=32, model_revision=self.bundle["model_revision"], hash_abi=self.abi),
-                    self.bundle["dataset_id"], self.bundle["generation"])
+                                     head_dim=32, model_revision=self.package["model_revision"], hash_abi=self.abi),
+                    self.package["dataset_id"], self.package["generation"])
         views, samples = {}, {}
         for spec in validated.manifest.tensors:
             view = torch.arange(spec.shape[0] * spec.shape[1], dtype=torch.int64).to(torch.uint8).reshape(spec.shape)

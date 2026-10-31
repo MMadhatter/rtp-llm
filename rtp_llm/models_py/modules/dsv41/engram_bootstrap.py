@@ -10,7 +10,6 @@ permanent process-lifetime pin; in-process detach is not supported.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import importlib
 import json
@@ -27,13 +26,34 @@ from .engram_capacity import CapacityError, capacity_from_environ
 
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_FILENAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
-_BUNDLE_FIELDS = frozenset((
-    "schema_version", "manifest", "manifest_sha256", "capabilities",
-    "dataset_id", "generation", "model_revision", "hash_abi", "samples",
-))
 _PROCESS_STORAGES = []
 _PROCESS_LOCK = threading.Lock()
+_STAGED_PACKAGE = None
+_STAGED_LOCK = threading.Lock()
+
+
+def stage_package(package):
+    """Hand the exchanged package to the model attach in this process.
+
+    The startup exchange and the model attach share one rank process, so the
+    package is passed in memory and never materialized as bundle files.
+    """
+    global _STAGED_PACKAGE
+    with _STAGED_LOCK:
+        if _STAGED_PACKAGE is not None and _STAGED_PACKAGE != package:
+            raise BootstrapError("PACKAGE_ALREADY_STAGED")
+        _STAGED_PACKAGE = package
+
+
+def staged_package():
+    with _STAGED_LOCK:
+        return _STAGED_PACKAGE
+
+
+def clear_staged_package():
+    global _STAGED_PACKAGE
+    with _STAGED_LOCK:
+        _STAGED_PACKAGE = None
 
 
 class BootstrapError(ValueError):
@@ -136,71 +156,6 @@ def hash_state_digest(hash_state):
     return "sha256:" + digest.hexdigest()
 
 
-def _read_bundle(path, layout, actual_hash_abi, *, limits=None):
-    limits = _configured_limits() if limits is None else limits
-    path = Path(path)
-    if not path.is_absolute():
-        raise BootstrapError("BUNDLE_PATH_MUST_BE_ABSOLUTE")
-    bundle = _json(_private_read(path, 2 << 20))
-    if type(bundle) is not dict or bundle.keys() != _BUNDLE_FIELDS:
-        raise BootstrapError("INVALID_BUNDLE_FIELDS")
-    if type(bundle["schema_version"]) is not int or bundle["schema_version"] != 1:
-        raise BootstrapError("UNSUPPORTED_BUNDLE_VERSION")
-    for key in ("manifest_sha256", "dataset_id", "hash_abi"):
-        if type(bundle[key]) is not str or not _DIGEST.fullmatch(bundle[key]):
-            raise BootstrapError("INVALID_BUNDLE_DIGEST")
-    if bundle["hash_abi"] != actual_hash_abi:
-        raise BootstrapError("HASH_ABI_MISMATCH")
-    try:
-        if str(UUID(bundle["generation"])) != bundle["generation"]:
-            raise ValueError()
-    except (ValueError, TypeError, AttributeError):
-        raise BootstrapError("INVALID_GENERATION") from None
-    for key in ("manifest", "capabilities"):
-        if type(bundle[key]) is not str or not _FILENAME.fullmatch(bundle[key]):
-            raise BootstrapError("INVALID_BUNDLE_FILENAME")
-    if len({path.name, bundle["manifest"], bundle["capabilities"]}) != 3:
-        raise BootstrapError("BOOTSTRAP_FILES_MUST_DIFFER")
-    expected = ExpectedLayout(layers=tuple(zip(layout.layer_ids, layout.num_embeddings)),
-                              head_dim=layout.head_dim, model_revision=bundle["model_revision"],
-                              hash_abi=actual_hash_abi)
-    raw = _private_read(path.parent / bundle["manifest"], limits.max_manifest_bytes)
-    if _digest(raw) != bundle["manifest_sha256"]:
-        raise BootstrapError("MANIFEST_DIGEST_MISMATCH")
-    validated = validate_for_attach(parse_manifest(raw, limits), expected,
-                                    bundle["dataset_id"], bundle["generation"], limits)
-    samples = bundle["samples"]
-    names = {tensor.name for tensor in validated.manifest.tensors}
-    if type(samples) is not dict or samples.keys() != names:
-        raise BootstrapError("INCOMPLETE_READ_SAMPLES")
-    for tensor in validated.manifest.tensors:
-        sample = samples[tensor.name]
-        required_rows = sorted({0, tensor.shape[0] // 2, tensor.shape[0] - 1} |
-                      {row for part in tensor.shards for row in (part.row_begin, part.row_end - 1)})
-        if (type(sample) is not dict or sample.keys() != {"row_ids", "sha256"}
-                or type(sample["row_ids"]) is not list
-                or any(type(row) is not int for row in sample["row_ids"])
-                or sample["row_ids"] != required_rows
-                or type(sample["sha256"]) is not str or not _DIGEST.fullmatch(sample["sha256"])):
-            raise BootstrapError("INVALID_READ_SAMPLE")
-    capabilities = _json(_private_read(path.parent / bundle["capabilities"], 256 << 10))
-    allocation_ids = {shard.allocation_id for tensor in validated.manifest.tensors
-                      for shard in tensor.shards}
-    if type(capabilities) is not dict or capabilities.keys() != allocation_ids:
-        raise BootstrapError("CAPABILITY_SET_MISMATCH")
-    handles = {}
-    for allocation_id, value in capabilities.items():
-        if type(value) is not str or not 0 < len(value) <= 1024:
-            raise BootstrapError("INVALID_CAPABILITY_ENCODING")
-        try:
-            handles[allocation_id] = base64.b64decode(value, validate=True)
-        except ValueError:
-            raise BootstrapError("INVALID_CAPABILITY_ENCODING") from None
-        if not handles[allocation_id]:
-            raise BootstrapError("INVALID_CAPABILITY_ENCODING")
-    return bundle, raw, expected, handles
-
-
 def _load_native():
     try:
         return importlib.import_module("engram_native_dev_492ecf45")
@@ -221,19 +176,27 @@ def _verify_samples(views, validated, samples, device):
     return True
 
 
-def attach_from_bundle(bundle_path, *, layout, hash_state, device, environ=None):
-    """Validate the model's real layout/hash, map once and verify before READY."""
+def _attach_validated(raw, dataset_id, generation, model_revision, handles, samples,
+                      *, layout, hash_state, device, environ=None):
+    """Shared attach tail: validate, map once and verify before READY."""
     import torch
 
     target = torch.device(device)
     if target.type != "cuda":
         raise BootstrapError("CUDA_DEVICE_REQUIRED")
     limits = _configured_limits(environ)
-    bundle, raw, expected, handles = _read_bundle(
-        bundle_path, layout, hash_state_digest(hash_state), limits=limits)
+    actual_hash_abi = hash_state_digest(hash_state)
+    expected = ExpectedLayout(
+        layers=tuple(zip(layout.layer_ids, layout.num_embeddings)),
+        head_dim=layout.head_dim, model_revision=model_revision,
+        hash_abi=actual_hash_abi)
     ordinal = target.index if target.index is not None else torch.cuda.current_device()
     # Reject an older/smaller bridge before importing even the first allocation.
-    manifest = parse_manifest(raw, limits)
+    parsed = parse_manifest(raw, limits)
+    if parsed.hash_abi != actual_hash_abi:
+        raise BootstrapError("HASH_ABI_MISMATCH")
+    validated = validate_for_attach(parsed, expected, dataset_id, generation, limits)
+    manifest = validated.manifest
     from .engram_shard_config import ShardConfig
     ShardConfig.from_environ(environ, inferred_count=len(manifest.tensors[0].shards)).validate_manifest(manifest)
     native = _load_native()
@@ -244,15 +207,15 @@ def attach_from_bundle(bundle_path, *, layout, hash_state, device, environ=None)
         raise BootstrapError("NATIVE_ALLOCATION_LIMIT")
     try:
         storage = FabricEngramStorage.attach(
-            raw, expected_layout=expected, dataset_id=bundle["dataset_id"],
-            generation=bundle["generation"], handles=handles, device=ordinal,
+            raw, expected_layout=expected, dataset_id=dataset_id,
+            generation=generation, handles=handles, device=ordinal,
             native=native, limits=limits)
     except CleanupPendingError as error:
         retain_for_process(error.resource)
         raise
     del handles
     try:
-        storage.verify(lambda views, verified: _verify_samples(views, verified, bundle["samples"], target))
+        storage.verify(lambda views, verified: _verify_samples(views, verified, samples, target))
         return storage
     except BaseException as original:
         try:
@@ -261,3 +224,54 @@ def attach_from_bundle(bundle_path, *, layout, hash_state, device, environ=None)
             retain_for_process(storage)
             raise CleanupPendingError("external Engram verification cleanup incomplete", storage) from original
         raise
+
+
+_PACKAGE_FIELDS = frozenset((
+    "raw", "dataset_id", "generation", "model_revision", "capabilities", "samples",
+))
+
+
+def attach_from_package(package, *, layout, hash_state, device, environ=None):
+    """Attach from an in-memory startup package. Serving never reads bundle files."""
+    if type(package) is not dict or set(package) != _PACKAGE_FIELDS:
+        raise BootstrapError("INVALID_PACKAGE")
+    raw = package["raw"]
+    if type(raw) is not bytes or not raw:
+        raise BootstrapError("INVALID_PACKAGE")
+    for key in ("dataset_id", "generation", "model_revision"):
+        if type(package[key]) is not str or not package[key]:
+            raise BootstrapError("INVALID_PACKAGE")
+    if not _DIGEST.fullmatch(package["dataset_id"]):
+        raise BootstrapError("INVALID_PACKAGE_DIGEST")
+    try:
+        if str(UUID(package["generation"])) != package["generation"]:
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError):
+        raise BootstrapError("INVALID_GENERATION") from None
+    limits = _configured_limits(environ)
+    manifest = parse_manifest(raw, limits)
+    names = {tensor.name for tensor in manifest.tensors}
+    samples = package["samples"]
+    if type(samples) is not dict or samples.keys() != names:
+        raise BootstrapError("INCOMPLETE_READ_SAMPLES")
+    for tensor in manifest.tensors:
+        sample = samples[tensor.name]
+        required = sorted({0, tensor.shape[0] // 2, tensor.shape[0] - 1} |
+                          {row for part in tensor.shards for row in (part.row_begin, part.row_end - 1)})
+        if (type(sample) is not dict or sample.keys() != {"row_ids", "sha256"}
+                or type(sample["row_ids"]) is not list
+                or any(type(row) is not int for row in sample["row_ids"])
+                or sample["row_ids"] != required
+                or type(sample["sha256"]) is not str or not _DIGEST.fullmatch(sample["sha256"])):
+            raise BootstrapError("INVALID_READ_SAMPLE")
+    capabilities = package["capabilities"]
+    allocation_ids = {shard.allocation_id for tensor in manifest.tensors for shard in tensor.shards}
+    if type(capabilities) is not dict or capabilities.keys() != allocation_ids:
+        raise BootstrapError("CAPABILITY_SET_MISMATCH")
+    for value in capabilities.values():
+        if type(value) is not bytes or not 0 < len(value) <= 1024:
+            raise BootstrapError("INVALID_CAPABILITY_ENCODING")
+    return _attach_validated(
+        raw, package["dataset_id"], package["generation"], package["model_revision"],
+        capabilities, samples,
+        layout=layout, hash_state=hash_state, device=device, environ=environ)

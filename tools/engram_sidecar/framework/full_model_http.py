@@ -35,7 +35,10 @@ TEXT_FIELDS = ("num_hidden_layers", "hidden_size", "vocab_size", "num_attention_
                "engram_n_heads", "engram_head_dim", "engram_compressed_vocab_size",
                "engram_pad_token_id", "engram_vocab_size")
 STORAGE_MODES = ("external-egm", "local-pinned")
-EXTERNAL_ENV = ("RTP_ENGRAM_EXTERNAL_BUNDLE", "RTP_ENGRAM_GRAPH_MODE",
+EXTERNAL_ENV = ("RTP_ENGRAM_COHORT", "RTP_ENGRAM_INSTANCE_INDEX", "RTP_ENGRAM_MODEL_REVISION",
+                "RTP_ENGRAM_LOCAL_DESCRIPTORS", "RTP_ENGRAM_COHORT_TIMEOUT",
+                "RTP_ENGRAM_TLS_DIR", "RTP_ENGRAM_CHECKPOINT", "ENGRAM_SHARD_COUNT",
+                "RTP_ENGRAM_GRAPH_MODE",
                 "RTP_ENGRAM_MAX_ALLOCATION_BYTES", "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES")
 
 
@@ -208,8 +211,10 @@ def launch_environment(args, inherited=None):
     storage_mode = getattr(args, "storage_mode", "external-egm")
     if storage_mode not in STORAGE_MODES:
         raise ValueError("invalid storage mode")
-    for key in EXTERNAL_ENV:
-        env.pop(key, None)
+    if storage_mode == "local-pinned":
+        # A local run must never inherit a static cohort contract by accident.
+        for key in EXTERNAL_ENV:
+            env.pop(key, None)
     # Dedicated test slice: no inherited service discovery, drafts, truncation,
     # or model overrides. Driver/library/device visibility remains operator set.
     for key in ("MODEL_SERVICE_CONFIG", "REMOTE_RPC_SERVER_IP", "REMOTE_VIT_SERVER_IP",
@@ -242,35 +247,22 @@ def launch_environment(args, inherited=None):
         "PYTHONPATH": str(REPO) + os.pathsep + env.get("PYTHONPATH", ""),
     })
     if storage_mode == "external-egm":
-        env.update({"RTP_ENGRAM_EXTERNAL_BUNDLE": str(args.bundle),
-                    "RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(args.max_allocation_bytes),
+        # The cohort contract comes from RTP_ENGRAM_* in the caller's environment;
+        # serving no longer consumes bundle files.
+        env.update({"RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(args.max_allocation_bytes),
                     "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": str(args.budget_bytes),
                     "RTP_ENGRAM_GRAPH_MODE": "process_lifetime" if cuda_graph else "eager"})
     return env
 
 
-def bundle_limits(args):
-    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _configured_limits
+def cohort_preflight(args):
+    """Validate the static cohort inputs that the serving path consumes."""
+    from rtp_llm.models_py.modules.dsv41.engram_startup import build_group
 
-    return _configured_limits({
-        "RTP_ENGRAM_MAX_ALLOCATION_BYTES": str(args.max_allocation_bytes),
-        "RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES": str(args.budget_bytes),
-    })
-
-
-def verify_bundle(args):
-    from rtp_llm.models_py.modules.dsv41.engram import EngramLayout, NgramHashState
-    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _read_bundle, hash_state_digest
-    from tools.engram_sidecar.framework.checkpoint_support import read_source
-
-    source = read_source(checkpoint=args.checkpoint, model_revision=args.model_revision)
-    layout = EngramLayout(source.config)
-    actual = hash_state_digest(NgramHashState(layout, str(args.checkpoint)))
-    bundle, _, _, handles = _read_bundle(args.bundle, layout, actual, limits=bundle_limits(args))
-    del handles
-    if bundle["model_revision"] != args.model_revision:
-        raise ValueError("operator checkpoint revision differs from Owner bundle")
-    return {key: bundle[key] for key in ("dataset_id", "generation", "model_revision", "hash_abi")}
+    config = build_group(os.environ, args.world_size if hasattr(args, "world_size") else 1)
+    if config is None:
+        raise ValueError("external-egm requires RTP_ENGRAM_COHORT in the environment")
+    return {key: config["group"][key] for key in ("generation", "model_revision")}
 
 
 def chat_payload(*, max_tokens=32):
@@ -325,13 +317,11 @@ def main(argv=None):
     report["storage_mode"] = args.storage_mode
     report["model_revision"] = args.model_revision
     if args.storage_mode == "external-egm":
-        if args.bundle is None or not args.bundle.is_absolute():
-            parser.error("absolute bundle required for external-egm")
         from rtp_llm.models_py.modules.dsv41.engram_capacity import validate_capacity
         validate_capacity(args.max_allocation_bytes, args.budget_bytes)
         os.environ["RTP_ENGRAM_MAX_ALLOCATION_BYTES"] = str(args.max_allocation_bytes)
         os.environ["RTP_ENGRAM_MAX_TOTAL_ALLOCATION_BYTES"] = str(args.budget_bytes)
-        report["bundle"] = verify_bundle(args)
+        report["cohort"] = cohort_preflight(args)
     elif args.bundle is not None:
         parser.error("local-pinned must not supply an external bundle")
     # Public reproducibility record: never include capabilities or inherited

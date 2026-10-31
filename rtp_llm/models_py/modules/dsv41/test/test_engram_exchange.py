@@ -9,6 +9,7 @@ import time
 import unittest
 from uuid import UUID
 
+from rtp_llm.models_py.modules.dsv41 import engram_bootstrap as b
 from rtp_llm.models_py.modules.dsv41 import engram_exchange as e
 from rtp_llm.models_py.modules.dsv41 import engram_startup as s
 from rtp_llm.models_py.modules.dsv41.engram_shard import plan_shards
@@ -45,6 +46,42 @@ def samples(_, manifest):
 
 def package(group, docs):
     return s.assemble_package(group, docs, None, samples=samples)
+
+
+def cohort_env(p, instances=1, index=0, timeout=3):
+    return {
+        s.COHORT_ENV: ','.join(f'127.0.0.1:{29500 + i}' for i in range(instances)),
+        s.INDEX_ENV: str(index),
+        s.REVISION_ENV: 'test-revision',
+        s.COUNT_ENV: str(p),
+        s.TIMEOUT_ENV: str(timeout),
+        s.CHECKPOINT_ENV: '/tmp/checkpoint',
+    }
+
+
+def derived(env, world_size):
+    """Descriptors whose host identity matches the group derived from env."""
+    config = s.build_group(env, world_size)
+    group = config['group']
+    p = sum(len(m['shards']) for m in group['members'])
+    plan = plan_shards(p * 4096 - 7, 64, p, granularity=4096)
+    hosts = {sh['index']: sh['host_id'] for m in group['members'] for sh in m['shards']}
+    docs = []
+    for index in range(p):
+        begin, end = plan.row_range(index)
+        tensors = {}
+        for role, width, size in [('weight', 64, plan.weight_bytes), ('scale', 2, plan.scale_bytes)]:
+            aid = str(UUID(int=1000 + 2 * index + (role == 'scale')))
+            tensors['layers.1.engram.embed.' + role] = dict(
+                shape=[plan.total_rows, width], row_begin=begin, row_end=end,
+                allocation_bytes=size, allocation_granularity=4096,
+                logical_bytes=(end - begin) * width, allocation_id=aid,
+                sha256='sha256:' + 'a' * 64, handle=base64.b64encode(aid.encode()).decode())
+        docs.append(dict(schema_version=2, shard=index, shards=p,
+            generation=group['generation'], model_revision=group['model_revision'],
+            hash_abi='sha256:' + 'b' * 64, host_id=hosts[index], owner_id=hosts[index],
+            owner_incarnation=str(UUID(int=200 + index)), tensors=tensors))
+    return config, docs
 
 
 class GroupTest(unittest.TestCase):
@@ -129,17 +166,18 @@ class GroupTest(unittest.TestCase):
             with self.assertRaisesRegex(e.ExchangeError, 'INVALID_GENERATION'):
                 e.validate_group(group)
 
-    def test_private_local_cache_and_full_identity_checks(self):
-        group, docs = fixture(); payload = package(group, docs)
-        with tempfile.TemporaryDirectory() as directory:
-            bundle = Path(s.materialize_package(group, payload, directory))
-            self.assertEqual(bundle.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(bundle.parent.stat().st_mode & 0o777, 0o700)
-            for name in ('manifest.json', 'capabilities.json'):
-                self.assertEqual((bundle.parent / name).stat().st_mode & 0o777, 0o600)
+    def test_memory_package_and_full_identity_checks(self):
+        env = cohort_env(2)
+        config, docs = derived(env, world_size=2)
+        payload = package(config['group'], docs)
+        memory = s.to_memory_package(config['group'], payload)
+        self.assertEqual(set(memory), {'raw', 'dataset_id', 'generation',
+                                       'model_revision', 'capabilities', 'samples'})
+        self.assertIsInstance(memory['raw'], bytes)
+        self.assertTrue(all(isinstance(v, bytes) and v for v in memory['capabilities'].values()))
         changed = deepcopy(payload); changed['capabilities'].pop(next(iter(changed['capabilities'])))
-        with self.assertRaisesRegex(e.ExchangeError, 'CAPABILITIES'): s.verify_package(group, changed)
-        changed_group = deepcopy(group); changed_group['generation'] = str(UUID(int=999))
+        with self.assertRaisesRegex(e.ExchangeError, 'CAPABILITIES'): s.verify_package(config['group'], changed)
+        changed_group = deepcopy(config['group']); changed_group['generation'] = str(UUID(int=999))
         with self.assertRaisesRegex(e.ExchangeError, 'IDENTITY'): s.verify_package(changed_group, payload)
 
 
@@ -163,53 +201,62 @@ class MemoryStore:
 
 
 class IntraInstanceTest(unittest.TestCase):
+    def tearDown(self):
+        b.clear_staged_package()
+
+    def _descriptor_env(self, env, docs, directory):
+        root = Path(directory)
+        paths = []
+        for doc in docs:
+            path = root / str(doc['shard'])
+            path.write_bytes(e.encode(doc))
+            path.chmod(0o600)
+            paths.append(str(path))
+        env[s.DESCRIPTORS_ENV] = ','.join(paths)
+        return env
+
     def test_only_rank_zero_exchanges_and_all_ranks_receive_identical_backing(self):
-        group, docs = fixture(1, 2, 4)
+        env = cohort_env(2)
+        config, docs = derived(env, world_size=4)
         store = MemoryStore(); calls = []
-        def exchange(config, local, deadline):
+        def exchange(cfg, local, deadline):
             calls.append(local)
-            return package(group, local)
+            return package(cfg['group'], local)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            local = {}
-            for doc in docs:
-                path = root / str(doc['shard']); path.write_bytes(e.encode(doc)); path.chmod(0o600)
-                local[str(doc['shard'])] = str(path)
-            config = dict(group=group, instance_id='i0', local_descriptors=local, timeout_seconds=3, cache_directory=directory)
-            path = root / 'config.json'; path.write_bytes(e.encode(config)); path.chmod(0o600)
-            envs = [{s.CONFIG_ENV: str(path)} for _ in range(4)]
+            self._descriptor_env(env, docs, directory)
+            envs = [dict(env) for _ in range(4)]
             with ThreadPoolExecutor(4) as pool:
-                futures = [pool.submit(s.prepare_static_engram, store, rank=i, world_size=4, environ=envs[i], leader_exchange=exchange) for i in range(4)]
-                bundles = [f.result() for f in futures]
+                futures = [pool.submit(s.prepare_static_engram, store, rank=i, world_size=4,
+                                       environ=envs[i], leader_exchange=exchange) for i in range(4)]
+                results = [f.result() for f in futures]
             self.assertEqual(len(calls), 1)
-            caps = [Path(p).parent.joinpath('capabilities.json').read_bytes() for p in bundles]
-            self.assertTrue(all(c == caps[0] for c in caps))
+            self.assertTrue(all(r is None for r in results))
             self.assertEqual(store.data, {})
-            self.assertTrue(all(env['ENGRAM_SHARD_COUNT'] == '2' for env in envs))
+            self.assertTrue(all(item['ENGRAM_SHARD_COUNT'] == '2' for item in envs))
+            staged = b.staged_package()
+            self.assertIsNotNone(staged)
+            self.assertEqual(staged['generation'], config['group']['generation'])
+            # Serving must not materialize any bundle files.
+            self.assertEqual(list(Path(directory).glob('**/*.json')), [])
 
     def test_bad_p_fails_before_any_store_side_effect(self):
-        group, _ = fixture(1, 2, 2)
         store = MemoryStore()
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'config.json'
-            path.write_bytes(e.encode(dict(group=group, instance_id='i0')))
-            path.chmod(0o600)
-            with self.assertRaisesRegex(e.ExchangeError, 'STORAGE_HOST_COUNT_MISMATCH'):
-                s.prepare_static_engram(store, rank=0, world_size=2,
-                    environ={s.CONFIG_ENV: str(path), 'ENGRAM_SHARD_COUNT': '3'})
+        env = cohort_env(2)
+        env[s.COUNT_ENV] = '1'
+        with self.assertRaisesRegex(ValueError, 'STORAGE_HOST_COUNT'):
+            s.prepare_static_engram(store, rank=0, world_size=2, environ=env)
         self.assertEqual(store.data, {})
 
     def test_inconsistent_worker_group_never_publishes_package(self):
-        group, _ = fixture(1, 2, 2)
+        env = cohort_env(2, timeout=0.2)
+        config, docs = derived(env, world_size=2)
         store = MemoryStore()
-        prefix = 'engram/' + group['generation'] + '/i0/'
+        prefix = 'engram/' + config['group']['generation'] + '/i0/'
         store.set(prefix + 'config/1', b'wrong-group')
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'config.json'
-            path.write_bytes(e.encode(dict(group=group, instance_id='i0', timeout_seconds=0.1)))
-            path.chmod(0o600)
+            self._descriptor_env(env, docs, directory)
             with self.assertRaisesRegex(e.ExchangeError, 'INSTANCE_GROUP_CONFIG_MISMATCH'):
-                s.prepare_static_engram(store, rank=0, world_size=2, environ={s.CONFIG_ENV: str(path)})
+                s.prepare_static_engram(store, rank=0, world_size=2, environ=env)
         self.assertNotIn(prefix + 'package', store.data)
 
     def test_unconfigured_models_do_nothing(self):

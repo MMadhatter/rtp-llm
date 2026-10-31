@@ -9,7 +9,7 @@ import unittest
 from uuid import UUID
 from types import SimpleNamespace as NS
 
-from tools.engram_sidecar.framework.sharded_bundle import build_manifest, read_shards
+from rtp_llm.models_py.modules.dsv41.engram_descriptors import build_manifest, validate_documents
 from tools.engram_sidecar.framework.sharded_checkpoint_owner import validate_local_budget
 from tools.engram_sidecar.framework.distributed_plan import render_plan
 from rtp_llm.models_py.modules.dsv41.engram_shard import plan_shards
@@ -45,6 +45,13 @@ def descriptors(p=3, dim=64):
 
 def build(docs):
     return build_manifest(docs, len(docs), GEN, 'revision', HASH)
+
+
+def read_shards(paths, shards, generation):
+    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _json, _private_read
+
+    documents = [_json(_private_read(Path(path), 1 << 20)) for path in paths]
+    return validate_documents(documents, shards, generation)
 
 
 class DistributedDescriptorTest(unittest.TestCase):
@@ -150,8 +157,10 @@ class LaunchPlanTest(unittest.TestCase):
         return dict(instance_count=instances, storage_host_count=p, generation=GEN, checkpoint='/model',
             model_revision='revision', publication_root='/run/engram',
             storage_hosts=[dict(host_id=f'h{i}', device=0, numa=0) for i in range(p)],
-            instances=[dict(instance_id=f'i{i}', hosts=[f'h{j}' for j in range(p) if j % instances == i])
-                       for i in range(instances)])
+            instances=[dict(instance_id=f'i{i}', ip=f'127.0.0.{i + 1}',
+                            hosts=[f'h{j}' for j in range(p) if j % instances == i])
+                       for i in range(instances)],
+            exchange=dict(coordinator=dict(host='127.0.0.1', port=19780)))
 
     def test_p_independent_of_instance_worker_count(self):
         for p in (2, 3, 5):
@@ -162,9 +171,11 @@ class LaunchPlanTest(unittest.TestCase):
                 self.assertTrue(all(c['held_shards'] for c in plan['consumers']))
                 self.assertEqual(len(plan['holders']), p)
                 self.assertEqual(len(plan['consumers']), instances)
-                bundles = {c['env']['RTP_ENGRAM_EXTERNAL_BUNDLE'] for c in plan['consumers']}
-                self.assertEqual(len(bundles), 1)
+                cohorts = {c['env']['RTP_ENGRAM_COHORT'] for c in plan['consumers']}
+                self.assertEqual(len(cohorts), 1)
+                self.assertEqual(len(cohorts.pop().split(',')), instances)
                 self.assertTrue(all(c['env']['ENGRAM_SHARD_COUNT'] == str(p) for c in plan['consumers']))
+                self.assertTrue(all('RTP_ENGRAM_EXTERNAL_BUNDLE' not in c['env'] for c in plan['consumers']))
 
     def test_reject_missing_or_duplicate_host(self):
         for kind in ('duplicate', 'missing', 'p1', 'invalid_device'):
@@ -207,24 +218,24 @@ class LaunchPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'must contain'):
             render_plan(config)
 
-    def test_rpc_plan_uses_only_leaders_and_no_offline_bundle(self):
+    def test_rpc_plan_emits_env_only(self):
         config = self.config(4, 2)
-        for instance in config['instances']: instance['local_world_size'] = 4
-        config['exchange'] = dict(coordinator=dict(host='127.0.0.1', port=19780),
-                                 tls={f'i{i}': {'certificate_fixture': True} for i in range(2)})
         plan = render_plan(config)
-        self.assertIsNone(plan['coordinator_argv'])
-        self.assertEqual(len(plan['startup_configs']), 2)
-        for consumer in plan['consumers']:
-            self.assertNotIn('RTP_ENGRAM_EXTERNAL_BUNDLE', consumer['env'])
-            self.assertIn('RTP_ENGRAM_STATIC_GROUP_CONFIG', consumer['env'])
-            member = next(m for m in plan['startup_configs'][consumer['instance_id']]['group']['members']
-                          if m['instance_id'] == consumer['instance_id'])
-            self.assertEqual(member['world_size'], 8)
-            self.assertEqual([s['publisher_rank'] for s in member['shards']], [0, 4])
+        self.assertNotIn('coordinator_argv', plan)
+        self.assertNotIn('startup_configs', plan)
+        for index, consumer in enumerate(plan['consumers']):
+            env = consumer['env']
+            self.assertNotIn('RTP_ENGRAM_EXTERNAL_BUNDLE', env)
+            self.assertNotIn('RTP_ENGRAM_STATIC_GROUP_CONFIG', env)
+            self.assertEqual(env['RTP_ENGRAM_INSTANCE_INDEX'], str(index))
+            self.assertEqual(env['RTP_ENGRAM_COHORT'], '127.0.0.1:19780,127.0.0.2:19780')
+            self.assertEqual(env['RTP_ENGRAM_MODEL_REVISION'], 'revision')
+            self.assertEqual(env['RTP_ENGRAM_CHECKPOINT'], '/model')
+            self.assertEqual(len(env['RTP_ENGRAM_LOCAL_DESCRIPTORS'].split(',')),
+                             len(consumer['held_shards']))
 
-    def test_rpc_plan_requires_complete_topology_and_tls(self):
-        config = self.config(); config['exchange'] = {}
-        with self.assertRaisesRegex(ValueError, 'local_world_size'): render_plan(config)
-        for member in config['instances']: member['local_world_size'] = 1
-        with self.assertRaisesRegex(ValueError, 'TLS'): render_plan(config)
+    def test_rpc_plan_requires_coordinator(self):
+        config = self.config()
+        config['exchange'] = {}
+        with self.assertRaisesRegex(ValueError, 'coordinator'):
+            render_plan(config)

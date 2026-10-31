@@ -44,7 +44,7 @@ flowchart TB
 {
   "instance_count": 2,
   "storage_host_count": 4,
-  "generation": "由本次组启动统一生成的 UUID",
+  "generation": "本次组启动统一生成的 UUID（用于 holder 发布目录命名）",
   "checkpoint": "/models/DeepSeek",
   "model_revision": "不可变模型版本",
   "publication_root": "/run/engram",
@@ -55,29 +55,31 @@ flowchart TB
     {"host_id":"host-D","device":0,"numa":0}
   ],
   "instances": [
-    {"instance_id":"i0","hosts":["host-A","host-B"],"local_world_size":4},
-    {"instance_id":"i1","hosts":["host-C","host-D"],"local_world_size":4}
+    {"instance_id":"i0","ip":"10.0.0.1","hosts":["host-A","host-B"]},
+    {"instance_id":"i1","ip":"10.0.0.2","hosts":["host-C","host-D"]}
   ],
   "exchange": {
-    "coordinator":{"host":"实例 i0 的 rank 0 可达 IP","port":29483},
-    "timeout_seconds":1800,
-    "tls": {
-      "i0": {
-        "ca_file":"/run/engram/pki/ca.pem",
-        "cert_file":"/run/engram/pki/member-0.pem",
-        "key_file":"/run/engram/pki/member-0.key",
-        "instance_cert_sha256":{"i0":"i0 证书 DER SHA256，64 位小写 hex","i1":"i1 证书 DER SHA256"}
-      },
-      "i1": {
-        "ca_file":"/run/engram/pki/ca.pem",
-        "cert_file":"/run/engram/pki/member-1.pem",
-        "key_file":"/run/engram/pki/member-1.key",
-        "instance_cert_sha256":{"i0":"同上","i1":"同上"}
-      }
-    }
+    "coordinator": {"host": "10.0.0.1", "port": 29483},
+    "timeout_seconds": 1800,
+    "tls_dir": "/run/engram/pki"
   }
 }
 ```
+
+`distributed_plan.py` 不再生成任何 JSON 启动配置；它把契约直接写进每个实例的 `consumers[].env`：
+
+```
+RTP_ENGRAM_COHORT=10.0.0.1:29483,10.0.0.2:29483   # N 个实例端点，顺序=实例索引
+RTP_ENGRAM_INSTANCE_INDEX=0                        # 本实例索引
+ENGRAM_SHARD_COUNT=4                               # P
+RTP_ENGRAM_MODEL_REVISION=<rev>
+RTP_ENGRAM_LOCAL_DESCRIPTORS=<shard-a.json>,<shard-b.json>   # 本实例每个本地 host 一个
+RTP_ENGRAM_CHECKPOINT=/models/DeepSeek
+RTP_ENGRAM_COHORT_TIMEOUT=1800                     # 可选
+RTP_ENGRAM_TLS_DIR=/run/engram/pki                 # 可选；不设则走 plain HTTP
+```
+
+`generation`、`instance_id`、shard 分配和 `publisher_rank` 全部由这些输入确定性推导，不需要分发 UUID 或成员表。
 
 上面是字段示例，文字占位符需要替换。`hosts` 顺序必须与实际 WORLD_RANK 分配一致：host index × local_world_size 对应本 host 的发布者 rank。每个实例允许不同 local_world_size，但目前同一实例内部使用一致的 local_world_size。
 
@@ -98,7 +100,7 @@ P 可配置为 2–64，N 为 1–64。每个实例至少持有一个分片；�
    ```
 
 4. 读取 `launch-plan.json`，在对应 host 启动每条 `holders[].argv`。这是容器内的分片持有进程，不是新 sidecar。启动器负责保活和组退出顺序。
-5. 将生成的 `startup-0.json` / `startup-1.json` 分发给对应实例的所有 host，放在各自 `consumers[].env.RTP_ENGRAM_STATIC_GROUP_CONFIG` 指定路径。目录私有，文件由 RTP 用户持有且权限 0600。分发的是启动配置，**无需人工收集/复制 Fabric handle**。
+5. 把 `consumers[].env` 里的 `RTP_ENGRAM_*` 设到对应实例的所有 host 环境里。**无需人工收集/复制 Fabric handle，也不需要分发任何启动配置文件**。
 6. 对每个实例设置 `consumers[].env` 后启动原有 RTP 命令。`BackendManager.start()` 在 DistributedServer 就绪后、NCCL/模型创建前调用 `prepare_static_engram()`。
 7. 启动适配器等待本机 holder 的 descriptor，经现有 Store 汇集到 rank 0；跨实例自动交换完整元数据；所有 worker 自动生成私有本地缓存并沿现有 bootstrap 导入、GPU 样本校验，再进行模型 warmup/Graph。
 8. 模型自身 ready 后才接流量。交换完成仅表示元数据齐备，不等于所有 GPU/模型已 ready。
@@ -124,7 +126,7 @@ python3 -m tools.engram_sidecar.framework.make_exchange_test_certs \
 - 同一实例相同提交可幂等；不同内容重报拒绝。缺成员、慢成员、缺 ACK、组不一致、TLS 失败均有超时/拒绝路径，不自动降低 N/P。
 - 协调者从本地 checkpoint 计算每片边界和全局中间行的样本摘要；GPU import 后真实读取并比对。此样本校验不等于每个消费者重算完整权重 hash。
 - JSON 有大小上限，不用 pickle，不记录 capability/私钥。Store 复用现有实例信任边界，前缀隔离不是新增认证机制。
-- 每个 worker 生成一个 0700 临时目录，内部 manifest/capabilities/bundle 为 0600。它是自动生成的启动缓存；在线不读取文件。缓存仍包含能力信息，不应提交日志或 Git；进程退出后由启动器清理。
+- 交换结果以内存 package 形式交给模型 attach（`engram_bootstrap.stage_package`），**服务路径不写任何 bundle 文件**，因此没有临时目录、没有 capability 落盘、也没有清理责任。
 - ACK 完成后清理本次 Store 元数据。任何失败都不能据此释放 backing：必须先停同组全部模型 worker、排空 GPU/Graph，再停止 holder。
 
 ## 代码入口
@@ -133,7 +135,7 @@ python3 -m tools.engram_sidecar.framework.make_exchange_test_certs \
 - `engram_startup.py`：已有 Store 汇集/广播、rank 0 交换、本地缓存。
 - `engram_descriptors.py`：RPC 和离线工具共用同一分片校验。
 - `rtp_llm/server/backend_manager.py`：模型创建前的启动钩子；未设置环境变量时立即跳过。
-- `distributed_plan.py`：生成 holder 命令、启动配置和环境变量；离线 bundle 模式仍供诊断使用。
+- `distributed_plan.py`：生成 holder 命令和 `RTP_ENGRAM_*` 环境变量；离线 bundle 模式已移除。
 - `native/probe_static_exchange_cuda.py`：双 host、双实例、每实例两个 worker 的真实 CUDA 集成探针。
 
 ## 测试与已知限制

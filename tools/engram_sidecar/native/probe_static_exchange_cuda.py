@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 from rtp_llm.models_py.modules.dsv41.engram_exchange import encode
-from rtp_llm.models_py.modules.dsv41.engram_startup import CONFIG_ENV, prepare_static_engram
+from rtp_llm.models_py.modules.dsv41.engram_startup import prepare_static_engram
 
 HASH = 'sha256:' + 'b' * 64
 
@@ -33,10 +33,11 @@ def private_write(path, value):
         stream.write(encode(value))
 
 
-def worker(rank, config_path, store_port, rows, device):
+def worker(rank, env, store_port, rows, device):
     import torch
     from torch.distributed import TCPStore
-    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _read_bundle, _verify_samples, _load_native
+    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import staged_package, _verify_samples, _load_native
+    from rtp_llm.models_py.modules.dsv41.engram_manifest import ExpectedLayout
     from rtp_llm.models_py.modules.dsv41.engram_storage import FabricEngramStorage
     from rtp_llm.models_py.modules.dsv41.engram_shard_storage import CudaDriverOps
 
@@ -51,21 +52,22 @@ def worker(rank, config_path, store_port, rows, device):
             if counter:
                 setattr(self, counter, getattr(self, counter) + 1)
             return value
-    config = json.loads(Path(config_path).read_bytes())
     torch.cuda.set_device(device)
     native = _load_native()
     baseline = native.resource_counters()
     store = TCPStore('127.0.0.1', store_port, 2, rank == 0, timedelta(seconds=120))
-    env = {CONFIG_ENV: config_path}
     started = time.monotonic()
-    bundle_path = prepare_static_engram(store, rank=rank, world_size=2, environ=env)
+    prepare_static_engram(store, rank=rank, world_size=2, environ=env)
     startup_ms = (time.monotonic() - started) * 1000
+    package = staged_package()
+    if package is None:
+        raise RuntimeError('startup exchange did not stage a package')
     # Test oracle only: prove graph replay does not require a live RPC listener.
-    address = config['coordinator']
+    host, port = env['RTP_ENGRAM_COHORT'].split(',')[0].rsplit(':', 1)
     deadline = time.monotonic() + 10
     while True:
         try:
-            with socket.create_connection((address['host'], address['port']), timeout=0.2):
+            with socket.create_connection((host, int(port)), timeout=0.2):
                 pass
         except OSError:
             break
@@ -73,13 +75,16 @@ def worker(rank, config_path, store_port, rows, device):
             raise RuntimeError('exchange listener still active after startup')
         time.sleep(0.05)
     layout = SimpleNamespace(layer_ids=(1,), num_embeddings=(rows,), head_dim=64)
-    bundle, raw, expected, handles = _read_bundle(bundle_path, layout, HASH)
+    expected = ExpectedLayout(layers=tuple(zip(layout.layer_ids, layout.num_embeddings)),
+                              head_dim=layout.head_dim, model_revision=package['model_revision'],
+                              hash_abi=HASH)
     ops = CountingOps(device)
-    storage = FabricEngramStorage.attach(raw, expected_layout=expected, dataset_id=bundle['dataset_id'],
-        generation=bundle['generation'], handles=handles, device=device, native=native, shard_ops=ops)
-    storage.verify(lambda views, verified: _verify_samples(views, verified, bundle['samples'], torch.device('cuda', device)))
+    storage = FabricEngramStorage.attach(package['raw'], expected_layout=expected,
+        dataset_id=package['dataset_id'], generation=package['generation'],
+        handles=package['capabilities'], device=device, native=native, shard_ops=ops)
+    storage.verify(lambda views, verified: _verify_samples(views, verified, package['samples'], torch.device('cuda', device)))
     w, scale = storage.table_views(1)
-    ids = torch.tensor(bundle['samples']['layers.1.engram.embed.weight']['row_ids'], device=device)
+    ids = torch.tensor(package['samples']['layers.1.engram.embed.weight']['row_ids'], device=device)
     # Values and ordering are checked against checkpoint samples before this.
     reference_w, reference_s = w.index_select(0, ids).clone(), scale.index_select(0, ids).clone()
     stream = torch.cuda.Stream(device=device)
@@ -101,8 +106,8 @@ def worker(rank, config_path, store_port, rows, device):
     assert ops.imports == ops.releases == ops.maps == ops.unmaps == 4
     assert ops.reserves == ops.frees == 2
     assert native.resource_counters() == baseline
-    print(json.dumps(dict(status='WORKER_PASS', instance=config['instance_id'], rank=rank,
-        startup_ms=round(startup_ms, 2), dataset_id=bundle['dataset_id'],
+    print(json.dumps(dict(status='WORKER_PASS', instance=env['RTP_ENGRAM_INSTANCE_INDEX'], rank=rank,
+        startup_ms=round(startup_ms, 2), dataset_id=package['dataset_id'],
         rpc_listener_closed=True, graph_replays=100, counters_balanced=True,
         imports=ops.imports, releases=ops.releases, maps=ops.maps, unmaps=ops.unmaps,
         reserves=ops.reserves, frees=ops.frees)), flush=True)
@@ -110,8 +115,9 @@ def worker(rank, config_path, store_port, rows, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', required=True, type=Path)
+    parser.add_argument('--workdir', required=True, type=Path)
     parser.add_argument('--shard', required=True, type=int, choices=(0, 1))
+    parser.add_argument('--exchange-port', required=True, type=int)
     parser.add_argument('--store-port', required=True, type=int)
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--numa', type=int, default=0)
@@ -121,11 +127,23 @@ def main():
     from safetensors.torch import save_file
     from rtp_llm.models_py.modules.dsv41.engram_bootstrap import _load_native
     from rtp_llm.models_py.modules.dsv41.engram_shard import plan_shards
-    config = json.loads(args.config.read_bytes())
-    assert len(config['group']['members']) == 2
+    from rtp_llm.models_py.modules.dsv41.engram_startup import (build_group, COHORT_ENV,
+        COUNT_ENV, INDEX_ENV, REVISION_ENV, DESCRIPTORS_ENV, TIMEOUT_ENV, CHECKPOINT_ENV)
+    root = args.workdir
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    endpoint = f'127.0.0.1:{args.exchange_port}'
+    env = {
+        COHORT_ENV: f'{endpoint},{endpoint}',
+        INDEX_ENV: str(args.shard),
+        COUNT_ENV: '2',
+        REVISION_ENV: 'probe-revision',
+        TIMEOUT_ENV: '120',
+        CHECKPOINT_ENV: str(root / 'checkpoint'),
+        DESCRIPTORS_ENV: str(root / 'shard.json'),
+    }
+    config = build_group(env, 2)
     member = next(m for m in config['group']['members'] if m['instance_id'] == config['instance_id'])
     assert member['world_size'] == 2 and len(member['shards']) == 1 and member['shards'][0]['index'] == args.shard
-    root = args.config.parent
     torch.set_num_threads(2)
     torch.cuda.set_device(args.device)
     native = _load_native()
@@ -153,13 +171,12 @@ def main():
     descriptor = dict(schema_version=2, shard=args.shard, shards=2, generation=config['group']['generation'],
         model_revision=config['group']['model_revision'], hash_abi=HASH, host_id=host, owner_id=host,
         owner_incarnation=str(uuid4()), tensors=tensors)
-    path = Path(config['local_descriptors'][str(args.shard)])
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = Path(env[DESCRIPTORS_ENV])
     private_write(path, descriptor)
     # Only the coordinator needs the tiny synthetic reference checkpoint.
     if args.shard == 0:
-        checkpoint = Path(config['checkpoint'])
-        checkpoint.mkdir(mode=0o700, parents=True, exist_ok=False)
+        checkpoint = Path(env[CHECKPOINT_ENV])
+        checkpoint.mkdir(mode=0o700, parents=True, exist_ok=True)
         weights = {}
         for role, width, base in [('weight', 64, 1), ('scale', 2, 101)]:
             table = torch.empty((plan.total_rows, width), dtype=torch.uint8)
@@ -171,7 +188,7 @@ def main():
         private_write(checkpoint / 'model.safetensors.index.json', {'weight_map': {k: 'probe.safetensors' for k in weights}})
         del table, weights
     print(json.dumps(dict(status='HOLDER_READY', host=host, shard=args.shard, backing_bytes=plan.shard_bytes)), flush=True)
-    mp.spawn(worker, args=(str(args.config), args.store_port, plan.total_rows, args.device), nprocs=2, join=True)
+    mp.spawn(worker, args=(env, args.store_port, plan.total_rows, args.device), nprocs=2, join=True)
     print(json.dumps(dict(status='PASS', instance=config['instance_id'], consumers_exited=True)), flush=True)
     # Test-only owner retirement. Production cohort launcher must coordinate drain.
     while not (root / 'STOP').exists():

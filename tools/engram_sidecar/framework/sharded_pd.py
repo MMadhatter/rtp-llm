@@ -121,7 +121,6 @@ def main(argv=None):
     parser.add_argument("--topology", type=Path, required=True)
     parser.add_argument("--node", choices=NODES, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--bundle", type=Path)
     parser.add_argument("--storage-mode", choices=full_model_http.STORAGE_MODES, default="external-egm")
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--max-allocation-bytes", type=int, default=128 * 1024**3)
@@ -130,8 +129,6 @@ def main(argv=None):
     parser.add_argument("--decode-moe-strategy", choices=("mega", "deepep"), default="mega")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    if args.storage_mode == "external-egm" and args.bundle is None:
-        parser.error("external-egm requires a role group's --bundle")
     topology = json.loads(args.topology.read_text())
     validate_topology(topology)
     args.port = topology["nodes"][args.node]["port"]
@@ -164,7 +161,8 @@ def main(argv=None):
                    env={**env, "CUDA_VISIBLE_DEVICES": ""}, check=True, timeout=180)
     full_model_http.checkpoint_preflight(args.checkpoint, args.storage_mode)
     if args.storage_mode == "external-egm":
-        full_model_http.verify_bundle(args)
+        args.world_size = int(env["WORLD_SIZE"])
+        full_model_http.cohort_preflight(args)
     os.execve(sys.executable, [sys.executable, "-m", "rtp_llm.start_server"], env)
     return 0
 

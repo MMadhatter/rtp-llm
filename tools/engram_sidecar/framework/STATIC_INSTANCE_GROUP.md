@@ -40,7 +40,7 @@
 
 现有实现是一 host 一 holder。两个实例声明同一存储 host 时，需要用该 storage_host 的 instance_id 明确归属；不会自行重复加载。每个实例都须有分片，所以在这个实现限制下需要 P≥N。同机更多实例各持独立分片的布局尚未实现，不能把它混称为已支持的物理 host 分片。
 
-当前已实现[一次性 RPC 交换](STATIC_RPC.md)：实例内复用现有 Store，实例间仅 rank 0 建立 N−1 条临时 TLS 连接，自动交换 handle，全部代表 ACK 后关闭监听。设置 `RTP_ENGRAM_STATIC_GROUP_CONFIG` 接入；不设置时保留显式离线 bundle 诊断路径。没有新 sidecar 容器，也没有完整表的中心存储服务。
+当前已实现[一次性 RPC 交换](STATIC_RPC.md)：实例内复用现有 Store，实例间仅 rank 0 建立 N−1 条临时 TLS 连接，自动交换 handle，全部代表 ACK 后关闭监听。设置 `RTP_ENGRAM_COHORT` 等环境变量接入；离线 bundle 路径已移除，服务不写任何 bundle 文件。没有新 sidecar 容器，也没有完整表的中心存储服务。
 
 ## 启动与退出约束
 

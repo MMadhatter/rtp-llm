@@ -147,14 +147,25 @@ def checkpoint_config(path, require_no_tables=False):
     return config, {"config_sha256": digest(config_raw), "tokenizer_sha256": digest(tokenizer_raw)}, index
 
 
-def bundle_identity(bundle):
-    keys = ("dataset_id", "generation", "model_revision", "hash_abi", "manifest_sha256")
-    result = {key: bundle[key] for key in keys}
+def load_package(shard_json, checkpoint):
+    """Build the in-memory package from published shard descriptors."""
+    from rtp_llm.models_py.modules.dsv41.engram_startup import package_from_descriptors
+
+    return package_from_descriptors([str(path) for path in shard_json], str(checkpoint))
+
+
+def package_identity(package):
+    from rtp_llm.models_py.modules.dsv41.engram_manifest import parse_manifest
+
+    manifest = parse_manifest(package["raw"])
+    result = {"dataset_id": package["dataset_id"], "generation": package["generation"],
+              "model_revision": package["model_revision"], "hash_abi": manifest.hash_abi,
+              "manifest_sha256": digest(package["raw"])}
     for key in ("dataset_id", "hash_abi", "manifest_sha256"):
         if not isinstance(result[key], str) or not DIGEST.fullmatch(result[key]):
-            raise ValueError("invalid bundle digest")
+            raise ValueError("invalid package digest")
     if str(UUID(result["generation"])) != result["generation"]:
-        raise ValueError("invalid bundle generation")
+        raise ValueError("invalid package generation")
     if not isinstance(result["model_revision"], str) or not 0 < len(result["model_revision"]) <= 512:
         raise ValueError("invalid model revision")
     return result
@@ -287,11 +298,11 @@ def validate_oracle(document, *, layout, metadata, identity, token_count=None):
     return parsed
 
 
-def verify_bundle_samples(parsed, bundle, layout):
+def verify_package_samples(parsed, package, layout):
     for layer, rows in zip(layout.layer_ids, layout.num_embeddings):
         selected = sorted({0, rows // 2, rows - 1})
         for position, role in enumerate(("weight", "scale")):
-            sample = bundle["samples"]["layers.{}.engram.embed.{}".format(layer, role)]
+            sample = package["samples"]["layers.{}.engram.embed.{}".format(layer, role)]
             if sample["row_ids"] != selected or digest(b"".join(parsed[str(layer)][row][position] for row in selected)) != sample["sha256"]:
                 raise ValueError("oracle/source differs from published bootstrap samples")
 
@@ -339,8 +350,8 @@ def prepare(args):
     from rtp_llm.models_py.modules.dsv41.engram_bootstrap import hash_state_digest
 
     config, metadata, index = checkpoint_config(args.checkpoint)
-    bundle = private_read(args.bundle)
-    identity = bundle_identity(bundle)
+    package = load_package(args.shard_json, args.checkpoint)
+    identity = package_identity(package)
     layout = EngramLayout(config)
     tokenizer = AutoTokenizer.from_pretrained(str(args.checkpoint), trust_remote_code=True, local_files_only=True)
     state = NgramHashState(layout, tokenizer=tokenizer)
@@ -359,7 +370,7 @@ def prepare(args):
                 "checkpoint_metadata": metadata, "layout": layout_metadata(layout),
                 "cases": cases, "rows": rows, "source_headers": headers}
     parsed = validate_oracle(document, layout=layout, metadata=metadata, identity=identity, token_count=len(state.token_map))
-    verify_bundle_samples(parsed, bundle, layout)
+    verify_package_samples(parsed, package, layout)
     if torch.cuda.is_initialized():
         raise AssertionError("CPU oracle preparation initialized CUDA")
     private_write_new(args.private_inputs, document)
@@ -370,22 +381,22 @@ def prepare(args):
 
 def run(args):
     config, metadata, _ = checkpoint_config(args.checkpoint, require_no_tables=True)
-    bundle, oracle = private_read(args.bundle), private_read(args.private_inputs)
-    identity = bundle_identity(bundle)
+    package, oracle = load_package(args.shard_json, args.checkpoint), private_read(args.private_inputs)
+    identity = package_identity(package)
     import torch
     if not torch.cuda.is_available() or args.device >= torch.cuda.device_count():
         raise ValueError("authorized CUDA device is not available")
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     from rtp_llm.models_py.modules.dsv41.engram import EngramLayout, NgramHashState, HostEngramEmbedding
-    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import attach_from_bundle, hash_state_digest
+    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import attach_from_package, hash_state_digest
 
     layout = EngramLayout(config)
     state = NgramHashState(layout, str(args.checkpoint))
     if hash_state_digest(state) != identity["hash_abi"]:
         raise ValueError("consumer tokenizer/hash mismatch")
     parsed = validate_oracle(oracle, layout=layout, metadata=metadata, identity=identity, token_count=len(state.token_map))
-    verify_bundle_samples(parsed, bundle, layout)
+    verify_package_samples(parsed, package, layout)
     spec = importlib.util.find_spec("engram_native_dev_492ecf45")
     if spec is None or not isinstance(spec.loader, importlib.machinery.ExtensionFileLoader):
         raise RuntimeError("prebuilt native bridge required; no Python shim")
@@ -397,7 +408,7 @@ def run(args):
         torch.cuda.synchronize(device)
         before = torch.cuda.memory_allocated(device)
         torch.cuda.reset_peak_memory_stats(device)
-        storage = attach_from_bundle(args.bundle, layout=layout, hash_state=state, device=device)
+        storage = attach_from_package(package, layout=layout, hash_state=state, device=device)
         after = torch.cuda.memory_allocated(device)
         info = storage.info()
         for layer in layout.layer_ids:
@@ -455,11 +466,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("prepare", "run"))
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--shard-json", type=Path, action="append", required=True)
     parser.add_argument("--private-inputs", type=Path, required=True)
     parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args(argv)
-    if any(not path.is_absolute() for path in (args.checkpoint, args.bundle, args.private_inputs)) or args.device < 0:
+    if any(not path.is_absolute() for path in (args.checkpoint, args.private_inputs)) or args.device < 0:
         parser.error("absolute input paths and nonnegative device required")
     try:
         (prepare if args.action == "prepare" else run)(args)

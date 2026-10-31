@@ -85,12 +85,12 @@ class FullModelPreflightTest(unittest.TestCase):
     def test_local_preflight_does_not_read_external_bundle(self):
         self.add_tables()
         with patch("tools.engram_sidecar.framework.full_model_http.runtime_preflight", return_value={}), patch(
-            "tools.engram_sidecar.framework.full_model_http.verify_bundle", side_effect=AssertionError("must not attach")), patch(
+            "tools.engram_sidecar.framework.full_model_http.cohort_preflight", side_effect=AssertionError("must not attach")), patch(
             "sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(main(["preflight", "--checkpoint", str(self.root), "--storage-mode", "local-pinned",
                                    "--model-revision", "test", "--cuda-graph"]), 0)
         report = json.loads(out.getvalue())
-        self.assertNotIn("bundle", report)
+        self.assertNotIn("cohort", report)
         self.assertEqual(report["experiment_environment"]["DECODE_CAPTURE_CONFIG"], "1")
 
     def test_local_clears_external_env_with_same_normal_graph_configuration(self):

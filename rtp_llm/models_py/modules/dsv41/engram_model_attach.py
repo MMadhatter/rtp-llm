@@ -11,11 +11,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 
-EXTERNAL_BUNDLE_ENV = "RTP_ENGRAM_EXTERNAL_BUNDLE"
 EXTERNAL_GRAPH_MODE_ENV = "RTP_ENGRAM_GRAPH_MODE"
 PROCESS_LIFETIME_GRAPH = "process_lifetime"
 
@@ -100,7 +98,7 @@ def initialize_model_engram(
     returns the same attachment. A failed call cannot be retried in-process.
 
     External identity and GPU content verification belong to
-    ``attach_from_bundle``. This function never reads capabilities or infers
+    ``attach_from_package``. This function never reads capabilities or infers
     expected identity from an untrusted manifest.
     """
     previous = getattr(model, "_engram_attachment", None)
@@ -129,13 +127,14 @@ def initialize_model_engram(
             return attachment
 
         env = os.environ if environ is None else environ
-        bundle_path = env.get(EXTERNAL_BUNDLE_ENV)
-        if bundle_path is None and "ENGRAM_SHARD_COUNT" in env:
-            raise EngramModelInitializationError("DISTRIBUTED_ENGRAM_REQUIRES_BUNDLE")
-        attachment.external = bundle_path is not None
+        # Absolute import: this module is also loaded standalone by its unit tests.
+        from rtp_llm.models_py.modules.dsv41.engram_bootstrap import staged_package
+
+        package = staged_package()
+        if package is None and "ENGRAM_SHARD_COUNT" in env:
+            raise EngramModelInitializationError("DISTRIBUTED_ENGRAM_REQUIRES_EXCHANGE")
+        attachment.external = package is not None
         if attachment.external:
-            if not isinstance(bundle_path, str) or not bundle_path or not Path(bundle_path).is_absolute():
-                raise EngramModelInitializationError("INVALID_EXTERNAL_ENGRAM_BUNDLE_PATH")
             attachment.graph_mode = env.get(EXTERNAL_GRAPH_MODE_ENV, "eager")
             if attachment.graph_mode not in ("eager", PROCESS_LIFETIME_GRAPH):
                 raise EngramModelInitializationError("INVALID_EXTERNAL_ENGRAM_GRAPH_MODE")
@@ -157,11 +156,11 @@ def initialize_model_engram(
         hash_state = hash_factory(layout, checkpoint_path, device=device)
         if attachment.external:
             if attach_factory is None:
-                from .engram_bootstrap import attach_from_bundle
+                from rtp_llm.models_py.modules.dsv41.engram_bootstrap import attach_from_package
 
-                attach_factory = attach_from_bundle
+                attach_factory = attach_from_package
             storage = attach_factory(
-                bundle_path, layout=layout, hash_state=hash_state, device=device, environ=env
+                package, layout=layout, hash_state=hash_state, device=device, environ=env
             )
             attachment.storage = storage
 
@@ -238,7 +237,6 @@ def initialize_model_engram(
 
 
 __all__ = [
-    "EXTERNAL_BUNDLE_ENV",
     "EXTERNAL_GRAPH_MODE_ENV",
     "PROCESS_LIFETIME_GRAPH",
     "EngramModelAttachment",

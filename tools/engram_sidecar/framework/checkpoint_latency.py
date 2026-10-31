@@ -921,8 +921,9 @@ def run(args):
     source_config, source_metadata, index = lookup.checkpoint_config(args.source_checkpoint)
     if source_metadata != metadata:
         raise ValueError("baseline source and consumer config/tokenizer differ")
-    bundle, oracle = lookup.private_read(args.bundle), lookup.private_read(args.private_inputs)
-    identity = lookup.bundle_identity(bundle)
+    package = lookup.load_package(args.shard_json, args.checkpoint)
+    oracle = lookup.private_read(args.private_inputs)
+    identity = lookup.package_identity(package)
     import torch
     if not torch.cuda.is_available() or args.device >= torch.cuda.device_count():
         raise RuntimeError("selected authorized CUDA device unavailable")
@@ -934,7 +935,7 @@ def run(args):
         raise ValueError("source-cache NUMA must differ from GPU-local HOST_NUMA")
     torch.set_num_threads(1)
     from rtp_llm.models_py.modules.dsv41.engram import EngramLayout, NgramHashState, HostEngramEmbedding
-    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import attach_from_bundle, hash_state_digest
+    from rtp_llm.models_py.modules.dsv41.engram_bootstrap import attach_from_package, hash_state_digest
     layout = EngramLayout(config)
     if lookup.layout_metadata(EngramLayout(source_config)) != lookup.layout_metadata(layout):
         raise ValueError("source layout mismatch")
@@ -943,7 +944,7 @@ def run(args):
         raise ValueError("checkpoint hash ABI differs from publication")
     parsed = lookup.validate_oracle(oracle, layout=layout, metadata=metadata, identity=identity,
                                     token_count=len(state.token_map))
-    lookup.verify_bundle_samples(parsed, bundle, layout)
+    lookup.verify_package_samples(parsed, package, layout)
     headers = source_sample_check(args.source_checkpoint, index, layout, parsed)
     groups = layer_groups(layout.layer_ids, args.layers, args.layer_mode)
     layers = [layer for group in groups for layer in group]
@@ -979,7 +980,7 @@ def run(args):
     paths = {}
     completed = []
     try:
-        storage = attach_from_bundle(args.bundle, layout=layout, hash_state=state, device=device)
+        storage = attach_from_package(package, layout=layout, hash_state=state, device=device)
         rows_by_layer = dict(zip(layout.layer_ids, layout.num_embeddings))
         for group in groups:
             numa_by_layer = {}

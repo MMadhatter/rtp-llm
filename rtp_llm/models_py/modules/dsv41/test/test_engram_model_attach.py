@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from rtp_llm.models_py.modules.dsv41 import engram_bootstrap as b
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "engram_model_attach.py"
@@ -65,7 +66,10 @@ class ModelAttachTest(unittest.TestCase):
             _engram_hash_state=None,
             _engram_layers=(),
         )
-        self.env = {attach.EXTERNAL_BUNDLE_ENV: "/private/bundle.json"}
+        self.package = {"staged": True}
+        b.stage_package(self.package)
+        self.addCleanup(b.clear_staged_package)
+        self.env = {}
         self.kwargs = dict(
             layout_factory=self.make_layout,
             hash_factory=self.make_hash,
@@ -86,10 +90,10 @@ class ModelAttachTest(unittest.TestCase):
         self.assertEqual((path, device), ("/small/checkpoint", "cuda:1"))
         return self.hash_state
 
-    def attach_storage(self, path, *, layout, hash_state, device, environ):
+    def attach_storage(self, package, *, layout, hash_state, device, environ):
         self.trace.append("attach")
         self.attached_environ = environ
-        self.assertEqual((path, device), ("/private/bundle.json", "cuda:1"))
+        self.assertEqual((package, device), (self.package, "cuda:1"))
         self.assertIs(layout, self.layout)
         self.assertIs(hash_state, self.hash_state)
         return self.storage
@@ -109,8 +113,9 @@ class ModelAttachTest(unittest.TestCase):
         self.run_init(environ=environment)
         self.assertIs(self.attached_environ, environment)
 
-    def test_p_without_bundle_cannot_silently_load_local_tables(self):
-        with self.assertRaisesRegex(attach.EngramModelInitializationError, "REQUIRES_BUNDLE"):
+    def test_p_without_staged_package_cannot_silently_load_local_tables(self):
+        b.clear_staged_package()
+        with self.assertRaisesRegex(attach.EngramModelInitializationError, "REQUIRES_EXCHANGE"):
             self.run_init(environ={"ENGRAM_SHARD_COUNT": "3"})
         self.assertEqual(self.trace, ["layout"])
 
@@ -130,12 +135,13 @@ class ModelAttachTest(unittest.TestCase):
     def test_successful_reinitialize_ignores_changed_launch_environment(self):
         state = self.run_init()
         old_trace = list(self.trace)
-        self.env[attach.EXTERNAL_BUNDLE_ENV] = "/another/generation.json"
         self.assertIs(self.run_init(), state)
         self.assertEqual(self.trace, old_trace)
         self.assertEqual(self.retained, [self.storage])
 
     def test_legacy_has_no_external_keyword_or_retention(self):
+        b.clear_staged_package()
+
         def legacy(config, layer_id, path, device, **kwargs):
             self.assertEqual(kwargs, {})
             return Layer(layer_id, self.trace)
@@ -149,7 +155,7 @@ class ModelAttachTest(unittest.TestCase):
     def test_no_layer_model_skips_bundle_graph_and_hash(self):
         self.layout.layer_ids = ()
         self.model.py_hw_kernel_config.enable_cuda_graph = True
-        state = self.run_init(environ={attach.EXTERNAL_BUNDLE_ENV: "invalid-relative"})
+        state = self.run_init(environ={})
         self.assertEqual(state.phase, "EMPTY")
         self.assertFalse(state.external)
         self.assertEqual(self.trace, ["layout"])
@@ -268,14 +274,11 @@ class ModelAttachTest(unittest.TestCase):
         self.assertEqual(self.storage.pins, 1)
         self.assertNotIn("close", self.trace)
 
-    def test_invalid_explicit_bundle_does_not_enable_legacy_fallback(self):
-        for value in ("", "relative.json", 12):
-            with self.subTest(value=value):
-                self.model.__dict__.pop("_engram_attachment", None)
-                self.trace.clear()
-                with self.assertRaisesRegex(attach.EngramModelInitializationError, "BUNDLE_PATH"):
-                    self.run_init(environ={attach.EXTERNAL_BUNDLE_ENV: value})
-                self.assertEqual(self.trace, ["layout"])
+    def test_distributed_without_staged_package_is_rejected(self):
+        b.clear_staged_package()
+        with self.assertRaisesRegex(attach.EngramModelInitializationError, "REQUIRES_EXCHANGE"):
+            self.run_init(environ={"ENGRAM_SHARD_COUNT": "2"})
+        self.assertEqual(self.trace, ["layout"])
 
     def test_hash_failure_does_not_import_or_publish(self):
         def bad_hash(*args, **kwargs):
@@ -414,6 +417,8 @@ class ModelAttachTest(unittest.TestCase):
             attach.require_eager_engram(self.model)
 
     def test_legacy_success_cannot_be_switched_in_process(self):
+        b.clear_staged_package()
+
         def legacy(*args, **kwargs):
             return Layer(args[1], self.trace)
 
