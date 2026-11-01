@@ -318,3 +318,28 @@ class MutualTLSTest(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)
+
+
+class RankSpaceTest(unittest.TestCase):
+    """A member is either a whole gang or one host of a gang shared by members."""
+
+    def test_shared_gang_members_are_member_local(self):
+        env = cohort_env(p=2, instances=2, index=1)
+        env[s.RANKS_ENV] = '4'
+        group = s.build_group(env, 8)['group']
+        self.assertEqual([m['world_size'] for m in group['members']], [4, 4])
+        self.assertEqual([sh['publisher_rank'] for m in group['members'] for sh in m['shards']],
+                         [0, 0])
+
+    def test_whole_gang_members_keep_global_ranks(self):
+        env = cohort_env(p=2, instances=2, index=1)
+        group = s.build_group(env, 4)['group']
+        self.assertEqual([m['world_size'] for m in group['members']], [4, 4])
+        self.assertEqual([sh['publisher_rank'] for m in group['members'] for sh in m['shards']],
+                         [0, 0])
+
+    def test_ranks_per_instance_must_describe_the_gang(self):
+        env = cohort_env(p=2, instances=2, index=1)
+        env[s.RANKS_ENV] = '3'
+        with self.assertRaises(e.ExchangeError):
+            s.build_group(env, 8)

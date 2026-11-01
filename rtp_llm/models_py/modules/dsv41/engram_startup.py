@@ -34,6 +34,7 @@ TIMEOUT_ENV = 'RTP_ENGRAM_COHORT_TIMEOUT'
 TLS_DIR_ENV = 'RTP_ENGRAM_TLS_DIR'
 CHECKPOINT_ENV = 'RTP_ENGRAM_CHECKPOINT'
 COUNT_ENV = 'ENGRAM_SHARD_COUNT'
+RANKS_ENV = 'RTP_ENGRAM_RANKS_PER_INSTANCE'
 DEFAULT_TIMEOUT = 1800
 
 
@@ -143,10 +144,20 @@ def package_from_descriptors(paths, checkpoint, samples=checkpoint_samples):
 
 
 def _wait(store, keys, deadline):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise ExchangeError('INSTANCE_STARTUP_TIMEOUT')
-    store.wait(keys, timedelta(seconds=remaining))
+    # c10d Store.wait()/check() is collective: every rank must pass the same key
+    # set. Ranks here wait on different keys (own config vs. the shared package),
+    # so a collective wait deadlocks across the gang. Blocking get() is per-key.
+    pending = list(keys)
+    while pending:
+        if time.monotonic() >= deadline:
+            raise ExchangeError('INSTANCE_STARTUP_TIMEOUT')
+        try:
+            store.get(pending[0])
+        except KeyError:
+            # A local store answers immediately; retry until the peer publishes.
+            time.sleep(0.05)
+            continue
+        pending.pop(0)
 
 
 def _cohort(env):
@@ -220,20 +231,28 @@ def build_group(env, world_size):
     if not raw_index.isdigit() or not 0 <= int(raw_index) < instances:
         raise ExchangeError('INVALID_INSTANCE_INDEX')
     index = int(raw_index)
+    raw_ranks = env.get(RANKS_ENV)
+    if raw_ranks is not None and (not raw_ranks.isdigit() or int(raw_ranks) <= 0):
+        raise ExchangeError('INVALID_RANKS_PER_INSTANCE')
     generation = str(uuid5(NAMESPACE_URL, 'engram|' + revision + '|' +
                            ','.join(f'{host}:{port}' for host, port in cohort) + '|' + str(p)))
+    # A cohort member is either a whole gang on its own host (prefill) or one
+    # host of a gang shared by every member (decode); RANKS_ENV states which.
+    local_world_size = world_size if raw_ranks is None else int(raw_ranks)
+    if local_world_size != world_size and local_world_size * instances != world_size:
+        raise ExchangeError('WORLD_SIZE_NOT_DIVISIBLE_BY_INSTANCES')
     base, extra = divmod(p, instances)
     members = []
     for member_index in range(instances):
         start = member_index * base + min(member_index, extra)
         count = base + (1 if member_index < extra else 0)
-        if world_size % count:
+        if local_world_size % count:
             raise ExchangeError('WORLD_SIZE_NOT_DIVISIBLE_BY_LOCAL_HOSTS')
-        local_world_size = world_size // count
+        publishers = local_world_size // count
         host = cohort[member_index][0]
         shards = [dict(index=start + offset, host_id=f'{host}#{start + offset}',
-                       publisher_rank=offset * local_world_size) for offset in range(count)]
-        members.append(dict(instance_id=f'i{member_index}', world_size=world_size, shards=shards))
+                       publisher_rank=offset * publishers) for offset in range(count)]
+        members.append(dict(instance_id=f'i{member_index}', world_size=local_world_size, shards=shards))
     group = dict(generation=generation, model_revision=revision, members=members)
     validate_group(group)
     local = members[index]
@@ -305,7 +324,7 @@ def exchange_leaders(config, documents, deadline, build=None):
 
 
 def prepare_static_engram(store, *, rank, world_size, environ=None, leader_exchange=exchange_leaders):
-    """All ranks enter once. Only world rank 0 opens cross-instance connections."""
+    """All ranks enter once. Only the member-local rank 0 opens cross-instance connections."""
     env = os.environ if environ is None else environ
     config = build_config(env, world_size)
     if config is None:
@@ -314,27 +333,35 @@ def prepare_static_engram(store, *, rank, world_size, environ=None, leader_excha
     group_digest = validate_group(group)
     members = {m['instance_id']: m for m in group['members']}
     member = members[config['instance_id']]
-    if member['world_size'] != world_size or not 0 <= rank < world_size:
+    local_world_size = member['world_size']
+    if local_world_size == world_size:
+        # Whole gang per member: ranks are already member-local.
+        local_rank = rank
+    elif local_world_size * len(group['members']) == world_size:
+        local_rank = rank - config['index'] * local_world_size
+    else:
+        raise ExchangeError('INSTANCE_WORLD_SIZE_MISMATCH')
+    if not 0 <= local_rank < local_world_size:
         raise ExchangeError('INSTANCE_WORLD_SIZE_MISMATCH')
     p = sum(len(m['shards']) for m in group['members'])
     timeout = config['timeout_seconds']
     deadline = time.monotonic() + timeout
     if store is None:
-        if world_size != 1:
+        if local_world_size != 1:
             raise ExchangeError('INSTANCE_STORE_REQUIRED')
         from torch.distributed import HashStore
         store = HashStore()
     prefix = 'engram/' + group['generation'] + '/' + config['instance_id'] + '/'
     # Each worker must agree on the public contract, even if its config differs.
-    store.set(prefix + f'config/{rank}', group_digest.encode())
-    if rank == 0:
-        config_keys = [prefix + f'config/{i}' for i in range(world_size)]
+    store.set(prefix + f'config/{local_rank}', group_digest.encode())
+    if local_rank == 0:
+        config_keys = [prefix + f'config/{i}' for i in range(local_world_size)]
         _wait(store, config_keys, deadline)
         if any(store.get(k) != group_digest.encode() for k in config_keys):
             raise ExchangeError('INSTANCE_GROUP_CONFIG_MISMATCH')
     descriptors = config['local_descriptors']
     for offset, shard in enumerate(member['shards']):
-        if shard['publisher_rank'] != rank:
+        if shard['publisher_rank'] != local_rank:
             continue
         descriptor = Path(descriptors[offset])
         while not descriptor.exists():
@@ -342,7 +369,7 @@ def prepare_static_engram(store, *, rank, world_size, environ=None, leader_excha
                 raise ExchangeError('LOCAL_SHARD_NOT_READY')
             time.sleep(0.05)
         store.set(prefix + f'shard/{shard["index"]}', _private_read(descriptor, 1 << 20))
-    if rank == 0:
+    if local_rank == 0:
         keys = [prefix + f'shard/{s["index"]}' for s in member['shards']]
         _wait(store, keys, deadline)
         documents = [decode(store.get(key)) for key in keys]
@@ -353,11 +380,11 @@ def prepare_static_engram(store, *, rank, world_size, environ=None, leader_excha
     package = decode(store.get(prefix + 'package'))
     stage_package(to_memory_package(group, package))
     env[COUNT_ENV] = str(p)
-    store.set(prefix + f'received/{rank}', b'1')
-    if rank == 0:
-        _wait(store, [prefix + f'received/{i}' for i in range(world_size)], deadline)
+    store.set(prefix + f'received/{local_rank}', b'1')
+    if local_rank == 0:
+        _wait(store, [prefix + f'received/{i}' for i in range(local_world_size)], deadline)
         # Every worker holds the package in memory. No serving-time Store reads.
         for key in ([prefix + 'package'] + keys + config_keys +
-                    [prefix + f'received/{i}' for i in range(world_size)]):
+                    [prefix + f'received/{i}' for i in range(local_world_size)]):
             store.delete_key(key)
     return None
