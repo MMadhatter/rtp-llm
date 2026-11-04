@@ -1,0 +1,348 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Transactional model binding for experimental external Engram.
+
+This module imports neither CUDA nor the native RTP engine at import time.
+Factory injection is for control-flow unit tests; the defaults use the actual
+Engram implementation. Successful external mappings live until worker exit.
+Decode Graph is opt-in and holds a permanent storage pin until worker exit.
+There is deliberately no live detach, reload, discovery or service protocol.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+EXTERNAL_GRAPH_MODE_ENV = "RTP_ENGRAM_GRAPH_MODE"
+PROCESS_LIFETIME_GRAPH = "process_lifetime"
+_LOGGER = logging.getLogger(__name__)
+
+
+class EngramModelInitializationError(RuntimeError):
+    def __init__(self, code: str, *, resource=None):
+        self.code = code
+        self.resource = resource
+        super().__init__(code)
+
+
+@dataclass
+class EngramModelAttachment:
+    phase: str = "INITIALIZING"
+    external: bool = False
+    graph_mode: str = "eager"
+    graph_pin_held: bool = False
+    process_retained: bool = False
+    storage: Any = field(default=None, repr=False)
+    hash_state: Any = field(default=None, repr=False)
+    layers: tuple = field(default=(), repr=False)
+    failed_resources: list = field(default_factory=list, repr=False)
+
+
+def _retain_default(storage):
+    from .bootstrap import retain_for_process
+
+    retain_for_process(storage)
+
+
+def _log_model_state(attachment, phase, started, device, error=None):
+    """Report actual model publication, separately from control-plane readiness."""
+    info = {}
+    try:
+        if attachment.storage is not None:
+            info = attachment.storage.info()
+    except Exception:
+        # A missing diagnostic snapshot must not interfere with publication or
+        # rollback. Capacity is also recorded at the storage attach boundary.
+        pass
+    try:
+        _LOGGER.log(
+            logging.INFO if error is None else logging.ERROR,
+            "engram event=%s phase=%s state=%s generation=%s device=%s shard_count=%s "
+            "physical_bytes=%s allocation_count=%s mapping_count=%s graph_pins=%s "
+            "graph_mode=%s process_retained=%s layer_count=%s duration_ms=%.3f "
+            "error_class=%s cleanup_pending=%s",
+            "model_ready" if error is None else "model_failed",
+            phase,
+            attachment.phase,
+            info.get("generation", "none"),
+            info.get("device", device),
+            info.get("shard_count", "none"),
+            info.get("physical_bytes", "none"),
+            info.get("allocation_count", "none"),
+            info.get("mapping_count", "none"),
+            info.get("graph_pins", int(attachment.graph_pin_held)),
+            (
+                attachment.graph_mode
+                if attachment.graph_mode in ("eager", PROCESS_LIFETIME_GRAPH)
+                else "invalid"
+            ),
+            attachment.process_retained,
+            len(attachment.layers),
+            (time.monotonic() - started) * 1000,
+            type(error).__name__[:64] if error is not None else "none",
+            bool(attachment.failed_resources),
+        )
+    except Exception:
+        pass
+
+
+def require_engram_runtime(
+    model,
+    *,
+    is_cuda_graph=False,
+    capture_check=None,
+    is_prefill=False,
+    is_target_verify=False,
+):
+    """Keep eager default; admit opted-in decode graphs with a permanent pin.
+
+    Replay bypasses Python. The pin, not this per-forward check, prevents close
+    from invalidating captured pointers. No successful binding can be detached
+    or rebound in-process; even model/graph destruction retains its mapping.
+    """
+    attachment = getattr(model, "_engram_attachment", None)
+    if attachment is None or not attachment.external:
+        return
+    if attachment.phase != "READY":
+        raise EngramModelInitializationError("EXTERNAL_ENGRAM_NOT_READY")
+    if (
+        getattr(model, "_engram_storage", None) is not attachment.storage
+        or getattr(model, "_engram_hash_state", None) is not attachment.hash_state
+        or getattr(model, "_engram_layers", None)
+        != tuple((lid, index) for lid, index, _ in attachment.layers)
+        or any(
+            model.v4.layers[lid].engram is not module
+            for lid, _, module in attachment.layers
+        )
+    ):
+        raise EngramModelInitializationError("EXTERNAL_ENGRAM_BINDING_CHANGED")
+    if attachment.graph_mode == PROCESS_LIFETIME_GRAPH:
+        if not attachment.graph_pin_held or not attachment.process_retained:
+            raise EngramModelInitializationError(
+                "EXTERNAL_ENGRAM_GRAPH_LIFETIME_UNPINNED"
+            )
+        # Ordinary prefill remains eager; target verify/speculation is outside
+        # this slice. Decode replay never re-enters this Python guard.
+        if is_prefill or is_target_verify:
+            if is_cuda_graph or (capture_check is not None and capture_check()):
+                # A decode graph warms up on a prefill-shaped batch and on the
+                # speculative target-verify batch, so the input tag alone does
+                # not prove a prefill capture. A decode-role model owns both
+                # graphs; only a prefill-role capture stays unsupported.
+                if getattr(model, "_is_decode_role", False):
+                    return
+                raise EngramModelInitializationError(
+                    "EXTERNAL_ENGRAM_DECODE_GRAPH_ONLY"
+                )
+        return
+    if is_cuda_graph or (capture_check is not None and capture_check()):
+        raise EngramModelInitializationError("EXTERNAL_ENGRAM_GRAPH_UNSUPPORTED")
+
+
+def initialize_model_engram(
+    model,
+    *,
+    layout_factory=None,
+    hash_factory=None,
+    layer_factory=None,
+    attach_factory=None,
+    retain=None,
+    environ=None,
+    scale_group=None,
+):
+    """Build every model-local Engram layer, then publish the complete binding.
+
+    ``model`` supplies ``_v4_args.v41_config``, ``v4.layers``, and
+    ``v4.embed.weight.device``. On success it receives ``_engram_storage``,
+    ``_engram_hash_state`` and ``_engram_layers``. A successful repeated call
+    returns the same attachment. A failed call cannot be retried in-process.
+
+    External identity and GPU content verification belong to
+    ``attach_from_package``. This function never reads capabilities or infers
+    expected identity from an untrusted manifest.
+    """
+    previous = getattr(model, "_engram_attachment", None)
+    if previous is not None:
+        if previous.phase in ("READY", "EMPTY"):
+            require_engram_runtime(model)
+            return previous
+        raise EngramModelInitializationError("ENGRAM_INITIALIZATION_NOT_RETRYABLE")
+
+    attachment = EngramModelAttachment()
+    model._engram_attachment = attachment
+    retain = retain or _retain_default
+    constructed = []
+    published = []
+    storage = None
+    device = None
+    phase = "layout"
+    started = time.monotonic()
+    try:
+        if layout_factory is None:
+            from ..engram import EngramLayout
+
+            layout_factory = EngramLayout
+        config = model._v4_args.v41_config
+        layout = layout_factory(config)
+        if not layout.layer_ids:
+            # Draft/no-Engram models do not inspect the external launch bundle.
+            attachment.phase = "EMPTY"
+            return attachment
+
+        env = os.environ if environ is None else environ
+        # Absolute import: this module is also loaded standalone by its unit tests.
+        from rtp_llm.models_py.modules.dsv41.engram_distributed.bootstrap import (
+            staged_package,
+        )
+
+        package = staged_package()
+        from rtp_llm.models_py.modules.dsv41.engram_distributed.config import (
+            StoragePolicy,
+        )
+
+        policy = StoragePolicy.from_environ(env)
+        if policy.explicit and not policy.shared and package is not None:
+            raise EngramModelInitializationError("LOCAL_ENGRAM_HAS_SHARED_PACKAGE")
+        if package is None and policy.shared:
+            raise EngramModelInitializationError("DISTRIBUTED_ENGRAM_REQUIRES_EXCHANGE")
+        attachment.external = package is not None
+        phase = "graph_config"
+        if attachment.external:
+            attachment.graph_mode = env.get(
+                EXTERNAL_GRAPH_MODE_ENV, policy.default_graph_mode
+            )
+            if attachment.graph_mode not in ("eager", PROCESS_LIFETIME_GRAPH):
+                raise EngramModelInitializationError(
+                    "INVALID_EXTERNAL_ENGRAM_GRAPH_MODE"
+                )
+            hw = getattr(model, "py_hw_kernel_config", None)
+            if (
+                hw is not None
+                and bool(getattr(hw, "enable_cuda_graph", False))
+                and attachment.graph_mode != PROCESS_LIFETIME_GRAPH
+            ):
+                raise EngramModelInitializationError(
+                    "EXTERNAL_ENGRAM_GRAPH_UNSUPPORTED"
+                )
+
+        if hash_factory is None:
+            from ..engram import NgramHashState
+
+            hash_factory = NgramHashState
+        if layer_factory is None:
+            from ..engram import Engram
+
+            layer_factory = Engram.from_checkpoint
+        device = model.v4.embed.weight.device
+        checkpoint_path = config["checkpoint_path"]
+        phase = "hash_init"
+        hash_state = hash_factory(layout, checkpoint_path, device=device)
+        if attachment.external:
+            if attach_factory is None:
+                from rtp_llm.models_py.modules.dsv41.engram_distributed.bootstrap import (
+                    attach_from_package,
+                )
+
+                attach_factory = attach_from_package
+            phase = "storage_attach"
+            storage = attach_factory(
+                package,
+                layout=layout,
+                hash_state=hash_state,
+                device=device,
+                environ=env,
+            )
+            attachment.storage = storage
+
+        phase = "layer_construction"
+        for hash_index, layer_id in enumerate(layout.layer_ids):
+            if layer_id >= len(model.v4.layers):
+                continue  # Preserve main's model-local layer selection.
+            if layer_id < 0:
+                raise EngramModelInitializationError("INVALID_ENGRAM_LAYER_ID")
+            kwargs = {"external_storage": storage} if attachment.external else {}
+            if scale_group is not None:
+                kwargs["scale_group"] = scale_group
+            module = layer_factory(config, layer_id, checkpoint_path, device, **kwargs)
+            constructed.append((layer_id, hash_index, module))
+
+        if attachment.external and attachment.graph_mode == PROCESS_LIFETIME_GRAPH:
+            # Pin before any layer is published or the engine can capture. This
+            # pin is deliberately never removed after READY: worker exit owns
+            # cleanup, including capture/drain failure and model destruction.
+            phase = "graph_pin"
+            storage._pin_graph()
+            attachment.graph_pin_held = True
+
+        # No layer can become visible while another layer is still being loaded.
+        phase = "model_binding"
+        for layer_id, _, module in constructed:
+            layer = model.v4.layers[layer_id]
+            old = getattr(layer, "engram", None)
+            published.append((layer, old))
+            layer.engram = module
+        if attachment.external:
+            retain(storage)
+            attachment.process_retained = True
+        attachment.hash_state = hash_state
+        attachment.layers = tuple(constructed)
+        model._engram_storage = storage
+        model._engram_hash_state = hash_state
+        model._engram_layers = tuple((lid, index) for lid, index, _ in constructed)
+        attachment.phase = "READY"
+        if attachment.external:
+            _log_model_state(attachment, phase, started, device)
+        return attachment
+    except BaseException as original:
+        attachment.phase = "FAILED"
+        cleanup_errors = []
+        for layer, old in reversed(published):
+            try:
+                layer.engram = old
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if attachment.external:
+            # READY was never published, so no forward/capture was admitted.
+            # Only this pre-READY rollback may remove the lifetime pin.
+            if attachment.graph_pin_held:
+                try:
+                    storage._unpin_graph()
+                    attachment.graph_pin_held = False
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            for _, _, module in reversed(constructed):
+                try:
+                    module.release_external_views()
+                except BaseException as error:
+                    # Keep the module as well as storage: it may still own views.
+                    attachment.failed_resources.append(module)
+                    cleanup_errors.append(error)
+            resource = (
+                storage if storage is not None else getattr(original, "resource", None)
+            )
+            if resource is not None:
+                try:
+                    resource.close()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+                if cleanup_errors:
+                    attachment.failed_resources.append(resource)
+                    retain(resource)
+            _log_model_state(attachment, phase, started, device, original)
+        if cleanup_errors:
+            raise EngramModelInitializationError(
+                "ENGRAM_CLEANUP_INCOMPLETE", resource=attachment
+            ) from original
+        raise
+
+
+__all__ = [
+    "EXTERNAL_GRAPH_MODE_ENV",
+    "PROCESS_LIFETIME_GRAPH",
+    "EngramModelAttachment",
+    "EngramModelInitializationError",
+    "initialize_model_engram",
+    "require_engram_runtime",
+]
