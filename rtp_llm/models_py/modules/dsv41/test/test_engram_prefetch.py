@@ -10,7 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -207,6 +207,30 @@ class EngramPrefetchTest(unittest.TestCase):
         self.event.record.assert_called_once_with(self.side)
         self.current.wait_event.assert_called_once_with(self.event)
         self.assertEqual(self.embedding._pinned._lookup_events, [self.event])
+
+    def test_external_owner_prepares_prefetch_and_registers_with_storage(self):
+        # External Fabric views prefetch on the same side stream; the completion
+        # event belongs to the storage, not to a pinned host table.
+        self.module._lookup_stream = None
+        storage = MagicMock()
+        self.embedding._external_storage = storage
+        self.embedding._uses_external_storage = True
+        self.embedding._pinned = None
+        self.embedding.supports_async_prefetch = True
+        self.embedding.lookup_guard = engram.HostEngramEmbedding.lookup_guard.__get__(
+            self.embedding
+        )
+        self.embedding.register_lookup_event = (
+            engram.HostEngramEmbedding.register_lookup_event.__get__(self.embedding)
+        )
+        with (
+            patch.dict(os.environ, {"DSV41_ASYNC_ENGRAM_LOOKUP": "1"}),
+            patch.object(torch.cuda, "Stream", return_value=self.side),
+            patch.object(torch.cuda, "Event", return_value=self.event),
+        ):
+            engram.Engram.prepare_lookup_prefetch(self.module)
+        self.assertIs(self.module._lookup_stream, self.side)
+        storage.register_lookup_event.assert_called_once_with(self.event)
 
     def test_unregister_waits_before_releasing_mapped_host_storage(self):
         order = []

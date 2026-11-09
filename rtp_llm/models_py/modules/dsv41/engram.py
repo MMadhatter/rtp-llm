@@ -997,6 +997,16 @@ class HostEngramEmbedding:
         return not self._uses_external_storage
 
     @property
+    def supports_async_prefetch(self):
+        """A side stream can prefetch the mapped table.
+
+        Local tables keep the prefetch-tuned host kernel. External Fabric views
+        are GPU addresses, so the plain host-row kernel runs on the same side
+        stream once the mapping exists.
+        """
+        return not self._uses_external_storage or self._uva is not None
+
+    @property
     def supports_decode_prefetch(self):
         """Scheduled native decode supports either live table owner."""
         return (
@@ -1019,8 +1029,8 @@ class HostEngramEmbedding:
     def __call__(
         self, indices: torch.Tensor, device, *, prefetch=False
     ) -> torch.Tensor:
-        if prefetch and not self.supports_generic_prefetch:
-            raise RuntimeError("external Engram asynchronous prefetch is not supported")
+        if prefetch and not self.supports_async_prefetch:
+            raise RuntimeError("Engram asynchronous prefetch is not supported")
         if self._uses_external_storage:
             from rtp_llm.models_py.modules.dsv41 import _engram_triton
 
@@ -1953,7 +1963,7 @@ class Engram(nn.Module):
     def prepare_lookup_prefetch(self):
         """Called after lookup JIT warmup, never from a request or capture."""
         if (
-            not getattr(self.embed_tokens, "supports_generic_prefetch", True)
+            not getattr(self.embed_tokens, "supports_async_prefetch", True)
             or not engram_lookup_prefetch_enabled()
             or not self.q_weight.is_cuda
             or self.embed_tokens._uva is None
@@ -1975,7 +1985,7 @@ class Engram(nn.Module):
 
     def prefetch_lookup(self, hash_ids):
         if (
-            not getattr(self.embed_tokens, "supports_generic_prefetch", True)
+            not getattr(self.embed_tokens, "supports_async_prefetch", True)
             or self._lookup_stream is None
             or self._lookup_work is not None
             or not hash_ids.is_cuda
